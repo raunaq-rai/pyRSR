@@ -76,34 +76,33 @@ def AB_to_flux(mag, mag_err=None, output_unit='jy'):
     Parameters
     ----------
     mag : float or array
-        AB magnitude.
+        AB magnitude(s).
     mag_err : float or array, optional
-        Uncertainty on magnitude.
-    output_unit : str, {'fnu','jy'}
-        Desired output unit:
-        - 'fnu' for erg/s/cm²/Hz
-        - 'jy' for Jansky
+        Magnitude uncertainty. If 0 or None, returns plain float/array.
+    output_unit : {'fnu','jy'}
+        Desired flux unit.
 
     Returns
     -------
-    flux : float, array, or uncertainties.ufloat/unumpy.uarray
+    flux : float, array, or uncertainties object
         Flux density in requested units.
     """
     assert output_unit in ['fnu', 'jy'], "'output_unit' must be 'fnu' or 'jy'"
 
-    if mag_err is not None:
+    if mag_err is not None and np.any(np.asarray(mag_err) > 0):
         if np.size(mag) == 1:
             magpoint = ufloat(mag, mag_err)
         else:
             magpoint = unp.uarray(mag, mag_err)
     else:
-        magpoint = mag
+        magpoint = mag  # just use raw float/array, no uncertainties
 
-    # flux density in Jy
-    jy = 10 ** (23.0 - (magpoint + 48.6) / 2.5)
+    # AB definition
+    jy = 10**(23. - (magpoint + 48.6) / 2.5)
     fnu = jy * 1e-23
 
     return fnu if output_unit == 'fnu' else jy
+
 
 
 def fnu_to_flam(lam, fnu, fnu_err=None):

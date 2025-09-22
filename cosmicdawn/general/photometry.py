@@ -183,7 +183,14 @@ def calc_IRAC_color(mAB, EW, z, lam_eff, filter_name):
     lineflux = EW_obs * flux_flam
 
     filt_lam, filt_resp = np.genfromtxt(filter_name, unpack=True)
-    idx = np.where(filt_resp > 0.5)
+
+    # Scale threshold relative to max
+    peak = np.nanmax(filt_resp)
+    halfmax = 0.5 * peak
+    idx = np.where(filt_resp >= halfmax)
+    if len(idx[0]) == 0:
+        raise ValueError(f"No filter points above half-max in {filter_name}")
+
     filter_width = max(filt_lam[idx]) - min(filt_lam[idx])
 
     lineflux_filter = lineflux / filter_width
@@ -224,13 +231,21 @@ def calc_IRAC_EW(mAB_cont, color, z, lam_eff, filter_name):
     lineflux_filter = flux_flam_cont / ratio
 
     filt_lam, filt_resp = np.genfromtxt(filter_name, unpack=True)
-    idx = np.where(filt_resp > 0.5)
+
+    # Scale threshold relative to max
+    peak = np.nanmax(filt_resp)
+    halfmax = 0.5 * peak
+    idx = np.where(filt_resp >= halfmax)
+    if len(idx[0]) == 0:
+        raise ValueError(f"No filter points above half-max in {filter_name}")
+
     filter_width = max(filt_lam[idx]) - min(filt_lam[idx])
 
     lineflux = lineflux_filter * filter_width
     EW_obs = lineflux / flux_flam_cont
     EW0 = EW_obs / (1. + z)
     return EW0, EW_obs
+
 
 
 # --------------------------
