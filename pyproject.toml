@@ -32,6 +32,7 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["."]
+exclude = ["build*", "dist*", "*.egg-info", "tests*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
