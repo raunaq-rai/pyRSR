@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cosmicdawn"
+version = "0.0.1.dev0"
+description = "High-redshift galaxy analysis"
+readme = "README.md"
+authors = [
+    { name = "Raunaq Rai", email = "raunaq.rai.25@ucl.ac.uk" }
+]
+license = { text = "MIT" }
+requires-python = ">=3.9"
+
+dependencies = [
+    "numpy>=1.22",
+    "matplotlib>=3.5",
+    "scipy>=1.8",
+    "astropy>=5.0",
+    "uncertainties>=3.1.7"
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov",
+    "black",
+    "isort",
+    "flake8"
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --maxfail=1 --disable-warnings"
+
