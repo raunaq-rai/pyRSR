@@ -4,8 +4,7 @@ lines.py
 Functions for visualizing emission-line fitting results.
 
 Includes:
-- plot_line_fitting_results: plot full stacked spectrum with fitted model
-  and zoom-ins on emission-line regions.
+- plot_line_fitting_results: plot full stacked spectrum with fitted model and zoom-ins on emission-line regions.
 """
 
 import numpy as np

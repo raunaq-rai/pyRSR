@@ -12,6 +12,7 @@ Notes
 These functions are deliberately simplified:
     - `correct_slitloss` assumes a Gaussian profile for both PSF and source.
     - `calibrate_etc_spec` rescales synthetic spectra based on ETC predictions.
+    
 Users should replace the toy models with instrument-specific data when available.
 """
 

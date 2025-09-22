@@ -36,3 +36,5 @@ ENV/
 # macOS system files
 .DS_Store
 
+docs/build/
+
