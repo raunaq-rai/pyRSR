@@ -1,7 +1,7 @@
 # tests/test_stacking.py
 import numpy as np
 import pytest
-from cosmicdawn.analysis import stacking
+from cosmicdawn import stacking
 
 
 def test_stack_spectra_mean_and_median():

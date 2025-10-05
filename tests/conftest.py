@@ -13,7 +13,7 @@ def make_boxcar_filter(tmp_path):
 
         # Use absolute string path to avoid NumPy DataSource + cwd issues
         filt_path = (tmp_path / "boxcar.txt").resolve()
-        np.savetxt(str(filt_path), data)   # 👈 cast to str
+        np.savetxt(str(filt_path), data)   # cast to str
         return filt_path
 
     return _make

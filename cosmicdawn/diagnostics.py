@@ -18,7 +18,9 @@ References
 import numpy as np
 from astropy.constants import c
 from astropy.cosmology import Planck15
-from ..general.conversions import AB_to_flux, flux_to_AB
+import cosmicdawn
+from cosmicdawn import conversions
+from cosmicdawn.conversions import AB_to_flux, flux_to_AB
 
 
 # --------------------------

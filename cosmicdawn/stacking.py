@@ -8,7 +8,7 @@ creating emission-line masks for composite analysis.
 
 import numpy as np
 from astropy.stats import sigma_clip
-from cosmicdawn.general import utils  
+from cosmicdawn import utils  
 
 
 # --------------------------
