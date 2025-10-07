@@ -340,6 +340,46 @@ def fit_lines_batch(wave, flux, err, line_centers: dict[str, float], method="lea
             results[name] = e  # store the exception so you can inspect failures
     return results
 
+
+    # -----------------------------
+    # 4. Bootstrap (parametric)
+    # -----------------------------
+def bootstrap_lines(wave, flux, err, line_centers, B=200, method="leastsq",
+                    random_state=None, window=20.0, cont_inner=6.0, fitter_kwargs=None):
+    """
+    Parametric bootstrap: perturb flux with Gaussian noise ~N(0, err),
+    refit all lines, and derive uncertainties on flux, EW, μ.
+    """
+    rng = np.random.default_rng(random_state)
+    fitter_kwargs = {} if fitter_kwargs is None else dict(fitter_kwargs)
+
+    results_all = {k: {"flux": [], "ew": [], "mu": []} for k in line_centers.keys()}
+
+    for _ in range(B):
+        flux_b = flux + rng.normal(0.0, np.asarray(err))
+        batch = fit_lines_batch(
+            wave, flux_b, err, line_centers,
+            method=method, window=window, cont_inner=cont_inner, **fitter_kwargs
+        )
+        for name, res in batch.items():
+            if isinstance(res, Exception):
+                continue
+            results_all[name]["flux"].append(res.flux)
+            results_all[name]["ew"].append(res.ew)
+            results_all[name]["mu"].append(res.mu)
+
+    # Summarise results (median ± std)
+    summary = {}
+    for name, vals in results_all.items():
+        summary[name] = {}
+        for key, arr in vals.items():
+            arr = np.asarray(arr)
+            summary[name][key] = (np.median(arr), np.std(arr))
+    return summary
+
+
+
+
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -393,7 +433,21 @@ if __name__ == "__main__":
             print(f"{name}: FAILED ({res})")
         else:
             print(f"{name}: μ={res.mu:.2f}±{res.mu_err:.2f}, σ={res.sigma:.2f}±{res.sigma_err:.2f}, "
-                  f"Flux={res.flux:.2f}±{res.flux_err:.2f}, SNR={res.snr:.1f}")
+                  f"Flux={res.flux:.2f}±{res.flux_err:.2f}, SNR={res.snr:.1f},EW={res.ew:.2f}±{res.ew_err:.2f}")
+            
+        # Run bootstrap after LSQ fits
+    print("\n=== BOOTSTRAP (parametric, B=200) ===")
+    boot_summary = bootstrap_lines(
+        wave, flux, err, centers,
+        B=200, method="leastsq",
+        random_state=42, window=20.0, cont_inner=6.0
+    )
+
+    for name, stats in boot_summary.items():
+        f, f_std = stats["flux"]
+        ew, ew_std = stats["ew"]
+        mu, mu_std = stats["mu"]
+        print(f"{name}: Flux={f:.3f}±{f_std:.3f}, EW={ew:.3f}±{ew_std:.3f}, μ={mu:.3f}±{mu_std:.3f}")
 
     # -----------------------------
     # 3. MCMC fits for all lines
@@ -402,7 +456,7 @@ if __name__ == "__main__":
         results_mcmc = fit_lines_batch(
             wave, flux, err, centers,
             method="mcmc", window=20.0, cont_inner=6.0,
-            nwalkers=32, nsteps=5000, nburn=1000, random_state=42
+            nwalkers=12, nsteps=10000, nburn=5000, random_state=11
         )
 
         print("\n=== MCMC RESULTS ===")
@@ -411,7 +465,7 @@ if __name__ == "__main__":
                 print(f"{name}: FAILED ({res})")
             else:
                 print(f"{name}: μ={res.mu:.2f}±{res.mu_err:.2f}, σ={res.sigma:.2f}±{res.sigma_err:.2f}, "
-                      f"Flux={res.flux:.2f}±{res.flux_err:.2f}, SNR={res.snr:.1f}")
+                      f"Flux={res.flux:.2f}±{res.flux_err:.2f}, SNR={res.snr:.1f},EW={res.ew:.2f}±{res.ew_err:.2f}")
 
         # Optional: corner plot for one representative line
         if corner is not None:
@@ -427,26 +481,71 @@ if __name__ == "__main__":
                     title_fmt=".3f",
                     quantiles=[0.16, 0.5, 0.84],
                     color="royalblue",
-                    hist_kwargs={"density": True, "color": "lightblue"}
+                    hist_kwargs={"density": True, "color": "lightblue"},
+                    size=(8, 8)
                 )
                 fig.suptitle(f"MCMC Posterior Corner Plot: {target_line}", fontsize=12)
                 plt.show()
 
-    # -----------------------------
-    # 4. Combined plot
+        # -----------------------------
+    # 4. Combined plot with LSQ, MCMC, and Bootstrap uncertainties
     # -----------------------------
     plt.figure(figsize=(10, 4))
-    plt.plot(wave, flux, color="gray", lw=0.5, label="Synthetic data")
+    plt.plot(wave, flux, color="gray", lw=0.6, label="Synthetic data")
+
+    # --- LSQ (red dashed + shaded ±μ_err) ---
     for name, res in results_lsq.items():
         if not isinstance(res, Exception):
-            plt.axvline(res.mu, color="r", ls="--", alpha=0.7, label=f"{name} (LSQ)")
-    if emcee is not None:
+            plt.axvline(res.mu, color="red", ls="--", alpha=0.7)
+            plt.axvspan(
+                res.mu - res.mu_err, res.mu + res.mu_err,
+                color="red", alpha=0.15
+            )
+    lsq_proxy_line = plt.Line2D([0], [0], color="red", ls="--", lw=1.2, label="LSQ (±μ_err)")
+
+    # --- MCMC (blue dotted + shaded ±μ_err) ---
+    if emcee is not None and "results_mcmc" in locals():
         for name, res in results_mcmc.items():
             if not isinstance(res, Exception):
-                plt.axvline(res.mu, color="b", ls=":", alpha=0.7, label=f"{name} (MCMC)")
+                plt.axvline(res.mu, color="blue", ls=":", alpha=0.7)
+                plt.axvspan(
+                    res.mu - res.mu_err, res.mu + res.mu_err,
+                    color="blue", alpha=0.15
+                )
+        mcmc_proxy_line = plt.Line2D([0], [0], color="blue", ls=":", lw=1.2, label="MCMC (±μ_err)")
+    else:
+        mcmc_proxy_line = None
+
+    # --- Bootstrap (gold band ±μ_std) ---
+    if "boot_summary" in locals():
+        for name, stats in boot_summary.items():
+            mu, mu_std = stats["mu"]
+            plt.axvspan(
+                mu - mu_std, mu + mu_std,
+                color="gold", alpha=0.25
+            )
+            plt.axvline(mu, color="goldenrod", lw=1.2, ls="-", alpha=0.6)
+        boot_proxy_patch = plt.Rectangle((0, 0), 1, 1, color="gold", alpha=0.25, label="Bootstrap (±μ_std)")
+    else:
+        boot_proxy_patch = None
+
+    # --- Plot formatting ---
     plt.xlabel("Wavelength (Å)")
     plt.ylabel("Flux")
-    plt.title("Synthetic Spectrum with Multi-line Fits")
-    plt.legend(fontsize=8)
+    plt.title("Synthetic Spectrum: LSQ, MCMC, and Bootstrap Fits with Uncertainties")
+
+    # --- Legend (grouped by method) ---
+    legend_elems = [plt.Line2D([0], [0], color="gray", lw=0.6, label="Synthetic data")]
+    legend_elems.append(lsq_proxy_line)
+    if mcmc_proxy_line:
+        legend_elems.append(mcmc_proxy_line)
+    if boot_proxy_patch:
+        legend_elems.append(boot_proxy_patch)
+
+    plt.legend(
+        handles=legend_elems,
+        fontsize=8, loc="best", frameon=False
+    )
+
     plt.tight_layout()
     plt.show()
