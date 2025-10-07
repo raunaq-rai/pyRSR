@@ -27,7 +27,8 @@ emission_line(xvals, x0, A, width, FWHM=False)
 import numpy as np
 from astropy.io import ascii
 from uncertainties import unumpy as unp
-from .conversions import AB_to_flux, fnu_to_flam
+import pyRSR
+from pyRSR.conversions import AB_to_flux, fnu_to_flam
 
 
 # --------------------------

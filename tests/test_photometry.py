@@ -1,6 +1,6 @@
 import numpy as np
 import pytest
-from cosmicdawn import photometry as phot
+from pyRSR import photometry as phot
 
 # --------------------------
 # Filter + synthetic photometry

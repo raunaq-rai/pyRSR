@@ -1,8 +1,8 @@
 # tests/test_diagnostics.py
 import numpy as np
 import pytest
-import cosmicdawn
-from cosmicdawn import diagnostics
+import pyRSR
+from pyRSR import diagnostics
 
 
 def test_MUV_from_spec_valid():

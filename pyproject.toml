@@ -3,7 +3,7 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "cosmicdawn"
+name = "pyRSR"
 version = "0.0.1.dev0"
 description = "High-redshift galaxy analysis"
 readme = "README.md"
