@@ -1,5 +1,3 @@
-### potentially add in automatic detection - at the moment i am defining the centres beforehand
-
 """
 Gaussian line fitting utilities (least-squares + MCMC) for noisy spectra.
 
@@ -16,7 +14,7 @@ from __future__ import annotations
 import numpy as np
 from dataclasses import dataclass, asdict
 
-# --- optional deps guarded ---
+# --- Optional dependencies ---
 try:
     from scipy.optimize import curve_fit
 except Exception:
@@ -28,60 +26,60 @@ except Exception:
     emcee = None
 
 
-# ======= your lines dictionary =======
+# ======= Line dictionary =======
 lines_dict = {
-    'LYA':1215.670,
-    'NV_1':1238.821,
-    'NV_2':1242.804,
-    'NIV_1':1486.496,
-    'CIV_1':1548.187,
-    'CIV_2':1550.772,
-    'HEII_1':1640.420,
-    'OIII_05':1663.4795,
-    'NIII_1':1746.823,
-    'NIII_2':1748.656,
-    'CIII':1908.734,
-    'FeIV_1':2829.360,
-    'FeIV_2':2835.740,
-    'NeV_1':3345.821,
-    'NeV_2':3425.881,
-    'OII_UV_1':3727.092,
-    'OII_UV_2':3729.875,
-    'NEIII_UV_1':3869.86,
-    'NEIII_UV_2':3968.59,
-    'HDELTA':4102.8922,
-    'HGAMMA':4341.6837,
-    'OIII_1':4364.436,
-    'HEI_1':4471.479,
-    'HEII_2':4685.710,
-    'HBETA':4862.6830,
-    'OIII_2':4960.295,
-    'OIII_3':5008.240,
-    'HEI':5877.252,
-    'HALPHA':6564.608,
-    'SII_1':6718.295,
-    'SII_2':6732.674
+    'LYA': 1215.670,
+    'NV_1': 1238.821,
+    'NV_2': 1242.804,
+    'NIV_1': 1486.496,
+    'CIV_1': 1548.187,
+    'CIV_2': 1550.772,
+    'HEII_1': 1640.420,
+    'OIII_05': 1663.4795,
+    'NIII_1': 1746.823,
+    'NIII_2': 1748.656,
+    'CIII': 1908.734,
+    'FeIV_1': 2829.360,
+    'FeIV_2': 2835.740,
+    'NeV_1': 3345.821,
+    'NeV_2': 3425.881,
+    'OII_UV_1': 3727.092,
+    'OII_UV_2': 3729.875,
+    'NEIII_UV_1': 3869.86,
+    'NEIII_UV_2': 3968.59,
+    'HDELTA': 4102.8922,
+    'HGAMMA': 4341.6837,
+    'OIII_1': 4364.436,
+    'HEI_1': 4471.479,
+    'HEII_2': 4685.710,
+    'HBETA': 4862.6830,
+    'OIII_2': 4960.295,
+    'OIII_3': 5008.240,
+    'HEI': 5877.252,
+    'HALPHA': 6564.608,
+    'SII_1': 6718.295,
+    'SII_2': 6732.674
 }
 
 
-# ======= data container =======
+# ======= Data container =======
 @dataclass
 class LineFitResult:
     method: str
     line_name: str | None
-    mu: float                 # center wavelength
+    mu: float
     mu_err: float
-    sigma: float              # Gaussian sigma
+    sigma: float
     sigma_err: float
-    amp: float                # peak amplitude (above continuum)
+    amp: float
     amp_err: float
-    flux: float               # integrated flux
+    flux: float
     flux_err: float
-    ew: float                 # equivalent width (same units as wavelength)
+    ew: float
     ew_err: float
-    snr: float                # flux / flux_err
-    continuum_mu: float       # continuum level evaluated at mu
-    cov: np.ndarray | None    # covariance (for least squares) else None
+    snr: float
+    continuum_mu: float
+    cov: np.ndarray | None
     meta: dict
 
     def as_dict(self):
@@ -91,12 +89,14 @@ class LineFitResult:
         return d
 
 
-# ======= model / helpers =======
+# ======= Model / helper functions =======
 def _gaussian(x, amp, mu, sigma):
     return amp * np.exp(-0.5 * ((x - mu) / np.clip(sigma, 1e-9, np.inf)) ** 2)
 
+
 def _gaussian_w_continuum(x, amp, mu, sigma, c0, c1):
     return _gaussian(x, amp, mu, sigma) + c0 + c1 * (x - x.mean())
+
 
 def _sigma_clip(y, mask, lo=3.0, hi=3.0, iters=3):
     m = mask.copy()
@@ -106,12 +106,13 @@ def _sigma_clip(y, mask, lo=3.0, hi=3.0, iters=3):
         m &= (y > med - lo * std) & (y < med + hi * std)
     return m
 
+
 def _continuum_linear(x, y, yerr, mask):
-    """Robust weighted linear fit for sidebands: c0 + c1*(x-xref)."""
+    """Robust weighted linear fit for sidebands: c0 + c1*(x - xref)."""
     if not np.any(mask):
         c0 = float(np.nanmedian(y))
         c1 = 0.0
-        cov = np.array([[np.nan, np.nan],[np.nan, np.nan]])
+        cov = np.array([[np.nan, np.nan], [np.nan, np.nan]])
         return c0, c1, cov
 
     xref = x.mean()
@@ -119,7 +120,7 @@ def _continuum_linear(x, y, yerr, mask):
     w = np.ones_like(y[mask])
     if yerr is not None:
         with np.errstate(divide="ignore", invalid="ignore"):
-            w = 1.0 / np.clip(yerr[mask], 1e-12, np.inf)**2
+            w = 1.0 / np.clip(yerr[mask], 1e-12, np.inf) ** 2
 
     XT_W = X.T * w
     cov = np.linalg.pinv(XT_W @ X)
@@ -127,46 +128,68 @@ def _continuum_linear(x, y, yerr, mask):
     c0, c1 = beta
     return float(c0), float(c1), cov
 
+
 def _prep_window(wave, flux, err, center, window=20.0, cont_inner=6.0):
-    """Return local arrays (x,y,e), continuum fit (c0,c1,cov), and initial guesses (amp0,mu0,sig0)."""
+    """Return local arrays (x, y, e), continuum fit (c0, c1, cov), and initial guesses."""
     wave = np.asarray(wave)
     flux = np.asarray(flux)
-    err  = None if err is None else np.asarray(err)
+    err = None if err is None else np.asarray(err)
 
     sel = (wave > center - window) & (wave < center + window)
     if sel.sum() < 8:
         raise ValueError("Not enough points in window. Increase `window` or check wavelength grid.")
+
     x = wave[sel]
     y = flux[sel]
     e = None if err is None else err[sel]
 
-    # sidebands for continuum: exclude core
+    # Sidebands for continuum
     sb = (np.abs(x - center) >= cont_inner) & (np.abs(x - center) <= window)
     sb = _sigma_clip(y, sb)
     c0, c1, cov_c = _continuum_linear(x, y, e, sb)
 
-    # subtract continuum to init
-    y_cont = y - (c0 + c1*(x - x.mean()))
+    y_cont = y - (c0 + c1 * (x - x.mean()))
     amp0 = float(np.nanmax(y_cont))
-    try:
-        mu0 = float(x[np.nanargmax(y_cont)])
-    except Exception:
-        mu0 = float(center)
-    # second moment estimate (guarded)
+    mu0 = float(x[np.nanargmax(y_cont)]) if np.isfinite(np.nanmax(y_cont)) else float(center)
     wpos = np.clip(y_cont - np.nanmin(y_cont), 0, np.inf)
-    var = np.average((x - mu0)**2, weights=np.clip(wpos, 1e-12, np.inf))
-    sig0 = float(np.sqrt(np.clip(var, 0.25, (0.25*window)**2)))  # min ~0.5 in wavelength units
+    var = np.average((x - mu0) ** 2, weights=np.clip(wpos, 1e-12, np.inf))
+    sig0 = float(np.sqrt(np.clip(var, 0.25, (0.25 * window) ** 2)))
     return x, y, e, (c0, c1, cov_c), (amp0, mu0, sig0)
 
 
-# ======= least-squares =======
-def fit_line_leastsq(
-    wave, flux, err, center, window=20.0, cont_inner=6.0, name=None, bounds=None
-) -> LineFitResult:
+# ======= Robust EW computation =======
+def _ew_with_uncertainty(flux_line, flux_err, c0, c1, cov_c, mu, x_mean,
+                         z=0.0, cont_floor_sigma=3.0):
     """
-    Weighted least-squares fit of Gaussian + linear continuum in a local window.
-    `bounds` example: {'amp': (0,None), 'mu': (center-5, center+5), 'sigma': (0.05, 20)}
+    Compute observed and rest-frame equivalent widths with propagated continuum-fit errors.
+    Returns (EW_obs, EW_obs_err, EW_rest, EW_rest_err).
     """
+    dx = (mu - x_mean)
+    if cov_c is None or not np.isfinite(cov_c).all():
+        var_c0 = var_c1 = cov01 = np.nan
+    else:
+        var_c0, var_c1, cov01 = cov_c[0, 0], cov_c[1, 1], cov_c[0, 1]
+
+    c_mu = c0 + c1 * dx
+    var_c = var_c0 + (dx ** 2) * var_c1 + 2 * dx * cov01
+    sigma_c = np.sqrt(np.maximum(var_c, 0.0))
+
+    if not np.isfinite(c_mu) or not np.isfinite(sigma_c):
+        return (np.nan, np.nan, np.nan, np.nan)
+    if c_mu <= cont_floor_sigma * sigma_c or c_mu <= 0:
+        return (np.nan, np.nan, np.nan, np.nan)
+
+    ew_obs = flux_line / c_mu
+    ew_obs_err = np.sqrt((flux_err / c_mu) ** 2 + ((flux_line * sigma_c) / (c_mu ** 2)) ** 2)
+    ew_rest = ew_obs / (1.0 + z)
+    ew_rest_err = ew_obs_err / (1.0 + z)
+    return (float(ew_obs), float(ew_obs_err), float(ew_rest), float(ew_rest_err))
+
+
+# ======= Least-squares fitting =======
+def fit_line_leastsq(wave, flux, err, center, window=20.0, cont_inner=6.0,
+                     name=None, bounds=None, **kwargs) -> LineFitResult:
+    """Weighted least-squares fit of Gaussian + linear continuum in a local window."""
     if curve_fit is None:
         raise ImportError("scipy is required: pip install scipy")
 
@@ -174,56 +197,55 @@ def fit_line_leastsq(
     p0 = [amp0, mu0, sig0, c0, c1]
 
     lb = [-np.inf, center - window, 0.05, -np.inf, -np.inf]
-    ub = [ np.inf, center + window, window,  np.inf,  np.inf]
+    ub = [np.inf, center + window, window, np.inf, np.inf]
     if bounds:
-        if "amp" in bounds:
-            lb[0] = bounds["amp"][0] if bounds["amp"][0] is not None else lb[0]
-            ub[0] = bounds["amp"][1] if bounds["amp"][1] is not None else ub[0]
-        if "mu" in bounds:
-            lb[1] = bounds["mu"][0] if bounds["mu"][0] is not None else lb[1]
-            ub[1] = bounds["mu"][1] if bounds["mu"][1] is not None else ub[1]
-        if "sigma" in bounds:
-            lb[2] = bounds["sigma"][0] if bounds["sigma"][0] is not None else lb[2]
-            ub[2] = bounds["sigma"][1] if bounds["sigma"][1] is not None else ub[2]
+        for i, key in enumerate(["amp", "mu", "sigma"]):
+            if key in bounds:
+                lb[i] = bounds[key][0] if bounds[key][0] is not None else lb[i]
+                ub[i] = bounds[key][1] if bounds[key][1] is not None else ub[i]
 
-    sigma_w = None if e is None else e
-    popt, pcov = curve_fit(
-        _gaussian_w_continuum, x, y, p0=p0,
-        sigma=sigma_w, absolute_sigma=True,
-        bounds=(lb, ub), maxfev=20000
-    )
+    popt, pcov = curve_fit(_gaussian_w_continuum, x, y, p0=p0,
+                           sigma=e, absolute_sigma=True,
+                           bounds=(lb, ub), maxfev=20000)
+
     amp, mu, sig, c0_fit, c1_fit = popt
     perr = np.sqrt(np.diag(pcov))
 
-    # flux, EW, SNR
-    S = np.sqrt(2.0*np.pi)
+    S = np.sqrt(2.0 * np.pi)
     flux_line = float(S * amp * sig)
 
-    # propagate flux error from (amp, sigma) covariance
-    J = np.array([S*sig, S*amp])
-    cov_as = pcov[np.ix_([0,2],[0,2])]
+    J = np.array([S * sig, S * amp])
+    cov_as = pcov[np.ix_([0, 2], [0, 2])]
     flux_err = float(np.sqrt(J @ cov_as @ J))
+    cont_at_mu = float(c0_fit + c1_fit * (mu - x.mean()))
 
-    cont_at_mu = float(c0_fit + c1_fit*(mu - x.mean()))
-    ew = flux_line / max(cont_at_mu, 1e-30)
-    ew_err = abs(ew) * (flux_err / max(abs(flux_line), 1e-30))
+    ew_obs, ew_obs_err, ew_rest, ew_rest_err = _ew_with_uncertainty(
+        flux_line, flux_err, c0_fit, c1_fit, cov_c, mu, x.mean(),
+        z=kwargs.get("redshift", 0.0),
+        cont_floor_sigma=3.0
+    )
 
     return LineFitResult(
         method="leastsq",
         line_name=name,
-        mu=float(mu),         mu_err=float(perr[1]),
-        sigma=float(sig),     sigma_err=float(perr[2]),
-        amp=float(amp),       amp_err=float(perr[0]),
-        flux=float(flux_line),flux_err=float(flux_err),
-        ew=float(ew),         ew_err=float(ew_err),
-        snr=float(flux_line / max(flux_err,1e-30)),
+        mu=float(mu), mu_err=float(perr[1]),
+        sigma=float(sig), sigma_err=float(perr[2]),
+        amp=float(amp), amp_err=float(perr[0]),
+        flux=float(flux_line), flux_err=float(flux_err),
+        ew=float(ew_obs), ew_err=float(ew_obs_err),
+        snr=float(flux_line / max(flux_err, 1e-30)),
         continuum_mu=cont_at_mu,
         cov=pcov,
-        meta={"window": window, "cont_inner": cont_inner, "init": [amp0, mu0, sig0]}
+        meta={
+            "window": window, "cont_inner": cont_inner,
+            "init": [amp0, mu0, sig0],
+            "ew_rest": ew_rest, "ew_rest_err": ew_rest_err,
+            "redshift": kwargs.get("redshift", 0.0)
+        }
     )
 
 
-# ======= MCMC (emcee) =======
+# ======= MCMC fitting =======
 def _log_prior(theta, center, window, amp_prior=(0, np.inf), sigma_prior=(0.05, None)):
     amp, mu, sig, c0, c1 = theta
     if not (amp_prior[0] <= amp <= (np.inf if amp_prior[1] is None else amp_prior[1])):
@@ -235,14 +257,16 @@ def _log_prior(theta, center, window, amp_prior=(0, np.inf), sigma_prior=(0.05, 
         return -np.inf
     return 0.0
 
+
 def _log_likelihood(theta, x, y, e):
     amp, mu, sig, c0, c1 = theta
     model = _gaussian_w_continuum(x, amp, mu, sig, c0, c1)
     if e is None:
         r = y - model
-        return -0.5*np.sum(r**2)
-    invvar = 1.0 / np.clip(e, 1e-12, np.inf)**2
-    return -0.5*np.sum((y - model)**2 * invvar + np.log(2*np.pi) - np.log(invvar))
+        return -0.5 * np.sum(r ** 2)
+    invvar = 1.0 / np.clip(e, 1e-12, np.inf) ** 2
+    return -0.5 * np.sum((y - model) ** 2 * invvar + np.log(2 * np.pi) - np.log(invvar))
+
 
 def _log_posterior(theta, x, y, e, center, window, amp_prior, sigma_prior):
     lp = _log_prior(theta, center, window, amp_prior, sigma_prior)
@@ -250,23 +274,25 @@ def _log_posterior(theta, x, y, e, center, window, amp_prior, sigma_prior):
         return -np.inf
     return lp + _log_likelihood(theta, x, y, e)
 
-def fit_line_mcmc(
-    wave, flux, err, center, window=20.0, cont_inner=6.0, name=None,
-    nwalkers=32, nsteps=2000, nburn=500, amp_prior=(0.0, None), sigma_prior=(0.05, None),
-    random_state=None
-) -> LineFitResult:
+
+def fit_line_mcmc(wave, flux, err, center, window=20.0, cont_inner=6.0,
+                  name=None, nwalkers=32, nsteps=2000, nburn=500,
+                  amp_prior=(0.0, None), sigma_prior=(0.05, None),
+                  random_state=None, **kwargs) -> LineFitResult:
+    """MCMC Gaussian + linear-continuum line fit with robust EW propagation."""
     if emcee is None:
         raise ImportError("emcee is required: pip install emcee")
 
-    x, y, e, (c0, c1, _), (amp0, mu0, sig0) = _prep_window(wave, flux, err, center, window, cont_inner)
+    x, y, e, (c0, c1, cov_c_init), (amp0, mu0, sig0) = _prep_window(wave, flux, err, center, window, cont_inner)
     rng = np.random.default_rng(random_state)
+
     p0_center = np.array([amp0, mu0, sig0, c0, c1], dtype=float)
     p0_spread = np.array([
-        max(1e-3, abs(amp0)*0.1),
-        max(1e-3, window*0.02),
-        max(0.02, sig0*0.2),
-        max(1e-3, np.std(y)*0.1 + abs(c0)*0.1),
-        max(1e-6, 0.1*abs(c1) + 1e-4)
+        max(1e-3, abs(amp0) * 0.1),
+        max(1e-3, window * 0.02),
+        max(0.02, sig0 * 0.2),
+        max(1e-3, np.std(y) * 0.1 + abs(c0) * 0.1),
+        max(1e-6, 0.1 * abs(c1) + 1e-4)
     ], dtype=float)
     p0 = p0_center + rng.normal(scale=p0_spread, size=(nwalkers, 5))
 
@@ -277,53 +303,49 @@ def fit_line_mcmc(
     sampler.run_mcmc(p0, nsteps, progress=False)
     chain = sampler.get_chain(discard=nburn, flat=True)
 
-    q16, q50, q84 = np.percentile(chain, [16,50,84], axis=0)
+    q16, q50, q84 = np.percentile(chain, [16, 50, 84], axis=0)
     med = q50
-    perr = 0.5*(q84 - q16)
+    perr = 0.5 * (q84 - q16)
     amp, mu, sig, c0_fit, c1_fit = med
 
-    # flux / EW from posterior
-    flux_samples = np.sqrt(2.0*np.pi) * chain[:,0] * chain[:,2]
+    flux_samples = np.sqrt(2.0 * np.pi) * chain[:, 0] * chain[:, 2]
     flux_line = float(np.median(flux_samples))
-    flux_err  = float(np.std(flux_samples))
-
-    cont_mu_samples = c0_fit + c1_fit*(chain[:,1] - x.mean())
-    ew_samples = flux_samples / np.maximum(cont_mu_samples, 1e-30)
-    ew = float(np.median(ew_samples))
-    ew_err = float(np.std(ew_samples))
-
-    cont_at_mu = float(c0_fit + c1_fit*(mu - x.mean()))
-
+    flux_err = float(np.std(flux_samples))
     cont_at_mu = float(c0_fit + c1_fit * (mu - x.mean()))
+    cov_c = np.cov(chain[:, 3], chain[:, 4])
 
-    # Build result object
+    z = kwargs.get("redshift", 0.0)
+    cont_floor_sigma = kwargs.get("cont_floor_sigma", 3.0)
+
+    ew_obs, ew_obs_err, ew_rest, ew_rest_err = _ew_with_uncertainty(
+        flux_line, flux_err, c0_fit, c1_fit, cov_c, mu, x.mean(),
+        z=z, cont_floor_sigma=cont_floor_sigma
+    )
+
     result = LineFitResult(
         method="mcmc",
         line_name=name,
-        mu=float(mu),         mu_err=float(perr[1]),
-        sigma=float(sig),     sigma_err=float(perr[2]),
-        amp=float(amp),       amp_err=float(perr[0]),
-        flux=float(flux_line),flux_err=float(flux_err),
-        ew=float(ew),         ew_err=float(ew_err),
+        mu=float(mu), mu_err=float(perr[1]),
+        sigma=float(sig), sigma_err=float(perr[2]),
+        amp=float(amp), amp_err=float(perr[0]),
+        flux=float(flux_line), flux_err=float(flux_err),
+        ew=float(ew_obs), ew_err=float(ew_obs_err),
         snr=float(flux_line / max(flux_err, 1e-30)),
         continuum_mu=cont_at_mu,
-        cov=None,
+        cov=cov_c,
         meta={
             "window": window, "cont_inner": cont_inner,
             "nwalkers": nwalkers, "nsteps": nsteps, "nburn": nburn,
-            "amp_prior": amp_prior, "sigma_prior": sigma_prior
+            "amp_prior": amp_prior, "sigma_prior": sigma_prior,
+            "ew_rest": ew_rest, "ew_rest_err": ew_rest_err, "redshift": z
         }
     )
-
-    # --- NEW additions ---
-    result.samples = chain           # full posterior samples for corner plot
-    result.continuum = (c0_fit, c1_fit)  # continuum slope/intercept
-
+    result.samples = chain
+    result.continuum = (c0_fit, c1_fit)
     return result
 
 
-
-# ======= batch runner =======
+# ======= Batch runner =======
 def fit_lines_batch(wave, flux, err, line_centers: dict[str, float], method="leastsq", **kwargs):
     """Fit many lines from {name: center}. kwargs forwarded to fitter."""
     results = {}
@@ -337,21 +359,20 @@ def fit_lines_batch(wave, flux, err, line_centers: dict[str, float], method="lea
                 raise ValueError("method must be 'leastsq' or 'mcmc'")
             results[name] = res
         except Exception as e:
-            results[name] = e  # store the exception so you can inspect failures
+            results[name] = e
     return results
 
 
-    # -----------------------------
-    # 4. Bootstrap (parametric)
-    # -----------------------------
+# ======= Bootstrap (parametric) =======
 def bootstrap_lines(wave, flux, err, line_centers, B=200, method="leastsq",
                     random_state=None, window=20.0, cont_inner=6.0, fitter_kwargs=None):
     """
     Parametric bootstrap: perturb flux with Gaussian noise ~N(0, err),
-    refit all lines, and derive uncertainties on flux, EW, μ.
+    refit all lines, and derive uncertainties on flux, EW, and μ.
     """
     rng = np.random.default_rng(random_state)
     fitter_kwargs = {} if fitter_kwargs is None else dict(fitter_kwargs)
+    z = fitter_kwargs.get("redshift", 0.0)
 
     results_all = {k: {"flux": [], "ew": [], "mu": []} for k in line_centers.keys()}
 
@@ -362,21 +383,19 @@ def bootstrap_lines(wave, flux, err, line_centers, B=200, method="leastsq",
             method=method, window=window, cont_inner=cont_inner, **fitter_kwargs
         )
         for name, res in batch.items():
-            if isinstance(res, Exception):
+            if isinstance(res, Exception) or not np.isfinite(res.flux) or not np.isfinite(res.mu):
                 continue
             results_all[name]["flux"].append(res.flux)
-            results_all[name]["ew"].append(res.ew)
+            if np.isfinite(res.ew) and np.isfinite(res.continuum_mu) and res.continuum_mu > 0:
+                ew_val = res.ew / (1.0 + z)
+                results_all[name]["ew"].append(ew_val)
             results_all[name]["mu"].append(res.mu)
 
-    # Summarise results (median ± std)
     summary = {}
     for name, vals in results_all.items():
-        summary[name] = {}
-        for key, arr in vals.items():
-            arr = np.asarray(arr)
-            summary[name][key] = (np.median(arr), np.std(arr))
+        summary[name] = {key: ((np.nanmedian(arr), np.nanstd(arr)) if len(arr) > 0 else (np.nan, np.nan))
+                         for key, arr in vals.items()}
     return summary
-
 
 
 
