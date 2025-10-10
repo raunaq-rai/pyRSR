@@ -2,20 +2,25 @@
 linefit.py — Gaussian line fitting (least-squares, MCMC, bootstrap, Monte Carlo)
 ================================================================================
 
-Fits a Gaussian emission line plus linear continuum.
+Fits emission lines in astronomical spectra using a Gaussian model plus a
+linear continuum:
 
-Model:
-  F(λ) = A * exp[-(λ - μ)^2 / (2σ^2)] + (c₀ + c₁*(λ - λ̄))
+    F(λ) = A * exp[-(λ - μ)^2 / (2σ^2)] + (c₀ + c₁ * (λ - λ̄))
 
 Parameters:
-  A       amplitude of the line
+  A       amplitude of the Gaussian emission line
   μ       line centre (wavelength)
   σ       Gaussian width (Å)
   c₀, c₁  linear continuum coefficients
 
 Outputs per line (LineFitResult):
   μ ± μ_err, σ ± σ_err, flux ± flux_err, EW ± EW_err, SNR, continuum(μ)
-Dependencies: numpy, scipy, optional emcee
+
+Four independent fitting methods are provided:
+  1. Least-squares        — fast analytic solution via χ² minimisation
+  2. Bootstrap resampling  — empirical uncertainty from data resampling
+  3. Monte Carlo sampling  — parametric draws from LSQ covariance
+  4. MCMC sampling         — full posterior exploration (Bayesian)
 """
 
 from __future__ import annotations
@@ -23,7 +28,6 @@ import numpy as np
 from dataclasses import dataclass, asdict
 from typing import Optional, Dict
 
-# --- optional deps ---
 try:
     from scipy.optimize import curve_fit
 except ImportError:
@@ -35,20 +39,20 @@ except ImportError:
 
 
 # ==================================================================
-# --- Models & utilities
+# --- Models and helper functions
 # ==================================================================
 def _gauss(x, amp, mu, sig):
-    """Pure Gaussian profile."""
+    """Pure Gaussian model."""
     return amp * np.exp(-0.5 * ((x - mu) / np.clip(sig, 1e-9, np.inf)) ** 2)
 
 
 def _gauss_lin(x, amp, mu, sig, c0, c1):
-    """Gaussian + linear continuum."""
+    """Gaussian emission line on top of a linear continuum."""
     return _gauss(x, amp, mu, sig) + (c0 + c1 * (x - x.mean()))
 
 
 def _continuum(x, y, e, mask):
-    """Weighted linear fit y = c0 + c1*(x - xmean) on sidebands."""
+    """Weighted linear regression for the continuum."""
     if mask.sum() < 3:
         return np.nan, 0.0
     w = 1 / np.clip(e[mask], 1e-12, np.inf)**2
@@ -58,7 +62,7 @@ def _continuum(x, y, e, mask):
 
 
 def _sigma_clip(y, mask, lo=3.0, hi=3.0, iters=3):
-    """Sigma-clip a boolean mask."""
+    """Sigma-clipping for robust sideband selection."""
     m = mask.copy()
     for _ in range(iters):
         if not np.any(m):
@@ -71,7 +75,7 @@ def _sigma_clip(y, mask, lo=3.0, hi=3.0, iters=3):
 
 
 def _prep_window(w, f, e, center, win=20, inner=6):
-    """Select fitting window and initial guesses."""
+    """Extracts the fitting window, estimates the continuum, and sets initial parameter guesses."""
     sel = (w > center - win) & (w < center + win)
     if sel.sum() < 8:
         raise ValueError(f"Too few points near {center}")
@@ -81,17 +85,22 @@ def _prep_window(w, f, e, center, win=20, inner=6):
     y_sub = y - (c0 + c1 * (x - x.mean()))
     amp0 = np.nanmax(y_sub)
     mu0 = x[np.nanargmax(y_sub)]
-    sig0 = 1.5  # Å — reasonable starting guess
+    sig0 = 1.5
     return x, y, err, (c0, c1), (amp0, mu0, sig0)
 
 
 def _ew_uncertainty(flux, flux_err, c0, c1, mu, xmean, cov_c=None):
-    """Compute EW and its uncertainty (optionally propagating continuum covariance)."""
+    """
+    Compute equivalent width (EW) and uncertainty.
+
+    EW = flux / continuum(μ)
+    Propagates uncertainty from both line flux and continuum covariance.
+    """
     dx = mu - xmean
     c_mu = np.clip(abs(c0 + c1 * dx), 1e-10, np.inf)
     var_c = 0.0
     if cov_c is not None and np.all(np.isfinite(cov_c)):
-        var_c = cov_c[0,0] + dx**2*cov_c[1,1] + 2*dx*cov_c[0,1]
+        var_c = cov_c[0, 0] + dx**2 * cov_c[1, 1] + 2 * dx * cov_c[0, 1]
         var_c = max(var_c, 0.0)
     sigma_c = np.sqrt(var_c)
     ew = flux / c_mu
@@ -104,6 +113,7 @@ def _ew_uncertainty(flux, flux_err, c0, c1, mu, xmean, cov_c=None):
 # ==================================================================
 @dataclass
 class LineFitResult:
+    """Container for a single emission-line fit."""
     method: str
     name: str
     mu: float
@@ -129,28 +139,45 @@ class LineFitResult:
 # --- Fitting methods
 # ==================================================================
 def fit_line_lsq(w, f, e, center, name=None, window=20, inner=6):
-    """Least-squares Gaussian+linear continuum fit."""
+    """
+    Least-squares Gaussian + linear continuum fit.
+
+    Uses χ² minimisation via `scipy.optimize.curve_fit` to determine
+    the best-fit parameters [A, μ, σ, c₀, c₁]. The covariance matrix
+    returned by curve_fit is used to estimate 1σ parameter errors.
+
+    Returns:
+        LineFitResult with μ, σ, flux, EW, SNR, and uncertainties.
+    """
     if curve_fit is None:
         raise ImportError("scipy required for LSQ")
 
     x, y, err, (c0, c1), (A0, mu0, sig0) = _prep_window(w, f, e, center, window, inner)
     p0 = [A0, mu0, sig0, c0, c1]
-    popt, pcov = curve_fit(_gauss_lin, x, y, p0=p0, sigma=err, absolute_sigma=True, maxfev=20000)
+    popt, pcov = curve_fit(_gauss_lin, x, y, p0=p0, sigma=err,
+                           absolute_sigma=True, maxfev=20000)
     A, mu, sig, c0, c1 = popt
     perr = np.sqrt(np.diag(pcov))
-
     flux = np.sqrt(2 * np.pi) * A * sig
     flux_err = flux * np.sqrt((perr[0]/A)**2 + (perr[2]/sig)**2)
     cont_mu = c0 + c1 * (mu - x.mean())
     cov_c = pcov[3:5, 3:5]
     ew, ew_err = _ew_uncertainty(flux, flux_err, c0, c1, mu, x.mean(), cov_c)
-
     return LineFitResult("leastsq", name, mu, perr[1], sig, perr[2],
                          flux, flux_err, ew, ew_err, flux/flux_err, cont_mu)
 
 
 def fit_line_bootstrap(w, f, e, center, name=None, B=200, **kw):
-    """Bootstrap resampling using repeated LSQ fits."""
+    """
+    Bootstrap resampling method.
+
+    Repeats least-squares fits on B synthetic realisations of the spectrum,
+    each created by adding Gaussian noise drawn from the error array `e`.
+    The distribution of recovered parameters gives robust empirical errors.
+
+    Suitable when the noise distribution is non-Gaussian or data sampling
+    is uneven. Uncertainties are more realistic but typically larger.
+    """
     rng = np.random.default_rng(42)
     fluxes, ews, mus, sigmas = [], [], [], []
     for _ in range(B):
@@ -183,7 +210,20 @@ def fit_line_bootstrap(w, f, e, center, name=None, B=200, **kw):
 
 def fit_line_mcmc(w, f, e, center, name=None, window=20, inner=6,
                   nwalkers=32, nsteps=2000, nburn=500):
-    """MCMC Gaussian+continuum fit (requires emcee)."""
+    """
+    Markov Chain Monte Carlo (MCMC) Gaussian + continuum fit.
+
+    Performs a full Bayesian parameter inference using the `emcee` package.
+    Each walker samples the posterior distribution defined by:
+
+        p(θ | data) ∝ exp(-χ² / 2) * p(θ)
+
+    where χ² is computed from the Gaussian likelihood. Uniform priors
+    enforce positive amplitude and width.
+
+    Recommended when robust posteriors or parameter correlations are required.
+    Returns median parameter values and standard deviations.
+    """
     if emcee is None:
         raise ImportError("emcee not installed")
 
@@ -203,22 +243,19 @@ def fit_line_mcmc(w, f, e, center, name=None, window=20, inner=6,
         lp = log_prior(t)
         return lp + log_like(t) if np.isfinite(lp) else -np.inf
 
-    # Initial ensemble with positive amplitudes and widths
     p0 = np.array([max(A0, 1e-6), mu0, abs(sig0), c0, c1])
     rng = np.random.default_rng(123)
-    p0s = []
-    for _ in range(nwalkers):
-        A = abs(p0[0] * (1 + 0.1 * rng.standard_normal()))
-        mu = p0[1] + 0.1 * rng.standard_normal()
-        sig = abs(p0[2] * (1 + 0.1 * rng.standard_normal()))
-        c0_ = p0[3] * (1 + 0.1 * rng.standard_normal())
-        c1_ = p0[4] * (1 + 0.1 * rng.standard_normal())
-        p0s.append([A, mu, sig, c0_, c1_])
-    p0s = np.array(p0s)
+    p0s = np.array([
+        [abs(p0[0]*(1+0.1*rng.standard_normal())),
+         p0[1]+0.1*rng.standard_normal(),
+         abs(p0[2]*(1+0.1*rng.standard_normal())),
+         p0[3]*(1+0.1*rng.standard_normal()),
+         p0[4]*(1+0.1*rng.standard_normal())]
+        for _ in range(nwalkers)
+    ])
 
     sampler = emcee.EnsembleSampler(nwalkers, 5, log_post)
     sampler.run_mcmc(p0s, nsteps, progress=False)
-
     chain = sampler.get_chain(discard=nburn, flat=True)
     med, std = np.median(chain, axis=0), np.std(chain, axis=0)
     A, mu, sig, c0, c1 = med
@@ -226,13 +263,23 @@ def fit_line_mcmc(w, f, e, center, name=None, window=20, inner=6,
     flux_err = flux * np.sqrt((std[0]/A)**2 + (std[2]/sig)**2)
     cont_mu = c0 + c1*(mu - x.mean())
     ew, ew_err = _ew_uncertainty(flux, flux_err, c0, c1, mu, x.mean())
-
     return LineFitResult("mcmc", name, mu, std[1], sig, std[2],
                          flux, flux_err, ew, ew_err, flux/flux_err, cont_mu, samples=chain)
 
 
 def fit_line_mc(w, f, e, center, name=None, window=20, inner=6, nsamp=2000):
-    """Parametric Monte Carlo around LSQ solution using LSQ covariance."""
+    """
+    Monte Carlo propagation based on LSQ covariance.
+
+    Uses the covariance matrix from a least-squares fit to generate `nsamp`
+    random draws of correlated parameters. Each draw yields a synthetic set
+    of line parameters, from which distributions of flux, EW, μ, and σ are built.
+
+    This method is faster than MCMC but captures correlated uncertainties
+    more accurately than independent Gaussian errors.
+
+    Returns median values and percentile-based 1σ uncertainties.
+    """
     if curve_fit is None:
         raise ImportError("scipy required for MC")
 
@@ -268,36 +315,35 @@ def fit_line_mc(w, f, e, center, name=None, window=20, inner=6, nsamp=2000):
     ew_med, ew_err = qstats(ews)
     mu_med, mu_err = qstats(mus)
     sig_med, sig_err = qstats(sigmas)
-    snr = f_med / f_err if np.isfinite(f_err) and f_err>0 else np.nan
-    cont_mu = base.cont_mu
-
+    snr = f_med / f_err if np.isfinite(f_err) and f_err > 0 else np.nan
     return LineFitResult("montecarlo", name, mu_med, mu_err, sig_med, sig_err,
-                         f_med, f_err, ew_med, ew_err, snr, cont_mu)
+                         f_med, f_err, ew_med, ew_err, snr, base.cont_mu)
 
 
 # ==================================================================
-# --- Multi-line convenience
+# --- Multi-line convenience wrapper
 # ==================================================================
 def fit_lines_all(w, f, e, lines: Dict[str, float], **kw):
-    out = {"leastsq": {}, "bootstrap": {}, "mcmc": {}, "montecarlo": {}}
+    """
+    Convenience function to fit multiple emission lines using all methods.
+
+    Returns a nested dictionary:
+        results[method][line_name] = LineFitResult or Exception
+    """
+    out = {"leastsq": {}, "bootstrap": {}, "montecarlo": {}, "mcmc": {}}
     for name, cen in lines.items():
-        try:
-            out["leastsq"][name] = fit_line_lsq(w, f, e, cen, name=name, **kw)
-        except Exception as ex:
-            out["leastsq"][name] = ex
-        try:
-            out["bootstrap"][name] = fit_line_bootstrap(w, f, e, cen, name=name, **kw)
-        except Exception as ex:
-            out["bootstrap"][name] = ex
-        try:
-            out["montecarlo"][name] = fit_line_mc(w, f, e, cen, name=name, **kw)
-        except Exception as ex:
-            out["montecarlo"][name] = ex
-        if emcee:
+        for method, func in [
+            ("leastsq", fit_line_lsq),
+            ("bootstrap", fit_line_bootstrap),
+            ("montecarlo", fit_line_mc),
+            ("mcmc", fit_line_mcmc if emcee else None),
+        ]:
+            if func is None:
+                continue
             try:
-                out["mcmc"][name] = fit_line_mcmc(w, f, e, cen, name=name, **kw)
+                out[method][name] = func(w, f, e, cen, name=name, **kw)
             except Exception as ex:
-                out["mcmc"][name] = ex
+                out[method][name] = ex
     return out
 
 
