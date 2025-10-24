@@ -1,13 +1,60 @@
 """
-PyRSR — line_fit.py (linear-λ, pure Gaussian)
-=============================================
+PyRSR line_fit — Gaussian line-fitting in linear wavelength (F_λ)
+=================================================================
 
-- Independent Gaussian per line: flux A, width σ_A [Å], centroid μ_A [Å]
-- σ-weighted polynomial continuum with emission-line masking
-- Per-line centroid seeds from local observed peaks
-- Area-normalized Gaussians in F_lambda (A equals integrated flux)
-- Flux density plots (µJy) + [O III] zoom
+This module implements a *linear-wavelength, pure-Gaussian* emission–line fitter
+for JWST/NIRSpec 1D spectra. It provides:
+
+1) A σ–weighted polynomial continuum fitter with robust masking of emission lines.
+2) Independent Gaussian fits for each emission line:
+   - integrated flux A  [erg s⁻¹ cm⁻²]
+   - Gaussian width σ_A [Å]
+   - centroid μ_A       [Å]
+   Each line is fitted *independently* (no tied amplitudes/ratios).
+3) Pixel-integrated model evaluation (bin-averaged Gaussians on pixel edges) so
+   the fitted model respects spectral sampling and does not look “knife–edged”.
+4) Automatic centroid seeding from *local observed peaks* near catalog positions.
+5) Flux density plots (µJy) of *data*, *continuum*, and *continuum+lines*,
+   plus a zoom window around Hβ+[O III] for high-z galaxies.
+6) A parametric bootstrap utility to propagate uncertainties by repeatedly
+   re-fitting spectra with noise realizations (with tqdm progress bar,
+   optional figure saving, and ready-to-print line summaries).
+
+Typical workflow
+----------------
+>>> from astropy.io import fits
+>>> from PyRSR.line_fit import excels_fit_poly, bootstrap_excels_fit
+>>> with fits.open("some.spec.fits") as hdul:
+...     fit = excels_fit_poly(hdul, z=8.27, grating="G395M",
+...                           deg=3, continuum_windows=[(3.05,3.65),(4.05,4.75)],
+...                           plot=True)
+...     boot = bootstrap_excels_fit(hdul, z=8.27, grating="G395M",
+...                                 n_boot=200, deg=3,
+...                                 continuum_windows=[(3.05,3.65),(4.05,4.75)],
+...                                 show_progress=True, plot=True)
+
+Units & conventions
+-------------------
+- Wavelength arrays in **µm**; all line centers/widths reported in **Å**.
+- Flux density in **µJy**; integrated line fluxes in **erg s⁻¹ cm⁻²**.
+- All model profiles are *area-normalized* in F_λ; i.e., the amplitude A is
+  literally the integrated line flux.
+- Instrumental resolution enters only for *masks* and *seeding*; the fit itself
+  is purely Gaussian in λ, not in log λ.
+
+Edge cases / robustness
+-----------------------
+- If continuum windows or Lyman cut remove too much data, the continuum fit
+  falls back to a flat median.
+- Seeds & bounds are “finalized” to guarantee the initial guess is strictly
+  inside the provided bounds (avoids `ValueError: x0 outside bounds`).
+- Bootstrap has conservative outlier rejection per draw and 3σ clipping when
+  summarizing distributions.
+
+See function-level docstrings for detailed parameter/return documentation and
+usage examples.
 """
+
 
 from __future__ import annotations
 import numpy as np
@@ -44,6 +91,28 @@ from PyRSR.line import (
 # ============================================================
 
 def _lyman_cut_um(z: float, which: str | None = "lya") -> float:
+    """
+    Compute the observed Lyman cutoff wavelength in microns.
+
+    Parameters
+    ----------
+    z : float
+        Systemic redshift of the source.
+    which : {"lya", "lyman", None}, optional
+        Which Lyman limit to apply. "lya" uses 1215.67 Å; anything else
+        (e.g. "limit") uses 912 Å. If None, no cutoff is applied.
+
+    Returns
+    -------
+    float
+        Observed wavelength of the chosen Lyman cutoff in **µm**.
+        Returns `-np.inf` when `which is None`.
+
+    Notes
+    -----
+    The cutoff is used by the continuum fitter to exclude blue-ward
+    wavelengths from the polynomial fit.
+    """
     if which is None:
         return -np.inf
     lam_rest_A = 1215.67 if str(which).lower() == "lya" else 912.0
@@ -54,7 +123,28 @@ from scipy.special import erf
 
 
 def _pixel_edges_A(lam_A):
-    """Compute pixel edges (Å) from center grid (Å)."""
+    """
+    Convert a center-grid wavelength array (Å) into pixel edge arrays (Å).
+
+    Parameters
+    ----------
+    lam_A : array_like
+        Monotonic array of *pixel-center* wavelengths in Å.
+
+    Returns
+    -------
+    left_A : ndarray
+        Left pixel edges in Å (same length as `lam_A`).
+    right_A : ndarray
+        Right pixel edges in Å (same length as `lam_A`).
+
+    Notes
+    -----
+    Edges are constructed with a half-difference scheme:
+    the first edge uses the first spacing, and the last edge uses the last
+    spacing, preserving the total span. These edges are used to integrate
+    model Gaussians per pixel (bin averages) for physically realistic profiles.
+    """
     lam_A = np.asarray(lam_A, float)
     d = np.diff(lam_A)
     left  = np.r_[lam_A[0] - d[0]*0.5, lam_A[:-1] + 0.5*d]
@@ -63,8 +153,31 @@ def _pixel_edges_A(lam_A):
 
 def _gauss_binavg_area_normalized_A(lam_left_A, lam_right_A, muA, sigmaA):
     """
-    Per-pixel mean of an area-normalized Gaussian (∫ G dλ = 1) on Å edges.
-    Returns array with same length as lam_left/right (number of pixels).
+    Evaluate a *unit-area* Gaussian on pixel bins and return bin-averaged F_λ.
+
+    Parameters
+    ----------
+    lam_left_A, lam_right_A : array_like
+        Left/right pixel edges in Å (same length).
+    muA : float
+        Gaussian centroid in Å.
+    sigmaA : float
+        Gaussian σ in Å.
+
+    Returns
+    -------
+    mean : ndarray
+        Mean value of the unit-area Gaussian within each pixel (Å⁻¹). When
+        multiplied by an integrated flux A [erg s⁻¹ cm⁻²], this yields the
+        model F_λ profile for that line.
+
+    Notes
+    -----
+    - The function uses the analytic Gaussian CDF to compute the *area*
+      inside each pixel, then divides by pixel width to obtain the mean.
+    - If `sigmaA <= 0` or inputs are non-finite, returns zeros.
+    - This pixel-integration removes the “knife-edge” artifacts that occur
+      when evaluating narrow Gaussians only at pixel centers.
     """
     if not (np.isfinite(muA) and np.isfinite(sigmaA)) or sigmaA <= 0:
         return np.zeros_like(lam_left_A)
@@ -91,6 +204,55 @@ def _safe_median(x, default):
 def fit_continuum_polynomial(lam_um, flam, z, deg=2, windows=None,
                              lyman_cut="lya", sigma_flam=None,
                              grating="PRISM", clip_sigma=2.5, max_iter=5):
+    """
+    Fit a σ-weighted polynomial continuum in F_λ with robust line masking.
+
+    Parameters
+    ----------
+    lam_um : array_like
+        Wavelength grid in **µm** (same length as `flam`).
+    flam : array_like
+        Flux density in **F_λ** units (cgs per Å; use `fnu_uJy_to_flam` upstream).
+    z : float
+        Redshift (used for Lyman cut and to build masking around catalog lines).
+    deg : int, optional
+        Polynomial degree. For gratings, small values (2–3) are recommended.
+    windows : list[tuple[float,float]] | None, optional
+        Optional wavelength windows (in µm) on which the continuum is fitted.
+        If None, the whole post–Lyman-cut range is used.
+    lyman_cut : {"lya", "limit", None}, optional
+        Apply a Lyman cutoff before fitting. None disables it.
+    sigma_flam : array_like | None, optional
+        Per-pixel uncertainties in F_λ. If None, a robust constant is used.
+    grating : str, optional
+        Instrument mode string (used only to scale the masking half-width).
+    clip_sigma : float, optional
+        Sigma-clipping threshold in the normalized residuals used while
+        iteratively refining the fit.
+    max_iter : int, optional
+        Maximum number of robust-fit iterations.
+
+    Returns
+    -------
+    Fcont : ndarray
+        Best-fit polynomial continuum evaluated on `lam_um` (F_λ).
+    coeffs : ndarray
+        Polynomial coefficients in the *power* basis (constant first).
+
+    Algorithm
+    ---------
+    1) Optionally cut the spectrum blueward of the Lyman cutoff.
+    2) Optionally restrict to provided `windows`.
+    3) Mask ±4σ around *all* REST_LINES_A positions extrapolated to z.
+       The mask half-width is derived from the instrumental σ (log A) and
+       converted to Å, then inflated by ×1.5 as a safety margin.
+    4) Weighted least-squares polynomial fit with iterative sigma-clipping.
+
+    Caveats
+    -------
+    - If very few unmasked pixels remain, the routine falls back to a flat
+      continuum equal to the robust median of available pixels.
+    """    
     ly_um = _lyman_cut_um(z, lyman_cut)
     mask = lam_um >= ly_um
 
@@ -146,6 +308,34 @@ def fit_continuum_polynomial(lam_um, flam, z, deg=2, windows=None,
 # ============================================================
 
 def _find_local_peaks(lam_um, resid_flam, expected_um, sigma_gr_um, min_window_um=0.001):
+    """
+    Locate observed local peaks near each expected line center.
+
+    Parameters
+    ----------
+    lam_um : array_like
+        Wavelength grid in µm.
+    resid_flam : array_like
+        Continuum-subtracted F_λ spectrum on `lam_um`.
+    expected_um : array_like
+        Expected observed centers (catalog rest λ × (1+z)) in µm.
+    sigma_gr_um : array_like
+        Instrumental σ (converted to µm) for each expected center.
+        Used to define search windows.
+    min_window_um : float, optional
+        Minimum half-window size in µm to search for a local maximum.
+
+    Returns
+    -------
+    peaks_um : ndarray
+        Observed peak positions in µm (one per input line). If no valid
+        pixels exist in the window, returns the expected center.
+
+    Notes
+    -----
+    These peaks are used solely as *seeds* for the Gaussian centroids μ_A.
+    The actual centroids are then fitted freely within bounds.
+    """
     peaks = []
     for mu0, s_um in zip(expected_um, sigma_gr_um):
         w = max(5.0 * s_um, float(min_window_um))
@@ -166,10 +356,45 @@ def _find_local_peaks(lam_um, resid_flam, expected_um, sigma_gr_um, min_window_u
 
 def build_model_flam_linear(params, lam_um, z, grating, which_lines, mu_seed_um):
     """
-    params per line: [A_1..A_N, sigmaA_1..sigmaA_N, muA_1..muA_N]
-      A_j      : integrated flux (erg s^-1 cm^-2)
-      sigmaA_j : Gaussian sigma in Å
-      muA_j    : centroid in Å
+    Construct the *continuum-subtracted* model as a sum of pixel-integrated Gaussians.
+
+    Parameters
+    ----------
+    params : array_like
+        Concatenated parameter vector of length 3N (N = number of lines):
+        [A_1..A_N, sigmaA_1..sigmaA_N, muA_1..muA_N].
+        - A_j      : integrated flux [erg s⁻¹ cm⁻²]
+        - sigmaA_j : Gaussian σ [Å]
+        - muA_j    : centroid [Å]
+    lam_um : array_like
+        Wavelength grid (µm) on which to evaluate the model.
+    z : float
+        Redshift (unused here; included for interface parity).
+    grating : str
+        Instrument mode (unused here; included for interface parity).
+    which_lines : list[str]
+        Names of the lines being modelled (one per j).
+    mu_seed_um : array_like
+        Seed centroids in µm (unused in evaluation; present for parity/diagnostics).
+
+    Returns
+    -------
+    model : ndarray
+        Model F_λ on `lam_um` representing the *sum of lines only* (continuum
+        is handled upstream).
+    profiles : dict[str, ndarray]
+        Per-line F_λ profiles (same length as `lam_um`).
+    centers : dict[str, tuple[float, float]]
+        Mapping line → (μ_obs_A, σ_log10λ). σ_log10λ is provided for
+        downstream EW utilities that expect widths in log10 λ.
+
+    Implementation details
+    ----------------------
+    - Converts `lam_um` to Å and computes pixel edges.
+    - For each line, evaluates a *unit-area* Gaussian on pixel bins and scales
+      by A_j to obtain the F_λ contribution.
+    - Enforces a minimum σ_A of ~0.35 pixels to avoid pathological “delta-like”
+      spikes caused by sampling narrower than a pixel.
     """
     nL = len(which_lines)
     A = np.array(params[0:nL], float)
@@ -205,6 +430,33 @@ def build_model_flam_linear(params, lam_um, z, grating, which_lines, mu_seed_um)
 # ============================================================
 
 def _finalize_seeds_and_bounds(p0, lb, ub):
+    """
+    Make sure the initial guess is strictly inside the bounds (and bounds sane).
+
+    Parameters
+    ----------
+    p0 : array_like
+        Initial parameter vector.
+    lb, ub : array_like
+        Lower/upper bounds (same length as `p0`).
+
+    Returns
+    -------
+    p0_adj, lb_adj, ub_adj : tuple[ndarray, ndarray, ndarray]
+        Adjusted initial guess and bounds.
+
+    Rationale
+    ---------
+    `scipy.optimize.least_squares` requires the initial guess to lie strictly
+    inside the bounds. This helper:
+      1) Replaces non-finite bounds with wide defaults.
+      2) Fills non-finite x0 entries with midpoint of bounds.
+      3) Nudges x0 slightly away from the boundary by `eps`.
+      4) If any x0 still touches bounds (e.g. equal bounds), widens bounds by 5%.
+
+    This prevents common failures such as:
+        ValueError: Initial guess is outside of provided bounds
+    """
     p0 = np.array(p0, float); lb = np.array(lb, float); ub = np.array(ub, float)
 
     bad = ~np.isfinite(lb) | ~np.isfinite(ub) | (ub <= lb)
@@ -236,6 +488,83 @@ def excels_fit_poly(source, z, grating="PRISM", lines_to_use=None,
                     deg=2, continuum_windows=None, lyman_cut="lya",
                     fit_window_um=None, plot=True, verbose=True,
                     absorption_corrections=None):
+    """
+    Fit a polynomial continuum and independent Gaussians to all lines in range.
+
+    Parameters
+    ----------
+    source : dict | astropy.io.fits.HDUList
+        Either a dictionary with keys:
+            {'lam' or 'wave': µm, 'flux': µJy, 'err': µJy}
+        or an open HDUList whose 'SPEC1D' extension contains the same fields.
+    z : float
+        Systemic redshift of the source.
+    grating : str, optional
+        Instrument mode (e.g., "PRISM", "G395M", "G140H"). Used for seeding and
+        emission-line masking widths in the continuum fit.
+    lines_to_use : list[str] | None, optional
+        Subset of REST_LINES_A keys to fit. If None, auto-select lines that lie
+        inside the wavelength coverage (±0.02 µm margin).
+    deg : int, optional
+        Polynomial degree for the continuum.
+    continuum_windows : list[tuple[float,float]] | None, optional
+        Safe windows (µm) for continuum fitting. If None, uses all λ ≥ Lyman cut.
+    lyman_cut : {"lya", "limit", None}, optional
+        Apply a blue cutoff before continuum fitting.
+    fit_window_um : tuple[float,float] | None, optional
+        Optional global fitting window (µm). If set, the Gaussian fitting
+        operates only within this range; the returned model is zero outside.
+    plot : bool, optional
+        If True, produce a two-panel figure:
+          top  – data, continuum, and (continuum+lines) in µJy over full range;
+          bottom – zoom into the Hβ + [O III] complex (auto window at z).
+    verbose : bool, optional
+        If True, print a short summary of found lines and initial seeds.
+    absorption_corrections : dict | None, optional
+        If provided, pass-through to `apply_balmer_absorption_correction` on
+        the measured line fluxes.
+
+    Returns
+    -------
+    result : dict
+        {
+          'success' : bool,
+          'message' : str,
+          'lam_fit' : ndarray (µm) wavelength grid used for the fit,
+          'model_window_flam' : ndarray (F_λ model of lines only, on lam_fit),
+          'continuum_flam'    : ndarray (F_λ continuum on full grid),
+          'lines' : dict[name → per-line dict],
+          'which_lines' : list[str] (order of fitted lines)
+        }
+
+        Each per-line dict contains:
+          - F_line     : integrated flux [erg s⁻¹ cm⁻²]
+          - sigma_line : formal flux uncertainty from profile-weighted integral
+          - SNR        : F_line / sigma_line
+          - EW_obs_A   : observed-frame equivalent width [Å]
+          - EW0_A      : rest-frame equivalent width [Å]
+          - lam_obs_A  : fitted centroid μ_A [Å]
+          - sigma_A    : fitted Gaussian σ_A [Å]
+          - FWHM_A     : 2√(2 ln 2) σ_A [Å]
+
+    Procedure
+    ---------
+    1) Convert µJy → F_λ and fit the continuum polynomial with robust line masking.
+    2) Subtract continuum; robustly rescale σ if needed.
+    3) Determine which lines are covered; seed μ from local residual peaks.
+    4) Build seeds & bounds for A, σ_A, μ_A per line (looser for PRISM).
+    5) Minimize χ² with per-pixel width weighting (accounting for variable Δλ).
+    6) Construct best-fit line model (continuum-subtracted), then measure line
+       fluxes and equivalent widths using `measure_fluxes_profile_weighted` and
+       `equivalent_widths_A`.
+    7) Optionally plot full spectrum (µJy) and zoom into Hβ+[O III] region.
+
+    Examples
+    --------
+    >>> with fits.open("borg-v4_prism-clear_1747_732.spec.fits") as hdul:
+    ...     res = excels_fit_poly(hdul, z=8.22288, grating="PRISM",
+    ...                           deg=10, continuum_windows=None, plot=True)
+    """
 
     # --- Load spectrum ---
     if isinstance(source, dict):
@@ -434,6 +763,31 @@ def _o3_hb_zoom_bounds_um(z, pad_um=0.03):
     return obsA.min()/1e4 - pad_um, obsA.max()/1e4 + pad_um
 
 def _sigma_clip_mean_std(a, axis=0, sigma=3.0, min_keep=5):
+    """
+    Compute sigma-clipped mean and std along an axis, with finite-sample guard.
+
+    Parameters
+    ----------
+    a : array_like
+        Input array (e.g., stack of bootstrap models).
+    axis : int, optional
+        Axis over which to compute statistics.
+    sigma : float, optional
+        Clipping threshold in median absolute deviations (MAD).
+    min_keep : int, optional
+        Minimum number of finite samples required to keep a position;
+        otherwise it is treated as NaN.
+
+    Returns
+    -------
+    mean, std : ndarray
+        Sigma-clipped mean and standard deviation along `axis`.
+
+    Rationale
+    ---------
+    Bootstrap stacks may contain dropped/failed draws. This helper reduces the
+    influence of outliers while retaining simplicity for plotting mean ±1σ bands.
+    """
     a = np.asarray(a, float)
     med = np.nanmedian(a, axis=axis)
     mad = 1.4826 * np.nanmedian(np.abs(a - np.expand_dims(med, axis=axis)), axis=axis)
@@ -466,13 +820,78 @@ def bootstrap_excels_fit(
     save_transparent: bool = False,
 ):
     """
-    Robust parametric bootstrap for excels_fit_poly.
-    Returns per-line metrics as value ± error (mean ± std of filtered draws)
-    and includes preformatted strings in summary[line][metric]["text"].
+    Run a parametric bootstrap to propagate uncertainties from noise to line fits.
 
-    If `save_path` is provided, the bootstrap figure is saved at `save_dpi`.
-    - If `save_path` is a directory, a filename will be auto-generated.
-    - If it's a filepath, that exact path (and extension) will be used.
+    Parameters
+    ----------
+    source : dict | astropy.io.fits.HDUList
+        Same accepted formats as `excels_fit_poly`. The *same* spectrum is
+        re-fitted repeatedly with synthetic noise draws added.
+    z, grating, deg, continuum_windows, lyman_cut, fit_window_um, absorption_corrections
+        Passed through to `excels_fit_poly` for each draw.
+    n_boot : int, optional
+        Number of bootstrap draws. Increase for tighter uncertainties.
+    random_state : None | int | np.random.Generator, optional
+        Seed or RNG for reproducibility.
+    verbose : bool, optional
+        If True, prints periodic progress (in addition to tqdm if enabled).
+    plot : bool, optional
+        If True, produce a figure with:
+          - full-spectrum data and mean model (±1σ bootstrap band),
+          - a zoom into Hβ+[O III] (same band).
+    show_progress : bool, optional
+        If True and `tqdm` is available, show a progress bar.
+    save_path : str | None, optional
+        If not None, save the bootstrap figure. If a directory is supplied,
+        a filename of the form `bootstrap_<grating>_<n_boot>draws.<ext>` is
+        generated; if a filename is supplied, it is used verbatim.
+    save_dpi : int, optional
+        Figure DPI when saving (e.g., 300/500/600). Has no effect if `plot=False`
+        or `save_path=None`.
+    save_format : str, optional
+        Image format when `save_path` is a directory (e.g., "png", "pdf", "svg").
+        Ignored if `save_path` already contains an extension.
+    save_transparent : bool, optional
+        Save figure with transparent background when True.
+
+    Returns
+    -------
+    result : dict
+        {
+          "samples" : {line: {metric: array}, ...},  # raw per-draw samples
+          "summary" : {line: {metric: {"value","err","text"}}, ...},
+          "which_lines" : list[str],
+          "model_stack_flam" : ndarray  shape (n_boot, N_pix),
+          "keep_mask" : ndarray[bool]   which bootstrap draws were retained,
+          "lam_um" : ndarray            wavelength grid in µm,
+          "data_flux_uJy" : ndarray     original data (µJy),
+        }
+
+    Metrics and summary
+    -------------------
+    For each line and each metric (F_line, EW0_A, sigma_A, lam_obs_A, SNR):
+      - raw samples across accepted draws are stored in `samples`.
+      - a robust “value ± error” is computed as mean ± std on the accepted
+        draws after an optional light 3σ clipping (if ≥ 8 finite points).
+      - the string `"{value} ± {err}"` is provided under `["text"]` for easy printing.
+
+    Quality control / outlier handling
+    ----------------------------------
+    - A first nominal fit (`excels_fit_poly`) establishes sanity caps:
+      `flux_cap = 10×|F_line|`, `width_cap = 10×|σ_A|` per line.
+    - Each draw is rejected if any line is missing, exceeds the above caps,
+      or yields a non-finite centroid.
+    - Additionally, if the total model F_λ magnitude is absurdly large
+      (|F_λ| > 1e-11), the draw is dropped (protects against runaway fits).
+
+    Examples
+    --------
+    >>> boot = bootstrap_excels_fit(hdul, z=8.27, grating="G395M",
+    ...                             n_boot=200, deg=3,
+    ...                             continuum_windows=[(3.05,3.65),(4.05,4.75)],
+    ...                             show_progress=True, plot=True,
+    ...                             save_path="figs", save_dpi=500)
+    >>> print_bootstrap_line_table(boot)
     """
     # -------- load once --------
     if isinstance(source, dict):
