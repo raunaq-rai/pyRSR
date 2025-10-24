@@ -329,65 +329,80 @@ def build_model_flam(params, lam_um, z, grating, which_lines, tie_ratios=None, l
 # ---------------------- FLUX MEASUREMENT --------------------
 # ============================================================
 
-def measure_fluxes_profile_weighted(lam_um, flam_sub, sigma_flam, model_flam, profiles, centers):
+def measure_fluxes_profile_weighted(lam_um, flam_sub, sigma_flam, model_flam, profiles, centers,
+                                    error_floor_frac=0.1):
     """
-    Compute line fluxes and uncertainties using profile-weighted integration.
-
-    The method weights each pixel by the total model flux (handles blended lines)
-    following the FastSpecFit philosophy.
+    Stable, matched-filter line flux estimator.
 
     Parameters
     ----------
-    lam_um : ndarray
-        Observed wavelength grid [µm].
-    flam_sub : ndarray
-        Continuum-subtracted flux [erg/s/cm²/Å].
-    sigma_flam : ndarray
-        Flux uncertainty per pixel.
-    model_flam : ndarray
-        Total model profile.
-    profiles : dict
-        Individual line profiles from build_model_flam().
-    centers : dict
-        Central λ and σ_logA per line.
+    lam_um : array
+        Wavelength grid [µm].
+    flam_sub : array
+        Continuum-subtracted spectrum in F_lambda [cgs].
+    sigma_flam : array
+        1σ uncertainties (same units as flam_sub).
+    model_flam : array
+        Total best-fit line model on `lam_um` (unused for the estimator but kept for API).
+    profiles : dict[str, array]
+        Per-line model profiles on `lam_um` (same units as flam_sub).
+    centers : dict[str, tuple]
+        {name: (mu_A, sigma_logA)} as returned by build_model_flam().
+    error_floor_frac : float
+        Fraction of the global median(σ) to use as a floor to avoid overflows.
 
     Returns
     -------
-    flux_dict : dict
-        {line: {'F_line','sigma_line','mask_idx'}} for each fitted line.
+    dict
+        {line: {"F_line", "sigma_line", "mask_idx"}}
     """
     lam_A = lam_um * 1e4
     dlam_A = np.gradient(lam_A)
+
     out = {}
-    safe_sig2 = np.clip(sigma_flam, 1e-30, None)**2
+
+    # robust error floor to avoid σ→0 pathologies
+    med_sig = np.nanmedian(sigma_flam[np.isfinite(sigma_flam)])
+    sig_floor = error_floor_frac * med_sig if np.isfinite(med_sig) and med_sig > 0 else 0.0
+    safe_sigma = np.clip(sigma_flam, sig_floor, np.inf)
+    safe_sig2  = safe_sigma**2
 
     for name, prof in profiles.items():
         muA, sigma_logA = centers[name]
+
+        # 3σ window in *linear-Å* around the line
         sigma_ln = LN10 * sigma_logA
-        sigma_A = muA * sigma_ln
+        sigma_A  = muA * sigma_ln
         mask = (lam_A > muA - 3*sigma_A) & (lam_A < muA + 3*sigma_A)
         if np.count_nonzero(mask) < 3:
             continue
 
-        G_i = prof[mask]
-        M_i = model_flam[mask]
-        Δλ_i = dlam_A[mask]
-        σ_i2 = safe_sig2[mask]
-        F_i  = flam_sub[mask]
-
-        if np.sum(G_i) <= 0:
+        # template = per-line profile normalized to unit area
+        t = prof[mask].astype(float)
+        dl = dlam_A[mask].astype(float)
+        area = np.sum(t * dl)
+        if not np.isfinite(area) or area <= 0:
             continue
+        T = t / area
 
-        P_i = M_i / np.sum(G_i)
-        w_i = P_i / (Δλ_i * σ_i2)
+        F  = flam_sub[mask].astype(float)
+        s2 = safe_sig2[mask].astype(float)
 
-        num = np.sum(w_i * Δλ_i * F_i)
-        den = np.sum(w_i)
-        F_line = num / den if den > 0 else np.nan
-        sigma_line = np.sqrt(1.0 / np.sum(w_i)) if np.sum(w_i) > 0 else np.nan
+        # matched-filter estimator (numerically stable)
+        num = np.sum((T * F / s2) * dl)
+        den = np.sum((T * T / s2) * dl)
+
+        if not np.isfinite(den) or den <= 0:
+            F_line = np.nan
+            sigma_line = np.nan
+        else:
+            F_line = num / den
+            sigma_line = den**-0.5
 
         out[name] = dict(F_line=F_line, sigma_line=sigma_line, mask_idx=np.where(mask)[0])
+
     return out
+
 
 
 # ============================================================
@@ -429,6 +444,23 @@ def apply_balmer_absorption_correction(line_fluxes, correction_fractions=None):
         out[name] = d2
     return out
 
+# ============================================================
+# -------------------- LINE SELECTION UTILS ------------------
+# ============================================================
+
+def _lines_in_range(z, lam_obs_um, lines=None, margin_um=0.02):
+    """
+    Return the subset of `lines` (or all REST_LINES_A if None) whose
+    observed centres fall within the provided wavelength array (±margin).
+    """
+    lo, hi = np.nanmin(lam_obs_um), np.nanmax(lam_obs_um)
+    pool = REST_LINES_A if lines is None else {k: REST_LINES_A[k] for k in lines}
+    keep = []
+    for nm, lam0_A in pool.items():
+        mu_um = lam0_A * (1.0 + z) / 1e4
+        if (lo - margin_um) <= mu_um <= (hi + margin_um):
+            keep.append(nm)
+    return keep
 
 # ============================================================
 # -------------------- MAIN FITTING ROUTINE ------------------
@@ -436,7 +468,7 @@ def apply_balmer_absorption_correction(line_fluxes, correction_fractions=None):
 
 def excels_fit(source, z, grating="prism-clear", lines_to_use=None, tie_ratios=None,
                plot=True, rest_width_A=350.0, absorption_corrections=None,
-               fit_window_um=None, use_local_baseline=False):
+               fit_window_um=None, use_local_baseline=False,verbose=True):
     """
     Perform emission line fitting on a single spectrum.
 
@@ -512,17 +544,17 @@ def excels_fit(source, z, grating="prism-clear", lines_to_use=None, tie_ratios=N
         lam_fit, resid_fit, sig_fit, Fcont_fit = lam_um, residual_full, sig_flam_full, Fcont
 
     # === Select lines ===
-    which_lines = list(lines_to_use or REST_LINES_A.keys())
-    if fit_window_um:
-        kept = []
-        for nm in which_lines:
-            muA0 = REST_LINES_A[nm]*(1.0 + z)
-            mu_um0 = muA0 / 1e4
-            if (lo-0.02) <= mu_um0 <= (hi+0.02):
-                kept.append(nm)
-        which_lines = kept
+    which_lines = _lines_in_range(z, lam_fit, lines_to_use, margin_um=0.02)
     if not which_lines:
-        raise ValueError("No emission lines in selected window.")
+        raise ValueError("No emission lines fall within the wavelength coverage.")
+
+    if verbose:
+        print(f"Fitting {len(which_lines)} lines in range {lam_fit.min():.2f}-{lam_fit.max():.2f} µm:")
+        for nm in which_lines:
+            mu_um = REST_LINES_A[nm] * (1 + z) / 1e4
+            print(f"  {nm:10s} @ {mu_um:.3f} µm")
+
+
 
     # === Initial parameter seeds ===
     rms = np.nanstd(resid_fit)
@@ -607,3 +639,6 @@ def excels_fit(source, z, grating="prism-clear", lines_to_use=None, tie_ratios=N
         lam_fit=lam_fit,
         Fcont_fit=Fcont_fit,
     )
+
+
+
