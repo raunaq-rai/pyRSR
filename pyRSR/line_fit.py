@@ -14,68 +14,46 @@ for JWST/NIRSpec 1D spectra. It provides:
 3) Pixel-integrated model evaluation (bin-averaged Gaussians on pixel edges) so
    the fitted model respects spectral sampling and does not look “knife–edged”.
 4) Automatic centroid seeding from *local observed peaks* near catalog positions.
-5) Flux density plots (µJy) of *data*, *continuum*, and *continuum+lines*,
-   plus a zoom window around Hβ+[O III] for high-z galaxies.
+5) Flux density plots in **both** µJy and F_λ using bin-aware “stairs” rendering,
+   plus zoom windows around Hβ+[O III] for high-z galaxies (in µJy and F_λ).
+   Data points with ±1σ uncertainties are overplotted in grey on all panels.
 6) A parametric bootstrap utility to propagate uncertainties by repeatedly
    re-fitting spectra with noise realizations (with tqdm progress bar,
    optional figure saving, and ready-to-print line summaries).
-
-Typical workflow
-----------------
->>> from astropy.io import fits
->>> from PyRSR.line_fit import excels_fit_poly, bootstrap_excels_fit
->>> with fits.open("some.spec.fits") as hdul:
-...     fit = excels_fit_poly(hdul, z=8.27, grating="G395M",
-...                           deg=3, continuum_windows=[(3.05,3.65),(4.05,4.75)],
-...                           plot=True)
-...     boot = bootstrap_excels_fit(hdul, z=8.27, grating="G395M",
-...                                 n_boot=200, deg=3,
-...                                 continuum_windows=[(3.05,3.65),(4.05,4.75)],
-...                                 show_progress=True, plot=True)
+7) Grey vertical guides with non-overlapping labels for each emission line.
 
 Units & conventions
 -------------------
 - Wavelength arrays in **µm**; all line centers/widths reported in **Å**.
-- Flux density in **µJy**; integrated line fluxes in **erg s⁻¹ cm⁻²**.
-- All model profiles are *area-normalized* in F_λ; i.e., the amplitude A is
-  literally the integrated line flux.
-- Instrumental resolution enters only for *masks* and *seeding*; the fit itself
-  is purely Gaussian in λ, not in log λ.
-
-Edge cases / robustness
------------------------
-- If continuum windows or Lyman cut remove too much data, the continuum fit
-  falls back to a flat median.
-- Seeds & bounds are “finalized” to guarantee the initial guess is strictly
-  inside the provided bounds (avoids `ValueError: x0 outside bounds`).
-- Bootstrap has conservative outlier rejection per draw and 3σ clipping when
-  summarizing distributions.
-
-See function-level docstrings for detailed parameter/return documentation and
-usage examples.
+- Flux density in **µJy** and in **F_λ** [erg s⁻¹ cm⁻² Å⁻¹].
+- Integrated line fluxes in **erg s⁻¹ cm⁻²**.
+- All model profiles are *area-normalized* in F_λ; the amplitude A is the
+  integrated line flux.
 """
 
-
 from __future__ import annotations
+import os
+from math import sqrt
+
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.transforms import blended_transform_factory
 from astropy.io import fits
-from scipy.optimize import least_squares
 from numpy.polynomial import Polynomial
+from scipy.optimize import least_squares
+from scipy.special import erf
 
-# --- add near the top of line_fit.py (after imports) ---
+# tqdm (auto if available; no-op fallback)
 try:
     from tqdm.auto import tqdm
-except Exception:           # fallback if tqdm isn't installed
+except Exception:  # fallback if tqdm isn't installed
     def tqdm(x, *args, **kwargs):
         return x
-
 
 # --------------------------------------------------------------------
 # Imports from line.py (do not modify that file)
 # --------------------------------------------------------------------
-from PyRSR.line import (
-    C_AA, LN10, REST_LINES_A,
+from PyRSR.ma_line_fit import (
     fnu_uJy_to_flam, flam_to_fnu_uJy,
     sigma_grating_logA,             # σ_gr in log10(λ), λ in µm
     line_centers_obs_A,             # nominal observed centers in Å
@@ -83,119 +61,214 @@ from PyRSR.line import (
     equivalent_widths_A,
     rescale_uncertainties,
     _lines_in_range,
-    apply_balmer_absorption_correction
+    apply_balmer_absorption_correction,
 )
+
+C_AA = 2.99792458e18  #: Speed of light [Å·Hz·s⁻¹]
+LN10 = np.log(10.0)    #: Natural log of 10
+
+#: Rest wavelengths of commonly fitted nebular and recombination lines [Å]
+REST_LINES_A = {
+    "NIII_1": 989.790, "NIII_2": 991.514,"NIII_3": 991.579,
+
+    "NV_1": 1238.821, "NV_2": 1242.804, "NIV_1": 1486.496,
+
+    "HEII_1": 1640.420,  "OIII_05": 1663.4795, "CIII": 1908.734,
+
+    "OII_UV_1": 3727.092, "OII_UV_2": 3729.875,
+    "NEIII_UV_1": 3869.86, "NEIII_UV_2": 3968.59,
+    "HDELTA": 4102.8922, "HGAMMA": 4341.6837, "OIII_1": 4364.436,
+    "HEI_1": 4471.479, 
+    
+    "HEII_2": 4685.710, "HBETA": 4862.6830,
+    "OIII_2": 4960.295, "OIII_3": 5008.240, 
+    
+    "NII_1":5756.19,"HEI": 5877.252,
+    
+     "NII_2": 6549.86, "HALPHA": 6564.608, "NII_3":6585.27 ,"SII_1": 6718.295, "SII_2": 6732.674,
+}
 
 # ============================================================
 # Helpers
 # ============================================================
 
 def _lyman_cut_um(z: float, which: str | None = "lya") -> float:
-    """
-    Compute the observed Lyman cutoff wavelength in microns.
-
-    Parameters
-    ----------
-    z : float
-        Systemic redshift of the source.
-    which : {"lya", "lyman", None}, optional
-        Which Lyman limit to apply. "lya" uses 1215.67 Å; anything else
-        (e.g. "limit") uses 912 Å. If None, no cutoff is applied.
-
-    Returns
-    -------
-    float
-        Observed wavelength of the chosen Lyman cutoff in **µm**.
-        Returns `-np.inf` when `which is None`.
-
-    Notes
-    -----
-    The cutoff is used by the continuum fitter to exclude blue-ward
-    wavelengths from the polynomial fit.
-    """
     if which is None:
         return -np.inf
     lam_rest_A = 1215.67 if str(which).lower() == "lya" else 912.0
     return lam_rest_A * (1.0 + z) / 1e4  # µm
 
-from math import sqrt
-from scipy.special import erf
-
-
-def _pixel_edges_A(lam_A):
-    """
-    Convert a center-grid wavelength array (Å) into pixel edge arrays (Å).
-
-    Parameters
-    ----------
-    lam_A : array_like
-        Monotonic array of *pixel-center* wavelengths in Å.
-
-    Returns
-    -------
-    left_A : ndarray
-        Left pixel edges in Å (same length as `lam_A`).
-    right_A : ndarray
-        Right pixel edges in Å (same length as `lam_A`).
-
-    Notes
-    -----
-    Edges are constructed with a half-difference scheme:
-    the first edge uses the first spacing, and the last edge uses the last
-    spacing, preserving the total span. These edges are used to integrate
-    model Gaussians per pixel (bin averages) for physically realistic profiles.
-    """
+def _pixel_edges_A(lam_A: np.ndarray):
+    """Pixel edges in Å from a center-grid wavelength array in Å."""
     lam_A = np.asarray(lam_A, float)
     d = np.diff(lam_A)
-    left  = np.r_[lam_A[0] - d[0]*0.5, lam_A[:-1] + 0.5*d]
-    right = np.r_[lam_A[:-1] + 0.5*d, lam_A[-1] + d[-1]*0.5]
+    left  = np.r_[lam_A[0] - 0.5*d[0], lam_A[:-1] + 0.5*d]
+    right = np.r_[lam_A[:-1] + 0.5*d, lam_A[-1] + 0.5*d[-1]]
+    return left, right
+
+def _pixel_edges_um(lam_um: np.ndarray):
+    """Pixel edges in µm from a center-grid wavelength array in µm."""
+    lam_um = np.asarray(lam_um, float)
+    d = np.diff(lam_um)
+    left  = np.r_[lam_um[0] - 0.5*d[0], lam_um[:-1] + 0.5*d]
+    right = np.r_[lam_um[:-1] + 0.5*d, lam_um[-1] + 0.5*d[-1]]
     return left, right
 
 def _gauss_binavg_area_normalized_A(lam_left_A, lam_right_A, muA, sigmaA):
     """
-    Evaluate a *unit-area* Gaussian on pixel bins and return bin-averaged F_λ.
-
-    Parameters
-    ----------
-    lam_left_A, lam_right_A : array_like
-        Left/right pixel edges in Å (same length).
-    muA : float
-        Gaussian centroid in Å.
-    sigmaA : float
-        Gaussian σ in Å.
-
-    Returns
-    -------
-    mean : ndarray
-        Mean value of the unit-area Gaussian within each pixel (Å⁻¹). When
-        multiplied by an integrated flux A [erg s⁻¹ cm⁻²], this yields the
-        model F_λ profile for that line.
-
-    Notes
-    -----
-    - The function uses the analytic Gaussian CDF to compute the *area*
-      inside each pixel, then divides by pixel width to obtain the mean.
-    - If `sigmaA <= 0` or inputs are non-finite, returns zeros.
-    - This pixel-integration removes the “knife-edge” artifacts that occur
-      when evaluating narrow Gaussians only at pixel centers.
+    Mean value (per pixel) of a *unit-area* Gaussian over [left,right] bins (Å⁻¹).
     """
     if not (np.isfinite(muA) and np.isfinite(sigmaA)) or sigmaA <= 0:
         return np.zeros_like(lam_left_A)
     inv = 1.0 / (sqrt(2.0) * sigmaA)
-    # CDF differences over each pixel, then divide by pixel width => mean flux density
-    cdf_right = 0.5 * (1.0 + erf((lam_right_A - muA) * inv))
-    cdf_left  = 0.5 * (1.0 + erf((lam_left_A  - muA) * inv))
-    area = cdf_right - cdf_left
+    cdf_r = 0.5 * (1.0 + erf((lam_right_A - muA) * inv))
+    cdf_l = 0.5 * (1.0 + erf((lam_left_A  - muA) * inv))
+    area = cdf_r - cdf_l
     width = (lam_right_A - lam_left_A)
     width = np.where(width > 0, width, np.nan)
     mean = area / width
-    mean[~np.isfinite(mean)] = 0.0
+    mean[ ~np.isfinite(mean) ] = 0.0
     return mean
 
 def _safe_median(x, default):
     x = np.asarray(x, float)
     v = np.nanmedian(x[np.isfinite(x)]) if np.any(np.isfinite(x)) else np.nan
     return v if np.isfinite(v) else default
+
+# ---------- NEW: line annotation helper (grey vertical lines + de-overlapped labels)
+def _annotate_lines(ax, which_lines, z, per_line=None,
+                    color='0.7', text_color='0.25',
+                    lw=0.8, alpha=0.7,
+                    levels=(0.90, 0.78, 0.66, 0.54),
+                    min_dx_um=0.01,
+                    fontsize=8,
+                    only_within_xlim=True,
+                    shorten_names=True):
+    """
+    Draw grey vertical lines at each line's observed wavelength and add labels with
+    minimal overlap by staggering them across multiple y-levels (axes fraction).
+    """
+    if not which_lines:
+        return
+
+    xs = []
+    labels = []
+    for nm in which_lines:
+        if (per_line is not None) and (nm in per_line) and np.isfinite(per_line[nm].get('lam_obs_A', np.nan)):
+            lam_um = per_line[nm]['lam_obs_A'] / 1e4
+        else:
+            lam_um = REST_LINES_A[nm] * (1.0 + z) / 1e4
+
+        lab = nm
+        if shorten_names:
+            lab = lab.replace('[', '').replace(']', '')
+            lab = lab.replace('_', ' ')
+        xs.append(float(lam_um))
+        labels.append(lab)
+
+    xs = np.asarray(xs, float)
+    labels = np.asarray(labels, object)
+
+    if only_within_xlim:
+        xlo, xhi = ax.get_xlim()
+        keep = (xs >= xlo) & (xs <= xhi)
+        xs = xs[keep]; labels = labels[keep]
+
+    if xs.size == 0:
+        return
+
+    order = np.argsort(xs)
+    xs = xs[order]; labels = labels[order]
+
+    trans = blended_transform_factory(ax.transData, ax.transAxes)
+    last_x_at_level = np.full(len(levels), -np.inf)
+
+    for xval, lab in zip(xs, labels):
+        ax.axvline(xval, color=color, lw=lw, alpha=alpha, zorder=0)
+        level_idx = None
+        for i, x_last in enumerate(last_x_at_level):
+            if (xval - x_last) >= min_dx_um:
+                level_idx = i
+                break
+        if level_idx is None:
+            level_idx = len(levels) - 1
+
+        y_frac = levels[level_idx]
+        last_x_at_level[level_idx] = xval
+
+        ax.text(xval, y_frac, lab,
+                rotation=90, ha='center', va='bottom',
+                color=text_color, fontsize=fontsize,
+                transform=trans, zorder=5,
+                bbox=dict(facecolor='white', edgecolor='none', alpha=0.5, pad=0.5))
+
+# ============================================================
+# NEW: Two-window continuum selection around observed Lyα
+# ============================================================
+
+def continuum_windows_two_sides_of_lya(
+    lam_source_or_dict,
+    z: float,
+    buffer_rest_A: float = 200.0,  # exclude ± this many rest-Å around Lyα
+    min_pts: int = 12,             # require at least this many pixels per side
+    verbose: bool = False,
+):
+    """
+    Return up to two (lo_um, hi_um) windows for continuum fitting:
+      - Blueward: [λ_min,  λ_Lyα_obs - buffer_obs]
+      - Redward : [λ_Lyα_obs + buffer_obs, λ_max]
+    Any side with < min_pts is dropped.
+
+    Parameters
+    ----------
+    lam_source_or_dict : array-like of λ(µm) OR a dict with 'lam'/'wave'
+    z : float
+    buffer_rest_A : float
+    min_pts : int
+    verbose : bool
+    """
+    # Accept dict or array of wavelengths
+    if isinstance(lam_source_or_dict, dict):
+        lam_um = np.asarray(
+            lam_source_or_dict.get("lam", lam_source_or_dict.get("wave")), float
+        )
+    else:
+        lam_um = np.asarray(lam_source_or_dict, float)
+
+    if lam_um.size == 0:
+        return []
+
+    lam_um = lam_um[np.isfinite(lam_um)]
+    if lam_um.size == 0:
+        return []
+
+    lam_min, lam_max = float(np.min(lam_um)), float(np.max(lam_um))
+
+    # Observed Lyα and observed buffer (in µm)
+    LYA_REST_A = 1215.67
+    lya_obs_um = LYA_REST_A * (1.0 + z) / 1e4
+    buf_obs_um = buffer_rest_A * (1.0 + z) / 1e4
+
+    blue_lo, blue_hi = lam_min, min(lya_obs_um - buf_obs_um, lam_max)
+    red_lo,  red_hi  = max(lya_obs_um + buf_obs_um, lam_min), lam_max
+
+    windows = []
+
+    def maybe_add(lo, hi):
+        if not (np.isfinite(lo) and np.isfinite(hi) and hi > lo):
+            return
+        sel = (lam_um >= lo) & (lam_um <= hi)
+        if np.count_nonzero(sel) >= min_pts:
+            windows.append((float(lo), float(hi)))
+
+    maybe_add(blue_lo, blue_hi)
+    maybe_add(red_lo,  red_hi)
+
+    if verbose:
+        print(f"Lyman-α (obs): {lya_obs_um:.5f} µm | buffer: ±{buffer_rest_A:.0f} Å (rest)")
+        print(f"Continuum windows (blue/red): {windows if windows else '(none)'}")
+
+    return windows
 
 # ============================================================
 # Continuum (σ-weighted polynomial, with line masking)
@@ -204,55 +277,6 @@ def _safe_median(x, default):
 def fit_continuum_polynomial(lam_um, flam, z, deg=2, windows=None,
                              lyman_cut="lya", sigma_flam=None,
                              grating="PRISM", clip_sigma=2.5, max_iter=5):
-    """
-    Fit a σ-weighted polynomial continuum in F_λ with robust line masking.
-
-    Parameters
-    ----------
-    lam_um : array_like
-        Wavelength grid in **µm** (same length as `flam`).
-    flam : array_like
-        Flux density in **F_λ** units (cgs per Å; use `fnu_uJy_to_flam` upstream).
-    z : float
-        Redshift (used for Lyman cut and to build masking around catalog lines).
-    deg : int, optional
-        Polynomial degree. For gratings, small values (2–3) are recommended.
-    windows : list[tuple[float,float]] | None, optional
-        Optional wavelength windows (in µm) on which the continuum is fitted.
-        If None, the whole post–Lyman-cut range is used.
-    lyman_cut : {"lya", "limit", None}, optional
-        Apply a Lyman cutoff before fitting. None disables it.
-    sigma_flam : array_like | None, optional
-        Per-pixel uncertainties in F_λ. If None, a robust constant is used.
-    grating : str, optional
-        Instrument mode string (used only to scale the masking half-width).
-    clip_sigma : float, optional
-        Sigma-clipping threshold in the normalized residuals used while
-        iteratively refining the fit.
-    max_iter : int, optional
-        Maximum number of robust-fit iterations.
-
-    Returns
-    -------
-    Fcont : ndarray
-        Best-fit polynomial continuum evaluated on `lam_um` (F_λ).
-    coeffs : ndarray
-        Polynomial coefficients in the *power* basis (constant first).
-
-    Algorithm
-    ---------
-    1) Optionally cut the spectrum blueward of the Lyman cutoff.
-    2) Optionally restrict to provided `windows`.
-    3) Mask ±4σ around *all* REST_LINES_A positions extrapolated to z.
-       The mask half-width is derived from the instrumental σ (log A) and
-       converted to Å, then inflated by ×1.5 as a safety margin.
-    4) Weighted least-squares polynomial fit with iterative sigma-clipping.
-
-    Caveats
-    -------
-    - If very few unmasked pixels remain, the routine falls back to a flat
-      continuum equal to the robust median of available pixels.
-    """    
     ly_um = _lyman_cut_um(z, lyman_cut)
     mask = lam_um >= ly_um
 
@@ -308,34 +332,6 @@ def fit_continuum_polynomial(lam_um, flam, z, deg=2, windows=None,
 # ============================================================
 
 def _find_local_peaks(lam_um, resid_flam, expected_um, sigma_gr_um, min_window_um=0.001):
-    """
-    Locate observed local peaks near each expected line center.
-
-    Parameters
-    ----------
-    lam_um : array_like
-        Wavelength grid in µm.
-    resid_flam : array_like
-        Continuum-subtracted F_λ spectrum on `lam_um`.
-    expected_um : array_like
-        Expected observed centers (catalog rest λ × (1+z)) in µm.
-    sigma_gr_um : array_like
-        Instrumental σ (converted to µm) for each expected center.
-        Used to define search windows.
-    min_window_um : float, optional
-        Minimum half-window size in µm to search for a local maximum.
-
-    Returns
-    -------
-    peaks_um : ndarray
-        Observed peak positions in µm (one per input line). If no valid
-        pixels exist in the window, returns the expected center.
-
-    Notes
-    -----
-    These peaks are used solely as *seeds* for the Gaussian centroids μ_A.
-    The actual centroids are then fitted freely within bounds.
-    """
     peaks = []
     for mu0, s_um in zip(expected_um, sigma_gr_um):
         w = max(5.0 * s_um, float(min_window_um))
@@ -355,47 +351,6 @@ def _find_local_peaks(lam_um, resid_flam, expected_um, sigma_gr_um, min_window_u
 # ============================================================
 
 def build_model_flam_linear(params, lam_um, z, grating, which_lines, mu_seed_um):
-    """
-    Construct the *continuum-subtracted* model as a sum of pixel-integrated Gaussians.
-
-    Parameters
-    ----------
-    params : array_like
-        Concatenated parameter vector of length 3N (N = number of lines):
-        [A_1..A_N, sigmaA_1..sigmaA_N, muA_1..muA_N].
-        - A_j      : integrated flux [erg s⁻¹ cm⁻²]
-        - sigmaA_j : Gaussian σ [Å]
-        - muA_j    : centroid [Å]
-    lam_um : array_like
-        Wavelength grid (µm) on which to evaluate the model.
-    z : float
-        Redshift (unused here; included for interface parity).
-    grating : str
-        Instrument mode (unused here; included for interface parity).
-    which_lines : list[str]
-        Names of the lines being modelled (one per j).
-    mu_seed_um : array_like
-        Seed centroids in µm (unused in evaluation; present for parity/diagnostics).
-
-    Returns
-    -------
-    model : ndarray
-        Model F_λ on `lam_um` representing the *sum of lines only* (continuum
-        is handled upstream).
-    profiles : dict[str, ndarray]
-        Per-line F_λ profiles (same length as `lam_um`).
-    centers : dict[str, tuple[float, float]]
-        Mapping line → (μ_obs_A, σ_log10λ). σ_log10λ is provided for
-        downstream EW utilities that expect widths in log10 λ.
-
-    Implementation details
-    ----------------------
-    - Converts `lam_um` to Å and computes pixel edges.
-    - For each line, evaluates a *unit-area* Gaussian on pixel bins and scales
-      by A_j to obtain the F_λ contribution.
-    - Enforces a minimum σ_A of ~0.35 pixels to avoid pathological “delta-like”
-      spikes caused by sampling narrower than a pixel.
-    """
     nL = len(which_lines)
     A = np.array(params[0:nL], float)
     sigmaA = np.array(params[nL:2*nL], float)
@@ -413,71 +368,36 @@ def build_model_flam_linear(params, lam_um, z, grating, which_lines, mu_seed_um)
 
     for j, name in enumerate(which_lines):
         sj = np.clip(sigmaA[j], min_sigma, 1e6)
-        # mean flux density per pixel from unit-area Gaussian, then scale by flux A_j
         profA = _gauss_binavg_area_normalized_A(left_A, right_A, muA[j], sj)
         prof_flam = A[j] * profA
         model += prof_flam
         profiles[name] = prof_flam
-        # for EW machinery: supply (mu_A, sigma_log10λ) — convert σ_A→σ_log10λ
         sigma_logA = sj / (muA[j] * LN10) if (np.isfinite(muA[j]) and muA[j] > 0) else np.nan
         centers[name] = (muA[j], sigma_logA)
 
     return model, profiles, centers
 
-
 # ============================================================
-# Robust seeds/bounds finalization (prevents x0-outside-bounds)
+# Robust seeds/bounds finalization
 # ============================================================
 
 def _finalize_seeds_and_bounds(p0, lb, ub):
-    """
-    Make sure the initial guess is strictly inside the bounds (and bounds sane).
-
-    Parameters
-    ----------
-    p0 : array_like
-        Initial parameter vector.
-    lb, ub : array_like
-        Lower/upper bounds (same length as `p0`).
-
-    Returns
-    -------
-    p0_adj, lb_adj, ub_adj : tuple[ndarray, ndarray, ndarray]
-        Adjusted initial guess and bounds.
-
-    Rationale
-    ---------
-    `scipy.optimize.least_squares` requires the initial guess to lie strictly
-    inside the bounds. This helper:
-      1) Replaces non-finite bounds with wide defaults.
-      2) Fills non-finite x0 entries with midpoint of bounds.
-      3) Nudges x0 slightly away from the boundary by `eps`.
-      4) If any x0 still touches bounds (e.g. equal bounds), widens bounds by 5%.
-
-    This prevents common failures such as:
-        ValueError: Initial guess is outside of provided bounds
-    """
     p0 = np.array(p0, float); lb = np.array(lb, float); ub = np.array(ub, float)
-
     bad = ~np.isfinite(lb) | ~np.isfinite(ub) | (ub <= lb)
     if np.any(bad):
         lb[bad] = -1e6
         ub[bad] =  1e6
-
     p0_bad = ~np.isfinite(p0)
     if np.any(p0_bad):
         p0[p0_bad] = 0.5*(lb[p0_bad] + ub[p0_bad])
-
     eps = 1e-10
     p0 = np.minimum(np.maximum(p0, lb + eps), ub - eps)
-
     outside = (p0 <= lb) | (p0 >= ub)
     if np.any(outside):
         span = np.maximum(ub - lb, 1e-8)
         lb[outside] -= 0.05*span[outside]
         ub[outside] += 0.05*span[outside]
         p0[outside] = np.minimum(np.maximum(p0[outside], lb[outside] + eps), ub[outside] - eps)
-
     return p0, lb, ub
 
 # ============================================================
@@ -488,84 +408,6 @@ def excels_fit_poly(source, z, grating="PRISM", lines_to_use=None,
                     deg=2, continuum_windows=None, lyman_cut="lya",
                     fit_window_um=None, plot=True, verbose=True,
                     absorption_corrections=None):
-    """
-    Fit a polynomial continuum and independent Gaussians to all lines in range.
-
-    Parameters
-    ----------
-    source : dict | astropy.io.fits.HDUList
-        Either a dictionary with keys:
-            {'lam' or 'wave': µm, 'flux': µJy, 'err': µJy}
-        or an open HDUList whose 'SPEC1D' extension contains the same fields.
-    z : float
-        Systemic redshift of the source.
-    grating : str, optional
-        Instrument mode (e.g., "PRISM", "G395M", "G140H"). Used for seeding and
-        emission-line masking widths in the continuum fit.
-    lines_to_use : list[str] | None, optional
-        Subset of REST_LINES_A keys to fit. If None, auto-select lines that lie
-        inside the wavelength coverage (±0.02 µm margin).
-    deg : int, optional
-        Polynomial degree for the continuum.
-    continuum_windows : list[tuple[float,float]] | None, optional
-        Safe windows (µm) for continuum fitting. If None, uses all λ ≥ Lyman cut.
-    lyman_cut : {"lya", "limit", None}, optional
-        Apply a blue cutoff before continuum fitting.
-    fit_window_um : tuple[float,float] | None, optional
-        Optional global fitting window (µm). If set, the Gaussian fitting
-        operates only within this range; the returned model is zero outside.
-    plot : bool, optional
-        If True, produce a two-panel figure:
-          top  – data, continuum, and (continuum+lines) in µJy over full range;
-          bottom – zoom into the Hβ + [O III] complex (auto window at z).
-    verbose : bool, optional
-        If True, print a short summary of found lines and initial seeds.
-    absorption_corrections : dict | None, optional
-        If provided, pass-through to `apply_balmer_absorption_correction` on
-        the measured line fluxes.
-
-    Returns
-    -------
-    result : dict
-        {
-          'success' : bool,
-          'message' : str,
-          'lam_fit' : ndarray (µm) wavelength grid used for the fit,
-          'model_window_flam' : ndarray (F_λ model of lines only, on lam_fit),
-          'continuum_flam'    : ndarray (F_λ continuum on full grid),
-          'lines' : dict[name → per-line dict],
-          'which_lines' : list[str] (order of fitted lines)
-        }
-
-        Each per-line dict contains:
-          - F_line     : integrated flux [erg s⁻¹ cm⁻²]
-          - sigma_line : formal flux uncertainty from profile-weighted integral
-          - SNR        : F_line / sigma_line
-          - EW_obs_A   : observed-frame equivalent width [Å]
-          - EW0_A      : rest-frame equivalent width [Å]
-          - lam_obs_A  : fitted centroid μ_A [Å]
-          - sigma_A    : fitted Gaussian σ_A [Å]
-          - FWHM_A     : 2√(2 ln 2) σ_A [Å]
-
-    Procedure
-    ---------
-    1) Convert µJy → F_λ and fit the continuum polynomial with robust line masking.
-    2) Subtract continuum; robustly rescale σ if needed.
-    3) Determine which lines are covered; seed μ from local residual peaks.
-    4) Build seeds & bounds for A, σ_A, μ_A per line (looser for PRISM).
-    5) Minimize χ² with per-pixel width weighting (accounting for variable Δλ).
-    6) Construct best-fit line model (continuum-subtracted), then measure line
-       fluxes and equivalent widths using `measure_fluxes_profile_weighted` and
-       `equivalent_widths_A`.
-    7) Optionally plot full spectrum (µJy) and zoom into Hβ+[O III] region.
-
-    Examples
-    --------
-    >>> with fits.open("borg-v4_prism-clear_1747_732.spec.fits") as hdul:
-    ...     res = excels_fit_poly(hdul, z=8.22288, grating="PRISM",
-    ...                           deg=10, continuum_windows=None, plot=True)
-    """
-
     # --- Load spectrum ---
     if isinstance(source, dict):
         lam_um = np.asarray(source.get("lam", source.get("wave")), float)
@@ -581,9 +423,23 @@ def excels_fit_poly(source, z, grating="PRISM", lines_to_use=None,
     ok = np.isfinite(lam_um) & np.isfinite(flux_uJy) & np.isfinite(err_uJy) & (err_uJy > 0)
     lam_um, flux_uJy, err_uJy = lam_um[ok], flux_uJy[ok], err_uJy[ok]
 
+    # --- AUTO continuum windows around Lyα if requested ---
+    auto_windows = None
+    if isinstance(continuum_windows, str) and continuum_windows.lower() == "two_sided_lya":
+        auto_windows = continuum_windows_two_sides_of_lya(lam_um, z, buffer_rest_A=200.0, min_pts=12, verbose=verbose)
+    elif isinstance(continuum_windows, dict) and continuum_windows.get("mode", "").lower() == "two_sided_lya":
+        brA = float(continuum_windows.get("buffer_rest_A", 200.0))
+        mpts = int(continuum_windows.get("min_pts", 12))
+        auto_windows = continuum_windows_two_sides_of_lya(lam_um, z, buffer_rest_A=brA, min_pts=mpts, verbose=verbose)
+
+    if auto_windows is not None:
+        continuum_windows = auto_windows
+        # when explicit windows are supplied, disable the global lyman_cut (we already gapped Lyα)
+        lyman_cut = None
+
     # --- Convert to F_lambda ---
-    flam = fnu_uJy_to_flam(flux_uJy, lam_um)
-    sig_flam = fnu_uJy_to_flam(err_uJy, lam_um)
+    flam = fnu_uJy_to_flam(flux_uJy, lam_um)       # data in Fλ
+    sig_flam = fnu_uJy_to_flam(err_uJy, lam_um)    # data 1σ in Fλ
 
     # --- Continuum ---
     Fcont, _ = fit_continuum_polynomial(
@@ -591,15 +447,15 @@ def excels_fit_poly(source, z, grating="PRISM", lines_to_use=None,
         lyman_cut=lyman_cut, sigma_flam=sig_flam, grating=grating
     )
     resid_full = flam - Fcont
-    sig_flam = rescale_uncertainties(resid_full, sig_flam)
+    sig_flam_fit = rescale_uncertainties(resid_full, sig_flam)  # used in fitting (not for display)
 
     # --- Fit window ---
     if fit_window_um:
         lo, hi = fit_window_um
         w = (lam_um >= lo) & (lam_um <= hi)
-        lam_fit, resid_fit, sig_fit, Fcont_fit = lam_um[w], resid_full[w], sig_flam[w], Fcont[w]
+        lam_fit, resid_fit, sig_fit, Fcont_fit = lam_um[w], resid_full[w], sig_flam_fit[w], Fcont[w]
     else:
-        lam_fit, resid_fit, sig_fit, Fcont_fit = lam_um, resid_full, sig_flam, Fcont
+        lam_fit, resid_fit, sig_fit, Fcont_fit = lam_um, resid_full, sig_flam_fit, Fcont
 
     # --- Lines in coverage ---
     which_lines = _lines_in_range(z, lam_fit, lines_to_use, margin_um=0.02)
@@ -670,20 +526,15 @@ def excels_fit_poly(source, z, grating="PRISM", lines_to_use=None,
         res.x, lam_fit, z, grating, which_lines, mu_seed_um
     )
 
-    # --- Fluxes & EWs (call with POSITIONAL args; no kwargs) ---
+    # --- Fluxes & EWs ---
     fluxes = measure_fluxes_profile_weighted(
-        lam_fit,                # lam_um
-        resid_fit,              # flam_sub (continuum-subtracted)
-        sig_fit,                # sigma_flam
-        model_flam_win,         # model_flam
-        profiles_win,           # profiles
-        centers                 # centers
+        lam_fit, resid_fit, sig_fit, model_flam_win, profiles_win, centers
     )
     ews = equivalent_widths_A(fluxes, lam_fit, Fcont_fit, z, centers)
     if absorption_corrections:
         fluxes = apply_balmer_absorption_correction(fluxes, absorption_corrections)
 
-    # --- Collect per-line outputs (add σ_A & FWHM_A for convenience) ---
+    # --- Collect per-line outputs ---
     per_line = {}
     for j, name in enumerate(which_lines):
         F_line   = fluxes.get(name, {}).get("F_line", np.nan)
@@ -702,38 +553,109 @@ def excels_fit_poly(source, z, grating="PRISM", lines_to_use=None,
             lam_obs_A=muA, sigma_A=sigma_A, FWHM_A=FWHM_A
         )
 
-    # --- Plot in flux density (µJy): data & (continuum + lines) ---
+    # --- Plot (bin-aware stairs) in µJy + F_lambda + zooms + data errorbars + line labels ---
     if plot:
+        # line+cont model on full grid (Fλ)
         if fit_window_um:
             model_full = np.zeros_like(lam_um)
+            w = (lam_um >= lo) & (lam_um <= hi)  # from above
             model_full[w] = model_flam_win
             total_model_flam = Fcont + model_full
         else:
             total_model_flam = Fcont + model_flam_win
 
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(11, 7), sharex=False,
-                                       gridspec_kw={'height_ratios': [1.6, 1.0]})
+        # Convert for µJy panels
+        cont_uJy  = flam_to_fnu_uJy(Fcont,            lam_um)
+        model_uJy = flam_to_fnu_uJy(total_model_flam, lam_um)
 
-        # Full
-        ax1.plot(lam_um, flux_uJy, 'k-', lw=0.8, label='Data')
-        ax1.plot(lam_um, flam_to_fnu_uJy(Fcont, lam_um), 'b--', lw=1.0, label=f'Continuum (deg={deg})')
-        ax1.plot(lam_um, flam_to_fnu_uJy(total_model_flam, lam_um), 'r-', lw=1.2, label='Continuum + Lines')
-        ax1.set_ylabel('Flux density [µJy]')
-        ax1.legend(ncol=3, fontsize=9)
-        ax1.grid(alpha=0.25)
+        # Pixel edges for stairs
+        left_um, right_um = _pixel_edges_um(lam_um)
+        edges_um = np.r_[left_um[0], right_um]
 
-        # Zoom [O III] region (typical for z~8)
+        # Zoom bounds
         o3_lo, o3_hi = 4.45, 4.70
         mZ = (lam_um > o3_lo) & (lam_um < o3_hi)
-        if np.any(mZ):
-            ax2.plot(lam_um[mZ], flux_uJy[mZ], 'k-', lw=0.9, label='Data')
-            ax2.plot(lam_um[mZ], flam_to_fnu_uJy(Fcont[mZ], lam_um[mZ]), 'b--', lw=0.9, label='Continuum')
-            ax2.plot(lam_um[mZ], flam_to_fnu_uJy(total_model_flam[mZ], lam_um[mZ]), 'r-', lw=1.0, label='Model')
-            ax2.set_xlim(o3_lo, o3_hi)
-            ax2.legend(fontsize=8)
-        ax2.set_xlabel('Observed wavelength [µm]')
-        ax2.set_ylabel('Flux density [µJy]')
+
+        # Build figure with 4 panels
+        fig, axes = plt.subplots(
+            4, 1, figsize=(11, 12.2),
+            gridspec_kw={"height_ratios": [1.4, 1.2, 1.0, 1.0]}
+        )
+        ax1, ax2, ax3, ax4 = axes
+
+        # (1) Full range in µJy
+        ax1.stairs(flux_uJy, edges_um, label='Data (bins)', color='k', linewidth=0.9, alpha=0.85)
+        ax1.errorbar(lam_um, flux_uJy, yerr=err_uJy, fmt='o', ms=2.5,
+                     color='0.35', mfc='none', mec=(0,0,0,0.25), mew=0.4,
+                     ecolor=(0,0,0,0.12), elinewidth=0.4, capsize=0, zorder=1,
+                     label='Data ±1σ')
+        ax1.stairs(cont_uJy, edges_um, label=f'Continuum (deg={deg})', color='b', linestyle='--', linewidth=1.0)
+        ax1.stairs(model_uJy, edges_um, label='Continuum + Lines', color='r', linewidth=1.2)
+        ax1.set_ylabel('Flux density [µJy]')
+        ax1.legend(ncol=3, fontsize=9, frameon=False)
+        ax1.grid(alpha=0.25)
+        _annotate_lines(ax1, which_lines, z, per_line=per_line, min_dx_um=0.01)
+
+        # (2) Full range in F_lambda (same bins)
+        data_flam = flam
+        data_flam_err = sig_flam
+        ax2.stairs(data_flam,          edges_um, label='Data (Fλ, bins)', color='k', linewidth=0.9, alpha=0.85)
+        ax2.errorbar(lam_um, data_flam, yerr=data_flam_err, fmt='o', ms=2.5,
+                     color='0.35', mfc='none', mec=(0,0,0,0.25), mew=0.4,
+                     ecolor=(0,0,0,0.12), elinewidth=0.4, capsize=0, zorder=1,
+                     label='Data (Fλ) ±1σ')
+        ax2.stairs(Fcont,              edges_um, label='Continuum (Fλ)', color='b', linestyle='--', linewidth=1.0)
+        ax2.stairs(total_model_flam,   edges_um, label='Model (Fλ)',     color='r', linewidth=1.2)
+        ax2.set_ylabel(r'$F_\lambda$ [erg s$^{-1}$ cm$^{-2}$ Å$^{-1}$]')
+        ax2.legend(ncol=3, fontsize=9, frameon=False)
         ax2.grid(alpha=0.25)
+        _annotate_lines(ax2, which_lines, z, per_line=per_line, min_dx_um=0.01)
+
+        # (3) Zoom in µJy around OIII/Hβ
+        if np.any(mZ):
+            lam_zoom = lam_um[mZ]
+            left_z, right_z = _pixel_edges_um(lam_zoom)
+            edges_z = np.r_[left_z[0], right_z]
+
+            ax3.stairs(flux_uJy[mZ],  edges_z, label='Data (bins)', color='k', linewidth=0.9, alpha=0.85)
+            ax3.errorbar(lam_zoom, flux_uJy[mZ], yerr=err_uJy[mZ], fmt='o', ms=2.0,
+                         color='0.35', mfc='none', mec=(0,0,0,0.25), mew=0.4,
+                         ecolor=(0,0,0,0.16), elinewidth=0.45, capsize=0, zorder=1,
+                         label='Data ±1σ')
+            ax3.stairs(cont_uJy[mZ],  edges_z, label='Continuum', color='b', linestyle='--', linewidth=0.9)
+            ax3.stairs(model_uJy[mZ], edges_z, label='Model',     color='r', linewidth=1.1)
+            ax3.set_xlim(o3_lo, o3_hi)
+            ax3.legend(fontsize=8, frameon=False, ncol=3)
+            ax3.grid(alpha=0.25)
+            _annotate_lines(ax3, which_lines, z, per_line=per_line, min_dx_um=0.002, levels=(0.92,0.80,0.68))
+        ax3.set_xlabel('Observed wavelength [µm]')
+        ax3.set_ylabel('Flux density [µJy]')
+
+        # (4) Zoom in F_lambda around OIII/Hβ
+        if np.any(mZ):
+            lam_zoom = lam_um[mZ]
+            left_z, right_z = _pixel_edges_um(lam_zoom)
+            edges_z = np.r_[left_z[0], right_z]
+
+            data_flam_z = data_flam[mZ]
+            data_flam_err_z = data_flam_err[mZ]
+            cont_flam_z = Fcont[mZ]
+            model_flam_z = total_model_flam[mZ]
+
+            ax4.stairs(data_flam_z, edges_z, label='Data (Fλ, bins)', color='k', linewidth=0.9, alpha=0.85)
+            ax4.errorbar(lam_zoom, data_flam_z, yerr=data_flam_err_z, fmt='o', ms=2.0,
+                         color='0.35', mfc='none', mec=(0,0,0,0.25), mew=0.4,
+                         ecolor=(0,0,0,0.16), elinewidth=0.45, capsize=0, zorder=1,
+                         label='Data (Fλ) ±1σ')
+            ax4.stairs(cont_flam_z,  edges_z, label='Continuum (Fλ)', color='b', linestyle='--', linewidth=0.9)
+            ax4.stairs(model_flam_z, edges_z, label='Model (Fλ)',     color='r', linewidth=1.1)
+            ax4.set_xlim(o3_lo, o3_hi)
+            ax4.legend(fontsize=8, frameon=False, ncol=3)
+            ax4.grid(alpha=0.25)
+            _annotate_lines(ax4, which_lines, z, per_line=per_line, min_dx_um=0.002, levels=(0.92,0.80,0.68))
+        ax4.set_xlabel('Observed wavelength [µm]')
+        ax4.set_ylabel(r'$F_\lambda$ [erg s$^{-1}$ cm$^{-2}$ Å$^{-1}$]')
+
         plt.tight_layout()
         plt.show()
 
@@ -747,15 +669,9 @@ def excels_fit_poly(source, z, grating="PRISM", lines_to_use=None,
         which_lines=which_lines,
     )
 
-
 # ============================================================
-# Bootstrapping with full-spectrum & OIII/Hβ zoom plots
+# Bootstrapping with µJy+Fλ stairs, zooms, data errorbars, line labels, tqdm
 # ============================================================
-from typing import Dict, List, Tuple
-import os
-import numpy as np
-import matplotlib.pyplot as plt
-from tqdm import tqdm
 
 def _o3_hb_zoom_bounds_um(z, pad_um=0.03):
     hbA, o3aA, o3bA = 4861.33, 4958.91, 5006.84
@@ -763,31 +679,6 @@ def _o3_hb_zoom_bounds_um(z, pad_um=0.03):
     return obsA.min()/1e4 - pad_um, obsA.max()/1e4 + pad_um
 
 def _sigma_clip_mean_std(a, axis=0, sigma=3.0, min_keep=5):
-    """
-    Compute sigma-clipped mean and std along an axis, with finite-sample guard.
-
-    Parameters
-    ----------
-    a : array_like
-        Input array (e.g., stack of bootstrap models).
-    axis : int, optional
-        Axis over which to compute statistics.
-    sigma : float, optional
-        Clipping threshold in median absolute deviations (MAD).
-    min_keep : int, optional
-        Minimum number of finite samples required to keep a position;
-        otherwise it is treated as NaN.
-
-    Returns
-    -------
-    mean, std : ndarray
-        Sigma-clipped mean and standard deviation along `axis`.
-
-    Rationale
-    ---------
-    Bootstrap stacks may contain dropped/failed draws. This helper reduces the
-    influence of outliers while retaining simplicity for plotting mean ±1σ bands.
-    """
     a = np.asarray(a, float)
     med = np.nanmedian(a, axis=axis)
     mad = 1.4826 * np.nanmedian(np.abs(a - np.expand_dims(med, axis=axis)), axis=axis)
@@ -798,6 +689,72 @@ def _sigma_clip_mean_std(a, axis=0, sigma=3.0, min_keep=5):
         m[:, nfin < min_keep] = False
     a = np.where(m, a, np.nan)
     return np.nanmean(a, axis=axis), np.nanstd(a, axis=axis)
+
+# -------------------------------
+# Smart-zoom helpers (drop-in)
+# -------------------------------
+def _obs_um_from_rest_A(rest_A, z):
+    return (np.asarray(rest_A, float) * (1.0 + z)) / 1e4
+
+def _window_from_lines_um(rest_list, z, pad_A=250.0):
+    """
+    Return [lo_um, hi_um] spanning the given rest-Å lines at redshift z,
+    with symmetric padding of pad_A (rest Å) on each side.
+    """
+    obs_um = _obs_um_from_rest_A(rest_list, z)
+    lo = np.min(obs_um) - pad_A * (1 + z) / 1e4
+    hi = np.max(obs_um) + pad_A * (1 + z) / 1e4
+    return float(lo), float(hi)
+
+def _has_coverage_window(lam_um, lo_um, hi_um, min_pts=5):
+    m = (lam_um >= lo_um) & (lam_um <= hi_um) & np.isfinite(lam_um)
+    return bool(np.count_nonzero(m) >= min_pts)
+
+def _has_fit_in_window(base_lines, candidate_names, snr_min=1.0):
+    """
+    True if the fit produced at least one of the candidate lines with finite params
+    and SNR above snr_min.
+    """
+    if not base_lines:
+        return False
+    for nm in candidate_names:
+        d = base_lines.get(nm)
+        if d is None:
+            continue
+        snr = d.get("SNR", np.nan)
+        f   = d.get("F_line", np.nan)
+        mu  = d.get("lam_obs_A", np.nan)
+        if np.isfinite(snr) and (snr >= snr_min) and np.isfinite(f) and np.isfinite(mu):
+            return True
+    return False
+
+def _make_zoom_panel(ax, lam_um, flux_uJy, err_uJy, cont_uJy, mu_uJy, sig_uJy,
+                     which_lines, per_line, z, lo_um, hi_um, title, annotate_min_dx_um=0.002):
+    """Render one zoom panel; returns True if drawn, else False (axis hidden)."""
+    sel = (lam_um >= lo_um) & (lam_um <= hi_um)
+    if not np.any(sel):
+        ax.setVisible(False)
+        return False
+
+    left, right = _pixel_edges_um(lam_um[sel])
+    edges = np.r_[left[0], right]
+
+    ax.stairs(flux_uJy[sel], edges, label="Data (bins)", linewidth=0.9, alpha=0.9)
+    ax.errorbar(lam_um[sel], flux_uJy[sel], yerr=err_uJy[sel], fmt='o', ms=2.2,
+                color='0.35', mfc='none', mec=(0,0,0,0.25), mew=0.4,
+                ecolor=(0,0,0,0.16), elinewidth=0.45, capsize=0, zorder=1,
+                label="±1σ")
+    ax.stairs(cont_uJy[sel], edges, label="Continuum", linestyle="--", linewidth=0.9)
+    ax.stairs(mu_uJy[sel],   edges, label="Model mean", linewidth=1.0)
+    ax.fill_between(lam_um[sel], mu_uJy[sel] - sig_uJy[sel], mu_uJy[sel] + sig_uJy[sel],
+                    step='mid', alpha=0.18, linewidth=0)
+    ax.set_xlim(lo_um, hi_um)
+    ax.set_title(title, fontsize=10)
+    ax.grid(alpha=0.25)
+    _annotate_lines(ax, which_lines, z, per_line=per_line,
+                    min_dx_um=annotate_min_dx_um, levels=(0.92, 0.80, 0.68))
+    return True
+
 
 def bootstrap_excels_fit(
     source,
@@ -813,86 +770,11 @@ def bootstrap_excels_fit(
     verbose=False,
     plot=True,
     show_progress=True,
-    # ------ NEW: saving controls ------
-    save_path: str | None = None,   # file path or directory; None = don't save
-    save_dpi: int = 500,            # e.g. 300, 500, 600
-    save_format: str = "png",       # png/pdf/svg/eps…
+    save_path: str | None = None,
+    save_dpi: int = 500,
+    save_format: str = "png",
     save_transparent: bool = False,
 ):
-    """
-    Run a parametric bootstrap to propagate uncertainties from noise to line fits.
-
-    Parameters
-    ----------
-    source : dict | astropy.io.fits.HDUList
-        Same accepted formats as `excels_fit_poly`. The *same* spectrum is
-        re-fitted repeatedly with synthetic noise draws added.
-    z, grating, deg, continuum_windows, lyman_cut, fit_window_um, absorption_corrections
-        Passed through to `excels_fit_poly` for each draw.
-    n_boot : int, optional
-        Number of bootstrap draws. Increase for tighter uncertainties.
-    random_state : None | int | np.random.Generator, optional
-        Seed or RNG for reproducibility.
-    verbose : bool, optional
-        If True, prints periodic progress (in addition to tqdm if enabled).
-    plot : bool, optional
-        If True, produce a figure with:
-          - full-spectrum data and mean model (±1σ bootstrap band),
-          - a zoom into Hβ+[O III] (same band).
-    show_progress : bool, optional
-        If True and `tqdm` is available, show a progress bar.
-    save_path : str | None, optional
-        If not None, save the bootstrap figure. If a directory is supplied,
-        a filename of the form `bootstrap_<grating>_<n_boot>draws.<ext>` is
-        generated; if a filename is supplied, it is used verbatim.
-    save_dpi : int, optional
-        Figure DPI when saving (e.g., 300/500/600). Has no effect if `plot=False`
-        or `save_path=None`.
-    save_format : str, optional
-        Image format when `save_path` is a directory (e.g., "png", "pdf", "svg").
-        Ignored if `save_path` already contains an extension.
-    save_transparent : bool, optional
-        Save figure with transparent background when True.
-
-    Returns
-    -------
-    result : dict
-        {
-          "samples" : {line: {metric: array}, ...},  # raw per-draw samples
-          "summary" : {line: {metric: {"value","err","text"}}, ...},
-          "which_lines" : list[str],
-          "model_stack_flam" : ndarray  shape (n_boot, N_pix),
-          "keep_mask" : ndarray[bool]   which bootstrap draws were retained,
-          "lam_um" : ndarray            wavelength grid in µm,
-          "data_flux_uJy" : ndarray     original data (µJy),
-        }
-
-    Metrics and summary
-    -------------------
-    For each line and each metric (F_line, EW0_A, sigma_A, lam_obs_A, SNR):
-      - raw samples across accepted draws are stored in `samples`.
-      - a robust “value ± error” is computed as mean ± std on the accepted
-        draws after an optional light 3σ clipping (if ≥ 8 finite points).
-      - the string `"{value} ± {err}"` is provided under `["text"]` for easy printing.
-
-    Quality control / outlier handling
-    ----------------------------------
-    - A first nominal fit (`excels_fit_poly`) establishes sanity caps:
-      `flux_cap = 10×|F_line|`, `width_cap = 10×|σ_A|` per line.
-    - Each draw is rejected if any line is missing, exceeds the above caps,
-      or yields a non-finite centroid.
-    - Additionally, if the total model F_λ magnitude is absurdly large
-      (|F_λ| > 1e-11), the draw is dropped (protects against runaway fits).
-
-    Examples
-    --------
-    >>> boot = bootstrap_excels_fit(hdul, z=8.27, grating="G395M",
-    ...                             n_boot=200, deg=3,
-    ...                             continuum_windows=[(3.05,3.65),(4.05,4.75)],
-    ...                             show_progress=True, plot=True,
-    ...                             save_path="figs", save_dpi=500)
-    >>> print_bootstrap_line_table(boot)
-    """
     # -------- load once --------
     if isinstance(source, dict):
         lam_um = np.asarray(source.get("lam", source.get("wave")), float)
@@ -942,9 +824,16 @@ def bootstrap_excels_fit(
                for ln in which_lines}
     model_stack_flam, keep_mask = [], []
 
+    # Progress iterator (use tqdm when available)
     iterator = range(n_boot)
     if show_progress:
-        iterator = tqdm(iterator, desc="Bootstrap", unit="draw")
+        iterator = tqdm(
+            range(n_boot),
+            desc=f"Bootstrap ({n_boot} draws)",
+            unit="draw",
+            dynamic_ncols=True,
+            leave=True
+        )
 
     for _ in iterator:
         flux_uJy_b = flux_uJy + rng.normal(0.0, err_uJy)
@@ -990,7 +879,7 @@ def bootstrap_excels_fit(
             for k in samples[ln]:
                 samples[ln][k].append(d[k])
 
-        # full F_lambda model on lam_um
+        # full F_lambda total model on lam_um (continuum + lines)
         cont = fb.get("continuum_flam", np.zeros_like(lam_um))
         if isinstance(wfit, slice):
             total_flam = cont + fb.get("model_window_flam", np.zeros_like(lam_um))
@@ -1044,47 +933,109 @@ def bootstrap_excels_fit(
 
     # -------- plotting + optional saving --------
     if plot:
+        # mean ± std (sigma-clipped) of total F_lambda model
         mu_flam, sig_flam = _sigma_clip_mean_std(model_stack_flam[keep_mask], axis=0, sigma=3.0)
+        # convert for µJy panels
         mu_uJy  = flam_to_fnu_uJy(mu_flam,  lam_um)
         sig_uJy = flam_to_fnu_uJy(sig_flam, lam_um)
 
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(11, 7),
-                                       gridspec_kw={"height_ratios": [1.6, 1.0]})
-        ax1.plot(lam_um, flux_uJy, "k-", lw=0.8, label="Data")
-        ax1.plot(lam_um, mu_uJy,  "r-", lw=1.0, label="Model (mean, clipped)")
-        ax1.fill_between(lam_um, mu_uJy - sig_uJy, mu_uJy + sig_uJy,
-                         color="r", alpha=0.18, linewidth=0,
-                         label="Model ±1σ (bootstrap)")
-        ax1.set_ylabel("Flux density [µJy]")
-        ax1.grid(alpha=0.25); ax1.legend(ncol=3, fontsize=9)
+        # Use the baseline continuum for display (always show it)
+        cont_flam = np.asarray(base.get("continuum_flam", np.zeros_like(lam_um)))
+        cont_uJy  = flam_to_fnu_uJy(cont_flam, lam_um)
 
-        zlo, zhi = _o3_hb_zoom_bounds_um(z, pad_um=0.03)
-        mz = (lam_um >= zlo) & (lam_um <= zhi)
-        if np.any(mz):
-            ax2.plot(lam_um[mz], flux_uJy[mz], "k-", lw=0.9, label="Data")
-            ax2.plot(lam_um[mz], mu_uJy[mz],  "r-", lw=1.0, label="Model (mean)")
-            ax2.fill_between(lam_um[mz], mu_uJy[mz] - sig_uJy[mz], mu_uJy[mz] + sig_uJy[mz],
-                             color="r", alpha=0.2, linewidth=0)
-            ax2.set_xlim(zlo, zhi); ax2.legend(fontsize=8)
-        ax2.set_xlabel("Observed wavelength [µm]")
-        ax2.set_ylabel("Flux density [µJy]")
-        ax2.grid(alpha=0.25)
-        plt.tight_layout()
+        # Pixel edges for stairs (full panel)
+        left_um, right_um = _pixel_edges_um(lam_um)
+        edges_um = np.r_[left_um[0], right_um]
 
-        # ---- SAVE HERE if requested ----
+        # --- Define smart zoom windows (in rest Å names consistent with REST_LINES_A keys) ---
+        o3hb_names = ["HBETA", "OIII_2", "OIII_3"]
+        o3hb_restA = [REST_LINES_A[n] for n in o3hb_names]
+        o3hb_lo, o3hb_hi = _window_from_lines_um(o3hb_restA, z, pad_A=250.0)
+
+        aur_names = ["HDELTA", "OIII_1"]
+        aur_restA = [REST_LINES_A[n] for n in aur_names]
+        aur_lo, aur_hi = _window_from_lines_um(aur_restA, z, pad_A=220.0)
+
+        oiiuv_names = ["OII_UV_1", "OII_UV_2"]
+        oiiuv_restA = [REST_LINES_A[n] for n in oiiuv_names]
+        oiiuv_lo, oiiuv_hi = _window_from_lines_um(oiiuv_restA, z, pad_A=180.0)
+
+        base_lines = base.get("lines", {})
+        zoom_defs = [
+            dict(title="Hβ + [O III]4959,5007", lo=o3hb_lo, hi=o3hb_hi, names=o3hb_names),
+            dict(title="Hδ + [O III]4363 (auroral)", lo=aur_lo, hi=aur_hi, names=aur_names),
+            dict(title="[O II] UV 3727,3729", lo=oiiuv_lo, hi=oiiuv_hi, names=oiiuv_names),
+        ]
+        show_flags = []
+        for zd in zoom_defs:
+            cov = _has_coverage_window(lam_um, zd["lo"], zd["hi"])
+            fitok = _has_fit_in_window(base_lines, zd["names"], snr_min=1.0)
+            show_flags.append(cov and fitok)
+
+        import matplotlib.gridspec as gridspec
+        fig = plt.figure(figsize=(12.0, 8.2))
+        gs = gridspec.GridSpec(2, 3, height_ratios=[1.6, 1.0], hspace=0.35, wspace=0.25)
+        ax_full = fig.add_subplot(gs[0, :])
+        ax_z1   = fig.add_subplot(gs[1, 0])
+        ax_z2   = fig.add_subplot(gs[1, 1])
+        ax_z3   = fig.add_subplot(gs[1, 2])
+        ax_zoom = [ax_z1, ax_z2, ax_z3]
+
+        errbar_kwargs = dict(
+            fmt='o',
+            ms=1.5,
+            mfc='none',
+            mec=(0, 0, 0, 0.25),
+            mew=0.4,
+            ecolor=(0, 0, 0, 0.12),
+            elinewidth=0.4,
+            capsize=0,
+            zorder=1
+        )
+
+        ax_full.stairs(flux_uJy, edges_um, label="Data (bins)", color="k", linewidth=0.9, alpha=0.9, zorder=3)
+        ax_full.errorbar(lam_um, flux_uJy, yerr=err_uJy, **errbar_kwargs)
+        ax_full.stairs(cont_uJy, edges_um, label="Continuum", color="b", linestyle="--", linewidth=1.0, zorder=2)
+        ax_full.stairs(mu_uJy,   edges_um, label="Model mean", color="r", linewidth=1.1, zorder=4)
+        ax_full.fill_between(lam_um, mu_uJy - sig_uJy, mu_uJy + sig_uJy,
+                             step='mid', color="r", alpha=0.18, linewidth=0,
+                             label="Model ±1σ (bootstrap)")
+        ax_full.set_ylabel("Flux density [µJy]")
+        ax_full.set_xlabel("Observed wavelength [µm]")
+        ax_full.grid(alpha=0.25)
+        ax_full.legend(ncol=3, fontsize=9, frameon=False)
+        _annotate_lines(ax_full, which_lines, z, per_line=base["lines"], min_dx_um=0.01)
+
+        for ax, zd, show in zip(ax_zoom, zoom_defs, show_flags):
+            if not show:
+                ax.set_visible(False)
+                continue
+            sel = (lam_um >= zd["lo"]) & (lam_um <= zd["hi"])
+            left_z, right_z = _pixel_edges_um(lam_um[sel])
+            edges_z = np.r_[left_z[0], right_z]
+
+            ax.stairs(flux_uJy[sel], edges_z, label="Data (bins)", color="k", linewidth=0.9, alpha=0.9, zorder=3)
+            ax.errorbar(lam_um[sel], flux_uJy[sel], yerr=err_uJy[sel], **errbar_kwargs)
+            ax.stairs(cont_uJy[sel], edges_z, label="Continuum", linestyle="--", linewidth=0.9, zorder=2)
+            ax.stairs(mu_uJy[sel],   edges_z, label="Model mean", linewidth=1.0, zorder=4)
+            ax.fill_between(lam_um[sel], mu_uJy[sel] - sig_uJy[sel], mu_uJy[sel] + sig_uJy[sel],
+                            step='mid', alpha=0.18, linewidth=0)
+            ax.set_xlim(zd["lo"], zd["hi"])
+            ax.set_title(zd["title"], fontsize=10)
+            ax.grid(alpha=0.25)
+            _annotate_lines(ax, which_lines, z, per_line=base["lines"], min_dx_um=0.002, levels=(0.92, 0.80, 0.68))
+            ax.set_xlabel("Observed wavelength [µm]")
+            ax.set_ylabel("µJy")
+
         if save_path:
-            # If a directory was given, build a filename
             root, ext = os.path.splitext(save_path)
             if os.path.isdir(save_path):
                 fname = os.path.join(save_path, f"bootstrap_{grating.lower()}_{n_boot}draws.{save_format}")
             else:
-                # If no extension in provided path, add one from save_format
-                if ext == "":
-                    fname = f"{save_path}.{save_format}"
-                else:
-                    fname = save_path
+                fname = f"{save_path}.{save_format}" if ext == "" else save_path
             fig.savefig(fname, dpi=save_dpi, format=fname.split(".")[-1],
                         bbox_inches="tight", transparent=save_transparent)
+
         plt.show()
         plt.close(fig)
 
@@ -1097,6 +1048,7 @@ def bootstrap_excels_fit(
         "lam_um": lam_um,
         "data_flux_uJy": flux_uJy,
     }
+
 
 def print_bootstrap_line_table(boot):
     print("\n=== BOOTSTRAP SUMMARY (value ± error) ===")
