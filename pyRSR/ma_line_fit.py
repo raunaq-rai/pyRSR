@@ -60,48 +60,27 @@ REST_LINES_A = {
 # ============================================================
 # ---------------------- UNIT CONVERSIONS --------------------
 # ============================================================
+C_CGS = 2.99792458e10  # cm/s
 
-def fnu_uJy_to_flam(flux_uJy: np.ndarray, lam_um: np.ndarray) -> np.ndarray:
+def fnu_uJy_to_flam(flux_uJy, lam_um):
     """
     Convert F_ν [µJy] at wavelength [µm] → F_λ [erg/s/cm²/Å].
-
-    Parameters
-    ----------
-    flux_uJy : array_like
-        Flux density per pixel in µJy.
-    lam_um : array_like
-        Wavelength array in µm.
-
-    Returns
-    -------
-    Flam : ndarray
-        Flux density per pixel in erg/s/cm²/Å.
     """
-    lam_A = lam_um * 1e4
-    Fnu_Jy = flux_uJy * 1e-6
-    Flam = Fnu_Jy * (C_AA / lam_A**2) * 1e-23
-    return Flam
+    lam_cm = np.asarray(lam_um, float) * 1e-4      # µm → cm
+    fnu_cgs = np.asarray(flux_uJy, float) * 1e-29  # µJy → erg/s/cm²/Hz
+    flam = fnu_cgs * C_CGS / (lam_cm**2)           # erg/s/cm²/cm
+    flam /= 1e8                                    # cm → Å
+    return flam
 
 
-def flam_to_fnu_uJy(flam: np.ndarray, lam_um: np.ndarray) -> np.ndarray:
+def flam_to_fnu_uJy(flam, lam_um):
     """
     Convert F_λ [erg/s/cm²/Å] → F_ν [µJy].
-
-    Parameters
-    ----------
-    flam : array_like
-        Flux density in erg/s/cm²/Å.
-    lam_um : array_like
-        Wavelength array in µm.
-
-    Returns
-    -------
-    flux_uJy : ndarray
-        Flux density in µJy.
     """
-    lam_A = lam_um * 1e4
-    Fnu_Jy = flam * (lam_A**2 / C_AA) * 1e23
-    return Fnu_Jy * 1e6
+    lam_cm = np.asarray(lam_um, float) * 1e-4       # µm → cm
+    fnu_cgs = np.asarray(flam, float) * (lam_cm**2) / C_CGS * 1e8
+    flux_uJy = fnu_cgs * 1e29                      # erg/s/cm²/Hz → µJy
+    return flux_uJy
 
 
 # ============================================================
