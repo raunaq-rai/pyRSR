@@ -110,8 +110,8 @@ def _pixel_edges_um(lam_um: np.ndarray):
     """Pixel edges in µm from a center-grid wavelength array in µm."""
     lam_um = np.asarray(lam_um, float)
     d = np.diff(lam_um)
-    left  = np.r_[lam_um[0] - 0.5*d[0], lam_um[:-1] + 0.5*d]
-    right = np.r_[lam_um[:-1] + 0.5*d, lam_um[-1] + 0.5*d[-1]]
+    left  = np.r_[lam_um[0] - 0.1*d[0], lam_um[:-1] + 0.1*d]
+    right = np.r_[lam_um[:-1] + 0.1*d, lam_um[-1] + 0.1*d[-1]]
     return left, right
 
 def _gauss_binavg_area_normalized_A(lam_left_A, lam_right_A, muA, sigmaA):
@@ -135,24 +135,46 @@ def _safe_median(x, default):
     v = np.nanmedian(x[np.isfinite(x)]) if np.any(np.isfinite(x)) else np.nan
     return v if np.isfinite(v) else default
 
-# ---------- NEW: line annotation helper (grey vertical lines + de-overlapped labels)
+from matplotlib.transforms import blended_transform_factory
+import numpy as np
+
 def _annotate_lines(ax, which_lines, z, per_line=None,
-                    color='0.7', text_color='0.25',
-                    lw=0.8, alpha=0.7,
+                    text_color='0.25',
                     levels=(0.90, 0.78, 0.66, 0.54),
                     min_dx_um=0.01,
                     fontsize=8,
                     only_within_xlim=True,
                     shorten_names=True):
     """
-    Draw grey vertical lines at each line's observed wavelength and add labels with
-    minimal overlap by staggering them across multiple y-levels (axes fraction).
+    Annotate emission lines as staggered text labels (no vertical guide lines).
+
+    Parameters
+    ----------
+    ax : matplotlib Axes
+        The axes on which to annotate.
+    which_lines : list[str]
+        Line names to annotate.
+    z : float
+        Redshift.
+    per_line : dict, optional
+        Mapping from line names to dicts with 'lam_obs_A' values (Å).
+    text_color : str or tuple, optional
+        Color of the text labels.
+    levels : tuple
+        Y-axis fractional heights for staggered labels.
+    min_dx_um : float
+        Minimum wavelength separation (µm) between labels on the same level.
+    fontsize : int
+        Font size of labels.
+    only_within_xlim : bool
+        Skip labels outside the current x-limits.
+    shorten_names : bool
+        Simplify names (remove brackets and underscores).
     """
     if not which_lines:
         return
 
-    xs = []
-    labels = []
+    xs, labels = [], []
     for nm in which_lines:
         if (per_line is not None) and (nm in per_line) and np.isfinite(per_line[nm].get('lam_obs_A', np.nan)):
             lam_um = per_line[nm]['lam_obs_A'] / 1e4
@@ -161,8 +183,7 @@ def _annotate_lines(ax, which_lines, z, per_line=None,
 
         lab = nm
         if shorten_names:
-            lab = lab.replace('[', '').replace(']', '')
-            lab = lab.replace('_', ' ')
+            lab = lab.replace('[', '').replace(']', '').replace('_', ' ')
         xs.append(float(lam_um))
         labels.append(lab)
 
@@ -172,19 +193,19 @@ def _annotate_lines(ax, which_lines, z, per_line=None,
     if only_within_xlim:
         xlo, xhi = ax.get_xlim()
         keep = (xs >= xlo) & (xs <= xhi)
-        xs = xs[keep]; labels = labels[keep]
+        xs, labels = xs[keep], labels[keep]
 
     if xs.size == 0:
         return
 
     order = np.argsort(xs)
-    xs = xs[order]; labels = labels[order]
+    xs, labels = xs[order], labels[order]
 
     trans = blended_transform_factory(ax.transData, ax.transAxes)
     last_x_at_level = np.full(len(levels), -np.inf)
 
     for xval, lab in zip(xs, labels):
-        ax.axvline(xval, color=color, lw=lw, alpha=alpha, zorder=0)
+        # Removed vertical line here
         level_idx = None
         for i, x_last in enumerate(last_x_at_level):
             if (xval - x_last) >= min_dx_um:
@@ -196,11 +217,13 @@ def _annotate_lines(ax, which_lines, z, per_line=None,
         y_frac = levels[level_idx]
         last_x_at_level[level_idx] = xval
 
-        ax.text(xval, y_frac, lab,
-                rotation=90, ha='center', va='bottom',
-                color=text_color, fontsize=fontsize,
-                transform=trans, zorder=5,
-                bbox=dict(facecolor='white', edgecolor='none', alpha=0.5, pad=0.5))
+        ax.text(
+            xval, y_frac, lab,
+            rotation=90, ha='center', va='bottom',
+            color=text_color, fontsize=fontsize,
+            transform=trans, zorder=5,
+            bbox=dict(facecolor='white', edgecolor='none', alpha=0.5, pad=0.5)
+        )
 
 # ============================================================
 # NEW: Two-window continuum selection around observed Lyα
@@ -403,7 +426,6 @@ def _finalize_seeds_and_bounds(p0, lb, ub):
 # ============================================================
 # Main fit
 # ============================================================
-
 def excels_fit_poly(source, z, grating="PRISM", lines_to_use=None,
                     deg=2, continuum_windows=None, lyman_cut="lya",
                     fit_window_um=None, plot=True, verbose=True,
@@ -434,20 +456,19 @@ def excels_fit_poly(source, z, grating="PRISM", lines_to_use=None,
 
     if auto_windows is not None:
         continuum_windows = auto_windows
-        # when explicit windows are supplied, disable the global lyman_cut (we already gapped Lyα)
-        lyman_cut = None
+        lyman_cut = None  # we already gapped Lyα with explicit windows
 
     # --- Convert to F_lambda ---
-    flam = fnu_uJy_to_flam(flux_uJy, lam_um)       # data in Fλ
-    sig_flam = fnu_uJy_to_flam(err_uJy, lam_um)    # data 1σ in Fλ
+    flam     = fnu_uJy_to_flam(flux_uJy, lam_um)     # data in Fλ
+    sig_flam = fnu_uJy_to_flam(err_uJy,  lam_um)     # 1σ in Fλ
 
     # --- Continuum ---
     Fcont, _ = fit_continuum_polynomial(
         lam_um, flam, z, deg=deg, windows=continuum_windows,
         lyman_cut=lyman_cut, sigma_flam=sig_flam, grating=grating
     )
-    resid_full = flam - Fcont
-    sig_flam_fit = rescale_uncertainties(resid_full, sig_flam)  # used in fitting (not for display)
+    resid_full   = flam - Fcont
+    sig_flam_fit = rescale_uncertainties(resid_full, sig_flam)  # used in fitting
 
     # --- Fit window ---
     if fit_window_um:
@@ -463,40 +484,66 @@ def excels_fit_poly(source, z, grating="PRISM", lines_to_use=None,
         raise ValueError("No emission lines in wavelength coverage.")
 
     # --- Instrument σ and centroid seeds ---
-    expected_um = np.array([REST_LINES_A[nm]*(1+z)/1e4 for nm in which_lines])
+    expected_um  = np.array([REST_LINES_A[nm]*(1+z)/1e4 for nm in which_lines])
     sigma_gr_log = np.array([sigma_grating_logA(grating, mu_um) for mu_um in expected_um])  # log10
-    muA_nom = expected_um * 1e4                           # Å
-    sigmaA_inst = muA_nom * LN10 * sigma_gr_log           # Å (instrumental σ)
-    sigma_um_inst = sigmaA_inst / 1e4                     # µm (for peak search)
+    muA_nom      = expected_um * 1e4                          # Å
+    sigmaA_inst  = muA_nom * LN10 * sigma_gr_log              # Å (instrumental σ)
+    sigma_um_inst = sigmaA_inst / 1e4                         # µm (for peak search)
 
     mu_seed_um = _find_local_peaks(lam_fit, resid_fit, expected_um, sigma_um_inst, min_window_um=0.001)
-    muA_seed = mu_seed_um * 1e4  # Å
+    muA_seed   = mu_seed_um * 1e4  # Å
 
-    # --- Seeds & bounds per line ---
+    # ============================
+    # Seeds & bounds — corrected
+    # ============================
     nL = len(which_lines)
-    rms = _safe_median(resid_fit, 0.0)
 
-    # Amplitudes (≥0)
-    A0, A_lo, A_hi = [], np.zeros(nL), []
-    for mu in expected_um:
-        m = (lam_fit > mu - 0.05) & (lam_fit < mu + 0.05)
-        pk = np.nanmax(resid_fit[m]) if np.any(m) else 3.0*max(rms, 1e-30)
-        A0.append(max(0.5*rms, 1.5*pk))
-        A_hi.append(max(1000.0*rms, 10.0*pk))
-    A0 = np.array(A0, float); A_hi = np.array(A_hi, float)
+    # --- pixel scale in Å (for gentle floors to avoid sub-pixel collapse)
+    lamA_fit = lam_fit * 1e4
+    pix_A = float(np.median(np.diff(lamA_fit))) if lamA_fit.size > 1 else 1.0
 
-    # Widths σ_A (Å)
+    # --- Robust σ bounds (tight to LSF; no huge absolute floors/ceilings)
     g = str(grating).lower()
     if "prism" in g:
-        sigmaA_lo = np.maximum(0.25 * sigmaA_inst, 0.02)
-        sigmaA_hi = np.maximum(2.5  * sigmaA_inst, 0.05)
+        # PRISM: allow a bit more freedom (blended features / LSF wings)
+        sigmaA_lo = np.maximum(0.35 * pix_A, 0.50 * sigmaA_inst)     # ≥ 0.5×σ_inst
+        sigmaA_hi = np.maximum(1.50 * pix_A, 1.60 * sigmaA_inst)     # ≤ 1.6×σ_inst
     else:
-        sigmaA_lo = np.maximum(0.20 * sigmaA_inst, 0.02)
-        sigmaA_hi = np.maximum(1.50 * sigmaA_inst, 0.05)
-    sigmaA_seed = np.clip(0.8 * np.where(np.isfinite(sigmaA_inst), sigmaA_inst, 1.0),
-                          sigmaA_lo, sigmaA_hi)
+        # MED/HIGH: keep σ very close to the instrumental resolution
+        sigmaA_lo = np.maximum(0.25 * pix_A, 0.60 * sigmaA_inst)     # ≥ 0.6×σ_inst
+        sigmaA_hi = np.maximum(1.00 * pix_A, 1.35 * sigmaA_inst)     # ≤ 1.35×σ_inst
 
-    # Centroids μ_A (Å)
+    # --- σ seeds near instrumental width, clipped into [lo, hi]
+    sigmaA_seed = np.clip(0.95 * sigmaA_inst, sigmaA_lo, sigmaA_hi)
+
+    # --- Amplitude seeds in area units (erg s^-1 cm^-2), consistent with σ
+    # peak_Fλ ≈ A / (sqrt(2π) σ_A)  =>  A ≈ peak_Fλ * sqrt(2π) * σ_A
+    SQRT2PI = np.sqrt(2.0 * np.pi)
+
+    # local-peak estimate near each expected line (±0.05 µm window as before)
+    A0, A_lo, A_hi = [], np.zeros(len(sigmaA_seed)), []
+    rms_flam = float(_safe_median(np.abs(resid_fit), 0.0))
+    rms_flam = max(rms_flam, 1e-30)
+
+    for j, mu_um in enumerate(expected_um):
+        win = (lam_fit > mu_um - 0.05) & (lam_fit < mu_um + 0.05)
+        peak_flam = np.nanmax(resid_fit[win]) if np.any(win) else 3.0 * rms_flam
+        peak_flam = max(peak_flam, 3.0 * rms_flam)  # ensure not tiny at low S/N
+
+        # use the σ seed (not σ_inst) for self-consistency
+        A_seed = peak_flam * SQRT2PI * sigmaA_seed[j]
+
+        # set a generous upper bound but scale with σ_hi to avoid runaway broad fits
+        A_upper = 10.0 * max(peak_flam, 3.0 * rms_flam) * SQRT2PI * np.maximum(sigmaA_hi[j], sigmaA_seed[j])
+
+        A0.append(A_seed)
+        A_hi.append(A_upper)
+
+    A0 = np.array(A0, float)
+    A_hi = np.array(A_hi, float)
+
+
+    # Centroids μ_A (Å) — allow several σ of freedom (wider for PRISM)
     if "prism" in g:
         muA_lo = muA_seed - 12.0 * np.maximum(sigmaA_inst, 1.0)
         muA_hi = muA_seed + 12.0 * np.maximum(sigmaA_inst, 1.0)
@@ -505,13 +552,12 @@ def excels_fit_poly(source, z, grating="PRISM", lines_to_use=None,
         muA_hi = muA_seed + 6.0  * np.maximum(sigmaA_inst, 1.0)
 
     # Pack parameters and finalize to guarantee x0 inside bounds
-    p0 = np.r_[A0, sigmaA_seed, muA_seed]
-    lb = np.r_[A_lo, sigmaA_lo, muA_lo]
-    ub = np.r_[A_hi, sigmaA_hi, muA_hi]
+    p0 = np.r_[A0,           sigmaA_seed, muA_seed]
+    lb = np.r_[A_lo,         sigmaA_lo,   muA_lo]
+    ub = np.r_[A_hi,         sigmaA_hi,   muA_hi]
     p0, lb, ub = _finalize_seeds_and_bounds(p0, lb, ub)
 
     # --- χ² residuals with pixel-width weighting in Å ---
-    lamA_fit = lam_fit * 1e4
     dlA = np.gradient(lamA_fit)
     w_pix = np.sqrt(dlA / _safe_median(dlA, 1.0))
 
@@ -519,7 +565,7 @@ def excels_fit_poly(source, z, grating="PRISM", lines_to_use=None,
         model, _, _ = build_model_flam_linear(p, lam_fit, z, grating, which_lines, mu_seed_um)
         return w_pix * (resid_fit - model) / np.clip(sig_fit, 1e-30, None)
 
-    res = least_squares(fun, p0, bounds=(lb, ub), max_nfev=200000, xtol=1e-12, ftol=1e-12)
+    res = least_squares(fun, p0, bounds=(lb, ub), max_nfev=80000, xtol=1e-8, ftol=1e-8)
 
     # --- Best-fit model on window ---
     model_flam_win, profiles_win, centers = build_model_flam_linear(
@@ -553,9 +599,8 @@ def excels_fit_poly(source, z, grating="PRISM", lines_to_use=None,
             lam_obs_A=muA, sigma_A=sigma_A, FWHM_A=FWHM_A
         )
 
-    # --- Plot (bin-aware stairs) in µJy + F_lambda + zooms + data errorbars + line labels ---
+    # --- Plot (unchanged except for your existing styling) ---
     if plot:
-        # line+cont model on full grid (Fλ)
         if fit_window_um:
             model_full = np.zeros_like(lam_um)
             w = (lam_um >= lo) & (lam_um <= hi)  # from above
@@ -564,26 +609,21 @@ def excels_fit_poly(source, z, grating="PRISM", lines_to_use=None,
         else:
             total_model_flam = Fcont + model_flam_win
 
-        # Convert for µJy panels
         cont_uJy  = flam_to_fnu_uJy(Fcont,            lam_um)
         model_uJy = flam_to_fnu_uJy(total_model_flam, lam_um)
 
-        # Pixel edges for stairs
         left_um, right_um = _pixel_edges_um(lam_um)
         edges_um = np.r_[left_um[0], right_um]
 
-        # Zoom bounds
         o3_lo, o3_hi = 4.45, 4.70
         mZ = (lam_um > o3_lo) & (lam_um < o3_hi)
 
-        # Build figure with 4 panels
         fig, axes = plt.subplots(
             4, 1, figsize=(11, 12.2),
             gridspec_kw={"height_ratios": [1.4, 1.2, 1.0, 1.0]}
         )
         ax1, ax2, ax3, ax4 = axes
 
-        # (1) Full range in µJy
         ax1.stairs(flux_uJy, edges_um, label='Data (bins)', color='k', linewidth=0.9, alpha=0.85)
         ax1.errorbar(lam_um, flux_uJy, yerr=err_uJy, fmt='o', ms=2.5,
                      color='0.35', mfc='none', mec=(0,0,0,0.25), mew=0.4,
@@ -593,10 +633,8 @@ def excels_fit_poly(source, z, grating="PRISM", lines_to_use=None,
         ax1.stairs(model_uJy, edges_um, label='Continuum + Lines', color='r', linewidth=1.2)
         ax1.set_ylabel('Flux density [µJy]')
         ax1.legend(ncol=3, fontsize=9, frameon=False)
-        ax1.grid(alpha=0.25)
         _annotate_lines(ax1, which_lines, z, per_line=per_line, min_dx_um=0.01)
 
-        # (2) Full range in F_lambda (same bins)
         data_flam = flam
         data_flam_err = sig_flam
         ax2.stairs(data_flam,          edges_um, label='Data (Fλ, bins)', color='k', linewidth=0.9, alpha=0.85)
@@ -608,10 +646,8 @@ def excels_fit_poly(source, z, grating="PRISM", lines_to_use=None,
         ax2.stairs(total_model_flam,   edges_um, label='Model (Fλ)',     color='r', linewidth=1.2)
         ax2.set_ylabel(r'$F_\lambda$ [erg s$^{-1}$ cm$^{-2}$ Å$^{-1}$]')
         ax2.legend(ncol=3, fontsize=9, frameon=False)
-        ax2.grid(alpha=0.25)
         _annotate_lines(ax2, which_lines, z, per_line=per_line, min_dx_um=0.01)
 
-        # (3) Zoom in µJy around OIII/Hβ
         if np.any(mZ):
             lam_zoom = lam_um[mZ]
             left_z, right_z = _pixel_edges_um(lam_zoom)
@@ -626,12 +662,10 @@ def excels_fit_poly(source, z, grating="PRISM", lines_to_use=None,
             ax3.stairs(model_uJy[mZ], edges_z, label='Model',     color='r', linewidth=1.1)
             ax3.set_xlim(o3_lo, o3_hi)
             ax3.legend(fontsize=8, frameon=False, ncol=3)
-            ax3.grid(alpha=0.25)
             _annotate_lines(ax3, which_lines, z, per_line=per_line, min_dx_um=0.002, levels=(0.92,0.80,0.68))
         ax3.set_xlabel('Observed wavelength [µm]')
         ax3.set_ylabel('Flux density [µJy]')
 
-        # (4) Zoom in F_lambda around OIII/Hβ
         if np.any(mZ):
             lam_zoom = lam_um[mZ]
             left_z, right_z = _pixel_edges_um(lam_zoom)
@@ -651,7 +685,6 @@ def excels_fit_poly(source, z, grating="PRISM", lines_to_use=None,
             ax4.stairs(model_flam_z, edges_z, label='Model (Fλ)',     color='r', linewidth=1.1)
             ax4.set_xlim(o3_lo, o3_hi)
             ax4.legend(fontsize=8, frameon=False, ncol=3)
-            ax4.grid(alpha=0.25)
             _annotate_lines(ax4, which_lines, z, per_line=per_line, min_dx_um=0.002, levels=(0.92,0.80,0.68))
         ax4.set_xlabel('Observed wavelength [µm]')
         ax4.set_ylabel(r'$F_\lambda$ [erg s$^{-1}$ cm$^{-2}$ Å$^{-1}$]')
@@ -668,6 +701,7 @@ def excels_fit_poly(source, z, grating="PRISM", lines_to_use=None,
         lines=per_line,
         which_lines=which_lines,
     )
+
 
 # ============================================================
 # Bootstrapping with µJy+Fλ stairs, zooms, data errorbars, line labels, tqdm
@@ -750,10 +784,39 @@ def _make_zoom_panel(ax, lam_um, flux_uJy, err_uJy, cont_uJy, mu_uJy, sig_uJy,
                     step='mid', alpha=0.18, linewidth=0)
     ax.set_xlim(lo_um, hi_um)
     ax.set_title(title, fontsize=10)
-    ax.grid(alpha=0.25)
     _annotate_lines(ax, which_lines, z, per_line=per_line,
                     min_dx_um=annotate_min_dx_um, levels=(0.92, 0.80, 0.68))
     return True
+
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+from astropy.io import fits
+from tqdm.auto import tqdm
+
+# assumes these come from your module namespace already:
+# - excels_fit_poly
+# - flam_to_fnu_uJy
+# - _sigma_clip_mean_std
+# - _window_from_lines_um, _has_coverage_window, _has_fit_in_window
+# - REST_LINES_A
+# - _annotate_lines
+
+def _bin_edges_from_centers_um(lam_um: np.ndarray) -> np.ndarray:
+    """
+    Given wavelength centers in µm (possibly non-uniform), return bin edges in µm
+    such that each center is the midpoint of its bin.
+    """
+    lam = np.asarray(lam_um, float)
+    if lam.size < 2:
+        # fabricate a tiny symmetric bin if we only have one point
+        d = 1e-6
+        return np.array([lam[0] - d, lam[0] + d], float)
+
+    mid = 0.5 * (lam[1:] + lam[:-1])                 # interior edges
+    left  = lam[0]  - 0.5 * (lam[1]  - lam[0])       # first edge
+    right = lam[-1] + 0.5 * (lam[-1] - lam[-2])      # last edge
+    return np.r_[left, mid, right]
 
 
 def bootstrap_excels_fit(
@@ -888,6 +951,7 @@ def bootstrap_excels_fit(
             tmp[wfit] = fb.get("model_window_flam", np.zeros_like(lam_um[wfit]))
             total_flam = cont + tmp
 
+        # basic sanity filter against wild models
         if np.nanmax(np.abs(total_flam)) > 1e-11:
             keep_mask.append(False)
             model_stack_flam.append(np.full_like(lam_um, np.nan))
@@ -909,12 +973,16 @@ def bootstrap_excels_fit(
     # summaries (value ± error + preformatted text)
     def _ve(x):
         x = x[keep_mask]
-        val = np.nanmean(x); err = np.nanstd(x)
+        if x.size == 0 or np.all(~np.isfinite(x)):
+            return np.nan, np.nan
+        val = np.nanmean(x)
+        err = np.nanstd(x)
         if np.count_nonzero(np.isfinite(x)) >= 8:
             xc = x[np.isfinite(x)]
             m, s = np.nanmean(xc), np.nanstd(xc)
             xc = xc[(xc > m - 3*s) & (xc < m + 3*s)]
-            val, err = (np.nanmean(xc), np.nanstd(xc)) if xc.size else (val, err)
+            if xc.size:
+                val, err = np.nanmean(xc), np.nanstd(xc)
         return val, err
 
     summary = {}
@@ -943,22 +1011,22 @@ def bootstrap_excels_fit(
         cont_flam = np.asarray(base.get("continuum_flam", np.zeros_like(lam_um)))
         cont_uJy  = flam_to_fnu_uJy(cont_flam, lam_um)
 
-        # Pixel edges for stairs (full panel)
-        left_um, right_um = _pixel_edges_um(lam_um)
-        edges_um = np.r_[left_um[0], right_um]
+        # Centered bin edges + centers
+        edges_um   = _bin_edges_from_centers_um(lam_um)
+        centers_um = 0.5 * (edges_um[:-1] + edges_um[1:])
 
-        # --- Define smart zoom windows (in rest Å names consistent with REST_LINES_A keys) ---
+        # --- Define smart zoom windows ---
         o3hb_names = ["HBETA", "OIII_2", "OIII_3"]
         o3hb_restA = [REST_LINES_A[n] for n in o3hb_names]
-        o3hb_lo, o3hb_hi = _window_from_lines_um(o3hb_restA, z, pad_A=250.0)
+        o3hb_lo, o3hb_hi = _window_from_lines_um(o3hb_restA, z, pad_A=100.0)
 
         aur_names = ["HDELTA", "OIII_1"]
         aur_restA = [REST_LINES_A[n] for n in aur_names]
-        aur_lo, aur_hi = _window_from_lines_um(aur_restA, z, pad_A=220.0)
+        aur_lo, aur_hi = _window_from_lines_um(aur_restA, z, pad_A=100.0)
 
         oiiuv_names = ["OII_UV_1", "OII_UV_2"]
         oiiuv_restA = [REST_LINES_A[n] for n in oiiuv_names]
-        oiiuv_lo, oiiuv_hi = _window_from_lines_um(oiiuv_restA, z, pad_A=180.0)
+        oiiuv_lo, oiiuv_hi = _window_from_lines_um(oiiuv_restA, z, pad_A=80.0)
 
         base_lines = base.get("lines", {})
         zoom_defs = [
@@ -983,47 +1051,59 @@ def bootstrap_excels_fit(
 
         errbar_kwargs = dict(
             fmt='o',
-            ms=1.5,
-            mfc='none',
-            mec=(0, 0, 0, 0.25),
-            mew=0.4,
-            ecolor=(0, 0, 0, 0.12),
+            ms=1.2,
+            mfc='white',
+            mec=(0, 0, 0, 0.6),
+            mew=0.5,
+            ecolor=(0, 0, 0, 0.45),
             elinewidth=0.4,
-            capsize=0,
-            zorder=1
+            capsize=1.0,
+            alpha=0.8,
+            zorder=3
         )
 
-        ax_full.stairs(flux_uJy, edges_um, label="Data (bins)", color="k", linewidth=0.9, alpha=0.9, zorder=3)
-        ax_full.errorbar(lam_um, flux_uJy, yerr=err_uJy, **errbar_kwargs)
-        ax_full.stairs(cont_uJy, edges_um, label="Continuum", color="b", linestyle="--", linewidth=1.0, zorder=2)
-        ax_full.stairs(mu_uJy,   edges_um, label="Model mean", color="r", linewidth=1.1, zorder=4)
-        ax_full.fill_between(lam_um, mu_uJy - sig_uJy, mu_uJy + sig_uJy,
+        # Full panel (centers for errorbars, edges for stairs)
+        ax_full.stairs(flux_uJy, edges_um, label="Data (bins)", color="k", linewidth=1, alpha=0.9, zorder=3)
+        ax_full.errorbar(centers_um, flux_uJy, yerr=err_uJy, **errbar_kwargs)
+        ax_full.stairs(cont_uJy, edges_um, label="Continuum", color="b", linestyle="--", linewidth=0.7, zorder=2)
+        ax_full.stairs(mu_uJy,   edges_um, label="Model mean", color="r", linewidth=0.5, zorder=4)
+        ax_full.fill_between(centers_um, mu_uJy - sig_uJy, mu_uJy + sig_uJy,
                              step='mid', color="r", alpha=0.18, linewidth=0,
                              label="Model ±1σ (bootstrap)")
         ax_full.set_ylabel("Flux density [µJy]")
         ax_full.set_xlabel("Observed wavelength [µm]")
-        ax_full.grid(alpha=0.25)
         ax_full.legend(ncol=3, fontsize=9, frameon=False)
         _annotate_lines(ax_full, which_lines, z, per_line=base["lines"], min_dx_um=0.01)
 
+        # Zoom panels (use centers/edges within each window)
         for ax, zd, show in zip(ax_zoom, zoom_defs, show_flags):
             if not show:
                 ax.set_visible(False)
                 continue
             sel = (lam_um >= zd["lo"]) & (lam_um <= zd["hi"])
-            left_z, right_z = _pixel_edges_um(lam_um[sel])
-            edges_z = np.r_[left_z[0], right_z]
+            if not np.any(sel):
+                ax.set_visible(False)
+                continue
 
-            ax.stairs(flux_uJy[sel], edges_z, label="Data (bins)", color="k", linewidth=0.9, alpha=0.9, zorder=3)
-            ax.errorbar(lam_um[sel], flux_uJy[sel], yerr=err_uJy[sel], **errbar_kwargs)
-            ax.stairs(cont_uJy[sel], edges_z, label="Continuum", linestyle="--", linewidth=0.9, zorder=2)
-            ax.stairs(mu_uJy[sel],   edges_z, label="Model mean", linewidth=1.0, zorder=4)
-            ax.fill_between(lam_um[sel], mu_uJy[sel] - sig_uJy[sel], mu_uJy[sel] + sig_uJy[sel],
-                            step='mid', alpha=0.18, linewidth=0)
+            lam_z   = lam_um[sel]
+            flux_z  = flux_uJy[sel]
+            err_z   = err_uJy[sel]
+            cont_z  = cont_uJy[sel]
+            mu_z    = mu_uJy[sel]
+            sig_z   = sig_uJy[sel]
+
+            edges_z   = _bin_edges_from_centers_um(lam_z)
+            centers_z = 0.5 * (edges_z[:-1] + edges_z[1:])
+
+            ax.stairs(flux_z, edges_z, label="Data (bins)", color="k", linewidth=1, alpha=0.9, zorder=3)
+            ax.errorbar(centers_z, flux_z, yerr=err_z, **errbar_kwargs)
+            ax.stairs(cont_z, edges_z, label="Continuum", linestyle="--", linewidth=0.7, zorder=2)
+            ax.stairs(mu_z,   edges_z, label="Model mean", linewidth=0.5, zorder=4)
+            ax.fill_between(centers_z, mu_z - sig_z, mu_z + sig_z, step='mid', alpha=0.18, linewidth=0)
             ax.set_xlim(zd["lo"], zd["hi"])
             ax.set_title(zd["title"], fontsize=10)
-            ax.grid(alpha=0.25)
-            _annotate_lines(ax, which_lines, z, per_line=base["lines"], min_dx_um=0.002, levels=(0.92, 0.80, 0.68))
+            _annotate_lines(ax, which_lines, z, per_line=base["lines"],
+                            min_dx_um=0.002, levels=(0.92, 0.80, 0.68))
             ax.set_xlabel("Observed wavelength [µm]")
             ax.set_ylabel("µJy")
 
