@@ -28,6 +28,70 @@ def _bin_edges_from_centers_um(lam_um):
     ))
     return edges
 
+from adjustText import adjust_text
+
+def annotate_lines_no_overlap(ax, z, lam_min, lam_max, fontsize=7):
+    """
+    Annotate emission lines without overlaps, keeping labels inside the axes.
+    """
+    # Build observed wavelengths for lines in range
+    rest_waves_A = np.array(list(REST_LINES_A.values()))
+    line_names   = np.array(list(REST_LINES_A.keys()))
+    obs_um       = rest_waves_A * (1 + z) / 1e4
+
+    m = (obs_um > lam_min) & (obs_um < lam_max)
+    if not np.any(m):
+        return
+
+    obs_um   = obs_um[m]
+    names_in = line_names[m]
+
+    # Sort by wavelength
+    order = np.argsort(obs_um)
+    obs_um, names_in = obs_um[order], names_in[order]
+
+    # Base y near the top
+    ymin, ymax = ax.get_ylim()
+    yspan  = ymax - ymin
+    y_base = ymin + 0.90 * yspan
+
+    # Put a faint guide line for orientation (optional)
+    for x in obs_um:
+        ax.axvline(x, color="0.7", lw=0.4, alpha=0.5, zorder=1)
+
+    # Create all Text artists first (same initial y); rotation vertical
+    texts = []
+    for x, label in zip(obs_um, names_in):
+        t = ax.text(
+            x, y_base, label,
+            rotation=90, ha="center", va="bottom",
+            fontsize=fontsize, color="0.2", alpha=0.9,
+            bbox=dict(facecolor="white", edgecolor="none", alpha=0.55, pad=0.2),
+            clip_on=False,  # adjustText keeps us in-bounds via lim=...
+            zorder=10,
+        )
+        texts.append(t)
+
+    # Tell adjustText to move labels but keep them in-bounds
+    x0, x1 = ax.get_xlim()
+    y0, y1 = ax.get_ylim()
+    adjust_text(
+        texts,
+        # allow both x & y motion for text; don’t move data points
+        only_move={'points': 'none', 'text': 'xy'},
+        # make collisions “bigger” so labels don’t touch
+        expand_text=(1.1, 1.25),
+        # slight repulsion strength
+        force_text=(0.05, 0.2),
+        # keep inside axes rectangle
+        lim=(x0, x1, y0, y1),
+        # draw short connectors to their x-position if moved sideways
+        arrowprops=dict(arrowstyle='-', lw=0.4, color='0.4', alpha=0.7),
+        autoalign='y',  # prefer vertical stacking
+        ax=ax,
+    )
+
+
 def plot_spectrum_basic(
     lam_um,
     flux_uJy,
@@ -107,37 +171,12 @@ def plot_spectrum_basic(
     # -----------------------------------------------------------------
     # === Line annotation section ===
     # -----------------------------------------------------------------
+    # -----------------------------------------------------------------
+    # === Line annotation section (non-overlapping labels) ===
+    # -----------------------------------------------------------------
     if annotate_lines and z is not None:
-        rest_waves_A = np.array(list(REST_LINES_A.values()))
-        line_names = np.array(list(REST_LINES_A.keys()))
+        annotate_lines_no_overlap(ax, z, lam_um.min(), lam_um.max(), fontsize=fontsize)
 
-        obs_um = rest_waves_A * (1 + z) / 1e4  # Å → µm
-        in_range = (obs_um > lam_um.min()) & (obs_um < lam_um.max())
-
-        obs_um = obs_um[in_range]
-        line_names = line_names[in_range]
-
-        # avoid clutter: stagger labels vertically
-        ymin, ymax = ax.get_ylim()
-        label_height = ymax - ymin
-        levels = np.linspace(0.9, 0.75, 6)  # staggered heights
-
-        used_x = []
-        for i, (lam_i, name) in enumerate(zip(obs_um, line_names)):
-            if np.any(np.abs(np.array(used_x) - lam_i) < 0.015):  # avoid overlaps
-                continue
-            used_x.append(lam_i)
-            y_frac = levels[i % len(levels)]
-            ax.axvline(lam_i, color="gray", lw=0.4, alpha=0.5, zorder=1)
-            ax.text(
-                lam_i, ymin + y_frac * label_height,
-                name, rotation=90,
-                va="bottom", ha="center",
-                fontsize=fontsize,
-                color="0.2",
-                alpha=0.85,
-                clip_on=True,
-            )
 
     if save_path:
         fig.savefig(save_path, dpi=500, bbox_inches="tight", transparent=False)

@@ -300,55 +300,94 @@ def continuum_windows_two_sides_of_lya(
 def fit_continuum_polynomial(lam_um, flam, z, deg=2, windows=None,
                              lyman_cut="lya", sigma_flam=None,
                              grating="PRISM", clip_sigma=2.5, max_iter=5):
+    """
+    Fit σ-weighted polynomial continuum *independently in each specified window*,
+    masking emission lines. Returns stitched full-spectrum continuum and coef array.
+    """
+    lam_um = np.asarray(lam_um, float)
+    flam = np.asarray(flam, float)
+
+    # --- Lyman cut ---
     ly_um = _lyman_cut_um(z, lyman_cut)
-    mask = lam_um >= ly_um
+    global_mask = lam_um >= ly_um
 
-    if windows:
-        mask_win = np.zeros_like(mask, dtype=bool)
-        for (lo, hi) in windows:
-            mask_win |= (lam_um >= float(lo)) & (lam_um <= float(hi))
-        mask &= mask_win
-
-    lam_fit = lam_um[mask]
-    flam_fit = flam[mask]
+    # --- Default σ if not given ---
     if sigma_flam is None:
         sigma_flam = np.full_like(flam, max(1e-30, _safe_median(flam, 0.0)) * 0.05)
-    sig_fit = sigma_flam[mask]
+    sigma_flam = np.asarray(sigma_flam, float)
 
-    # Mask ±4 σ_inst (×1.5) around all catalog lines
-    lam_A = lam_fit * 1e4
-    for lam_rest in REST_LINES_A.values():
-        muA = lam_rest * (1 + z)
-        mu_um = muA / 1e4
-        sig_gr_log = float(sigma_grating_logA(grating, mu_um))  # log10
-        sigma_A = muA * LN10 * sig_gr_log * 1.5
-        core = (lam_A > muA - 4 * sigma_A) & (lam_A < muA + 4 * sigma_A)
-        flam_fit[core] = np.nan
-        sig_fit[core] = np.nan
+    # --- Default window (full coverage) ---
+    if not windows:
+        windows = [(float(np.nanmin(lam_um)), float(np.nanmax(lam_um)))]
 
-    good = np.isfinite(flam_fit) & np.isfinite(sig_fit) & (sig_fit > 0)
-    lam_fit, flam_fit, sig_fit = lam_fit[good], flam_fit[good], sig_fit[good]
+    # --- Output continuum array ---
+    Fcont = np.full_like(flam, np.nan)
 
-    if lam_fit.size < max(deg + 2, 10):
-        med = _safe_median(flam_fit, _safe_median(flam, 0.0))
-        return np.full_like(flam, med), np.array([med])
+    for (lo, hi) in windows:
+        # Limit to each window + Lyα cut
+        m = (lam_um >= lo) & (lam_um <= hi) & global_mask
+        if np.count_nonzero(m) < max(deg + 2, 10):
+            continue
 
-    w = 1.0 / np.clip(sig_fit, _safe_median(sig_fit, 1.0) * 1e-3, np.inf)
-    w /= np.nanmax(w)
+        lam_fit = lam_um[m]
+        flam_fit = flam[m].copy()
+        sig_fit = sigma_flam[m].copy()
 
-    for _ in range(max_iter):
-        p = Polynomial.fit(lam_fit, flam_fit, deg, w=w)
-        m = p(lam_fit)
-        resid = (flam_fit - m) / np.clip(sig_fit, 1e-30, None)
-        keep = np.abs(resid) < clip_sigma
-        if np.all(keep):
-            break
-        lam_fit, flam_fit, sig_fit = lam_fit[keep], flam_fit[keep], sig_fit[keep]
+        # --- Mask emission lines ---
+        lam_A = lam_fit * 1e4
+        for lam_rest in REST_LINES_A.values():
+            muA = lam_rest * (1 + z)
+            mu_um = muA / 1e4
+            sig_gr_log = float(sigma_grating_logA(grating, mu_um))
+            sigma_A = muA * LN10 * sig_gr_log * 1.5
+            core = (lam_A > muA - 4 * sigma_A) & (lam_A < muA + 4 * sigma_A)
+            flam_fit[core] = np.nan
+            sig_fit[core] = np.nan
+
+        good = np.isfinite(flam_fit) & np.isfinite(sig_fit) & (sig_fit > 0)
+        if np.count_nonzero(good) < max(deg + 2, 8):
+            continue
+
+        lam_fit, flam_fit, sig_fit = lam_fit[good], flam_fit[good], sig_fit[good]
         w = 1.0 / np.clip(sig_fit, _safe_median(sig_fit, 1.0) * 1e-3, np.inf)
         w /= np.nanmax(w)
 
-    p_final = Polynomial.fit(lam_fit, flam_fit, deg, w=w)
-    return p_final(lam_um), p_final.convert().coef
+        # --- Iterative σ-clipping ---
+        for _ in range(max_iter):
+            p = Polynomial.fit(lam_fit, flam_fit, deg, w=w)
+            m_est = p(lam_fit)
+            resid = (flam_fit - m_est) / np.clip(sig_fit, 1e-30, None)
+            keep = np.abs(resid) < clip_sigma
+            if np.all(keep):
+                break
+            lam_fit, flam_fit, sig_fit = lam_fit[keep], flam_fit[keep], sig_fit[keep]
+            if lam_fit.size < max(deg + 2, 8):
+                break
+            w = 1.0 / np.clip(sig_fit, _safe_median(sig_fit, 1.0) * 1e-3, np.inf)
+            w /= np.nanmax(w)
+
+        p_final = Polynomial.fit(lam_fit, flam_fit, deg, w=w)
+        Fcont[m] = p_final(lam_um)[m]
+
+    # --- Fill gaps linearly between windows ---
+    if np.any(~np.isfinite(Fcont)):
+        good = np.isfinite(Fcont)
+        if np.count_nonzero(good) >= 2:
+            Fcont = np.interp(lam_um, lam_um[good], Fcont[good], left=Fcont[good][0], right=Fcont[good][-1])
+        else:
+            Fcont[:] = _safe_median(flam, 0.0)
+
+    # --- Compatibility: return global coefs ---
+    mgood = np.isfinite(Fcont)
+    if np.count_nonzero(mgood) >= max(deg + 2, 10):
+        w_all = 1.0 / np.clip(sigma_flam[mgood], _safe_median(sigma_flam[mgood], 1.0) * 1e-3, np.inf)
+        w_all /= np.nanmax(w_all)
+        p_coefs = Polynomial.fit(lam_um[mgood], Fcont[mgood], deg, w=w_all).convert().coef
+    else:
+        p_coefs = np.array([_safe_median(Fcont[mgood], _safe_median(flam, 0.0))])
+
+    return Fcont, p_coefs
+
 
 # ============================================================
 # Seeds: local peaks for μ
@@ -502,16 +541,32 @@ def excels_fit_poly(source, z, grating="PRISM", lines_to_use=None,
     lamA_fit = lam_fit * 1e4
     pix_A = float(np.median(np.diff(lamA_fit))) if lamA_fit.size > 1 else 1.0
 
-    # --- Robust σ bounds (tight to LSF; no huge absolute floors/ceilings)
+    # --- Robust σ bounds tuned to grating resolution ---
     g = str(grating).lower()
+
     if "prism" in g:
-        # PRISM: allow a bit more freedom (blended features / LSF wings)
-        sigmaA_lo = np.maximum(0.35 * pix_A, 0.50 * sigmaA_inst)     # ≥ 0.5×σ_inst
-        sigmaA_hi = np.maximum(1.50 * pix_A, 1.60 * sigmaA_inst)     # ≤ 1.6×σ_inst
+        # Very low resolution PRISM (R ≈ 100)
+        # Allow wide range — blended features, coarse sampling
+        sigmaA_lo = np.maximum(0.40 * pix_A, 0.45 * sigmaA_inst)   # ≥ 0.45×σ_inst
+        sigmaA_hi = np.maximum(1.50 * pix_A, 1.75 * sigmaA_inst)   # ≤ 1.75×σ_inst
+
+    elif any(k in g for k in ["m", "med"]):
+        # Medium-resolution gratings (G140M/G235M/G395M, R ≈ 1000)
+        # Narrower bounds: moderate resolving power, well-behaved LSF
+        sigmaA_lo = np.maximum(0.30 * pix_A, 0.80 * sigmaA_inst)   # ≥ 0.8×σ_inst
+        sigmaA_hi = np.maximum(0.70 * pix_A, 1.20 * sigmaA_inst)   # ≤ 1.2×σ_inst
+
+    elif any(k in g for k in ["h", "high"]):
+        # High-resolution gratings (G140H/G235H/G395H, R ≈ 2700)
+        # Tightest bounds: LSF highly stable, velocity dispersion dominates
+        sigmaA_lo = np.maximum(0.25 * pix_A, 0.90 * sigmaA_inst)   # ≥ 0.9×σ_inst
+        sigmaA_hi = np.maximum(0.50 * pix_A, 1.15 * sigmaA_inst)   # ≤ 1.15×σ_inst
+
     else:
-        # MED/HIGH: keep σ very close to the instrumental resolution
-        sigmaA_lo = np.maximum(0.25 * pix_A, 0.60 * sigmaA_inst)     # ≥ 0.6×σ_inst
-        sigmaA_hi = np.maximum(1.00 * pix_A, 1.35 * sigmaA_inst)     # ≤ 1.35×σ_inst
+        # Fallback default (medium-like)
+        sigmaA_lo = np.maximum(0.30 * pix_A, 0.80 * sigmaA_inst)
+        sigmaA_hi = np.maximum(0.70 * pix_A, 1.20 * sigmaA_inst)
+
 
     # --- σ seeds near instrumental width, clipped into [lo, hi]
     sigmaA_seed = np.clip(0.95 * sigmaA_inst, sigmaA_lo, sigmaA_hi)
@@ -949,12 +1004,32 @@ def bootstrap_excels_fit(
 
         # full F_lambda total model on lam_um (continuum + lines)
         cont = fb.get("continuum_flam", np.zeros_like(lam_um))
+
+        # Mask continuum blueward of Lyα (avoid extrapolation entering bootstrap mean)
+        cont_mask = np.ones_like(lam_um, dtype=bool)
+        if (lyman_cut is not None) and (str(lyman_cut).lower() == "lya"):
+            lya_edge = 0.1216 * (1.0 + z)
+            disp_mask = (lam_um >= lya_edge)  # hard cut below Lyα
+
+
+        # Optionally also limit to your continuum windows
+        if continuum_windows and isinstance(continuum_windows, (list, tuple)):
+            cw_mask = np.zeros_like(lam_um, dtype=bool)
+            for lo, hi in continuum_windows:
+                cw_mask |= (lam_um >= lo) & (lam_um <= hi)
+            cont_mask &= cw_mask
+
+        cont_masked = np.full_like(cont, np.nan)
+        cont_masked[cont_mask] = cont[cont_mask]
+
+        # Combine masked continuum with model in fit window
         if isinstance(wfit, slice):
-            total_flam = cont + fb.get("model_window_flam", np.zeros_like(lam_um))
+            total_flam = cont_masked + fb.get("model_window_flam", np.zeros_like(lam_um))
         else:
             tmp = np.zeros_like(lam_um)
             tmp[wfit] = fb.get("model_window_flam", np.zeros_like(lam_um[wfit]))
-            total_flam = cont + tmp
+            total_flam = cont_masked + tmp
+
 
         # basic sanity filter against wild models
         if np.nanmax(np.abs(total_flam)) > 1e-11:
@@ -1003,56 +1078,50 @@ def bootstrap_excels_fit(
         summary[ln]["sigma_A"]   = {"value": vS,  "err": eS,  "text": f"{vS:.2f} ± {eS:.2f}"}
         summary[ln]["lam_obs_A"] = {"value": vMu, "err": eMu, "text": f"{vMu:.1f} ± {eMu:.1f}"}
         summary[ln]["SNR"]       = {"value": vSN, "err": eSN, "text": f"{vSN:.2f} ± {eSN:.2f}"}
+    # Convert data from µJy → Fλ  [erg s⁻¹ cm⁻² Å⁻¹]
+    # (assuming the data were originally in µJy)
+    flam     = fnu_uJy_to_flam(flux_uJy, lam_um)
+    sig_flam = fnu_uJy_to_flam(err_uJy,  lam_um)
 
     # -------- plotting + optional saving --------
     if plot:
         # mean ± std (sigma-clipped) of total F_lambda model
         mu_flam, sig_flam = _sigma_clip_mean_std(model_stack_flam[keep_mask], axis=0, sigma=3.0)
-        # convert for µJy panels
-        mu_uJy  = flam_to_fnu_uJy(mu_flam,  lam_um)
-        sig_uJy = flam_to_fnu_uJy(sig_flam, lam_um)
 
         # Use the baseline continuum for display (always show it)
         cont_flam = np.asarray(base.get("continuum_flam", np.zeros_like(lam_um)))
-        cont_uJy  = flam_to_fnu_uJy(cont_flam, lam_um)
 
-                # ============================================================
+        # ============================================================
         # Mask blueward of Lyα (avoid plotting extrapolated continuum)
         # ============================================================
         disp_mask = np.ones_like(lam_um, dtype=bool)
-
-        # 1) If lyman_cut == "lya", hide all λ < (1+z)*1216 Å
         if (lyman_cut is not None) and (str(lyman_cut).lower() == "lya"):
             lya_edge = 0.1216 * (1.0 + z)
-            disp_mask &= lam_um >= lya_edge
+            disp_mask = (lam_um >= lya_edge)  # hard cut below Lyα
 
-        # 2) Optionally, if you passed explicit continuum windows, only show those
         if continuum_windows and isinstance(continuum_windows, (list, tuple)):
             cw_mask = np.zeros_like(lam_um, dtype=bool)
             for lo, hi in continuum_windows:
                 cw_mask |= (lam_um >= lo) & (lam_um <= hi)
             disp_mask &= cw_mask
 
-        # 3) Also restrict to fit_window_um (if set)
         if fit_window_um:
             lo, hi = fit_window_um
             disp_mask &= (lam_um >= lo) & (lam_um <= hi)
 
-        # Apply mask to continuum + model arrays (NaN elsewhere)
-        cont_uJy_plot = cont_uJy.copy()
-        mu_uJy_plot   = mu_uJy.copy()
-        sig_uJy_plot  = sig_uJy.copy()
+        # Apply mask to arrays (NaN elsewhere)
+        cont_flam_plot = cont_flam.copy()
+        mu_flam_plot   = mu_flam.copy()
+        sig_flam_plot  = sig_flam.copy()
+        cont_flam_plot[~disp_mask] = np.nan
+        mu_flam_plot[~disp_mask]   = np.nan
+        sig_flam_plot[~disp_mask]  = np.nan
 
-        cont_uJy_plot[~disp_mask] = np.nan
-        mu_uJy_plot[~disp_mask]   = np.nan
-        sig_uJy_plot[~disp_mask]  = np.nan
-
-
-        # Centered bin edges + centers
+        # Bin edges + centers
         edges_um   = _bin_edges_from_centers_um(lam_um)
         centers_um = 0.5 * (edges_um[:-1] + edges_um[1:])
 
-        # --- Define smart zoom windows ---
+        # --- Define zoom windows ---
         o3hb_names = ["HBETA", "OIII_2", "OIII_3"]
         o3hb_restA = [REST_LINES_A[n] for n in o3hb_names]
         o3hb_lo, o3hb_hi = _window_from_lines_um(o3hb_restA, z, pad_A=100.0)
@@ -1087,79 +1156,69 @@ def bootstrap_excels_fit(
         ax_zoom = [ax_z1, ax_z2, ax_z3]
 
         errbar_kwargs = dict(
-            fmt='o',
-            ms=1.2,
-            mfc='white',
-            mec=(0, 0, 0, 0.6),
-            mew=0.5,
-            ecolor=(0, 0, 0, 0.45),
-            elinewidth=0.4,
-            capsize=1.0,
-            alpha=0.8,
-            zorder=3
+            fmt='o', ms=1.2, mfc='white',
+            mec=(0, 0, 0, 0.6), mew=0.5,
+            ecolor=(0, 0, 0, 0.45), elinewidth=0.4,
+            capsize=1.0, alpha=0.8, zorder=3
         )
 
-        # Full panel (centers for errorbars, edges for stairs)
-        # --- Figure title (source ID + redshift) ---
-        if source_id is not None:
-            ax_full.set_title(f"{source_id}   (z = {z:.3f})", fontsize=12, pad=8)
-        else:
-            ax_full.set_title(f"z = {z:.3f}", fontsize=12, pad=8)
+        # --- Full-spectrum panel ---
+        title = f"{source_id}   (z = {z:.3f})" if source_id else f"z = {z:.3f}"
+        ax_full.set_title(title, fontsize=12, pad=8)
 
-        ax_full.stairs(flux_uJy, edges_um, label="Data (bins)", color="k", linewidth=1, alpha=0.9, zorder=3)
-        ax_full.errorbar(centers_um, flux_uJy, yerr=err_uJy, **errbar_kwargs)
-        ax_full.stairs(cont_uJy_plot, edges_um, label="Continuum", color="b", linestyle="--", linewidth=0.7, zorder=2)
-        ax_full.stairs(mu_uJy_plot,   edges_um, label="Model mean", color="r", linewidth=0.5, zorder=4)
-        ax_full.fill_between(centers_um,
-                     mu_uJy_plot - sig_uJy_plot, mu_uJy_plot + sig_uJy_plot,
-                     step='mid', color="r", alpha=0.18, linewidth=0,
-                     label="Model ±1σ (bootstrap)")
+        ax_full.stairs(flam, edges_um, label="Data (bins)", color="k", linewidth=1, alpha=0.9, zorder=3)
+        ax_full.errorbar(centers_um, flam, yerr=sig_flam, **errbar_kwargs)
+        ax_full.stairs(cont_flam_plot, edges_um, label="Continuum", color="b", linestyle="--", linewidth=0.7, zorder=2)
+        ax_full.stairs(mu_flam_plot, edges_um, label="Model mean", color="r", linewidth=0.7, zorder=4)
+        ax_full.fill_between(
+            centers_um, mu_flam_plot - sig_flam_plot, mu_flam_plot + sig_flam_plot,
+            step='mid', color="r", alpha=0.18, linewidth=0, label="Model ±1σ"
+        )
 
-        ax_full.set_ylabel("Flux density [µJy]")
+        if (lyman_cut is not None) and (str(lyman_cut).lower() == "lya"):
+            ax_full.axvline(lya_edge, color='0.7', linestyle='--', lw=0.8, zorder=1)
+
+        ax_full.set_ylabel(r"$F_\lambda$ [erg s$^{-1}$ cm$^{-2}$ Å$^{-1}$]")
         ax_full.set_xlabel("Observed wavelength [µm]")
         ax_full.legend(ncol=3, fontsize=9, frameon=False)
         _annotate_lines(ax_full, which_lines, z, per_line=base["lines"], min_dx_um=0.01)
 
-        # --- Zoom panels (always show all 3) ---
+        # --- Zoom panels ---
         for ax, zd, show in zip(ax_zoom, zoom_defs, show_flags):
             sel = (lam_um >= zd["lo"]) & (lam_um <= zd["hi"])
 
             if np.any(sel):
                 lam_z   = lam_um[sel]
-                flux_z  = flux_uJy[sel]
-                err_z   = err_uJy[sel]
-                cont_z  = cont_uJy[sel]
-                mu_z    = mu_uJy[sel]
-                sig_z   = sig_uJy[sel]
+                flam_z  = flam[sel]
+                err_z   = sig_flam[sel]
+                cont_z  = cont_flam[sel]
+                mu_z    = mu_flam[sel]
+                sig_z   = sig_flam[sel]
 
                 edges_z   = _bin_edges_from_centers_um(lam_z)
                 centers_z = 0.5 * (edges_z[:-1] + edges_z[1:])
 
-                ax.stairs(flux_z, edges_z, label="Data (bins)", color="k", linewidth=1, alpha=0.9, zorder=3)
-                ax.errorbar(centers_z, flux_z, yerr=err_z, **errbar_kwargs)
-                ax.stairs(cont_z, edges_z, label="Continuum", linestyle="--",color='b', linewidth=0.7, zorder=2)
-                ax.stairs(mu_z,   edges_z, label="Model mean",color='r', linewidth=0.5, zorder=4)
+                ax.stairs(flam_z, edges_z, label="Data", color="k", linewidth=1, alpha=0.9)
+                ax.errorbar(centers_z, flam_z, yerr=err_z, **errbar_kwargs)
+                ax.stairs(cont_z, edges_z, label="Continuum", linestyle="--", color='b', linewidth=0.7)
+                ax.stairs(mu_z, edges_z, label="Model mean", color='r', linewidth=0.7)
                 ax.fill_between(centers_z, mu_z - sig_z, mu_z + sig_z,
                                 step='mid', alpha=0.18, linewidth=0)
                 _annotate_lines(ax, which_lines, z, per_line=base["lines"],
                                 min_dx_um=0.002, levels=(0.92, 0.80, 0.68))
             else:
-                # no data coverage → blank grey panel
                 ax.axhline(0, color='k', lw=0.5, alpha=0.3)
                 ax.text(0.5, 0.5, "No coverage", transform=ax.transAxes,
                         ha="center", va="center", fontsize=9, color="0.5")
 
             if not show:
-                # either low SNR or no line detected → overlay label
                 ax.text(0.5, 0.1, "No detection", transform=ax.transAxes,
                         ha="center", va="bottom", fontsize=8, color="0.6", alpha=0.8)
 
             ax.set_xlim(zd["lo"], zd["hi"])
             ax.set_title(zd["title"], fontsize=10)
             ax.set_xlabel("Observed wavelength [µm]")
-            ax.set_ylabel("µJy")
-            
-
+            ax.set_ylabel(r"$F_\lambda$ [erg s$^{-1}$ cm$^{-2}$ Å$^{-1}$]")
 
         if save_path:
             root, ext = os.path.splitext(save_path)
@@ -1177,11 +1236,9 @@ def bootstrap_excels_fit(
                 save_path=summary_txt
             )
 
-            
-        
-
         plt.show()
         plt.close(fig)
+
 
     return {
         "samples": samples,
