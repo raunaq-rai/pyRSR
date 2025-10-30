@@ -824,6 +824,7 @@ def bootstrap_excels_fit(
     z,
     grating="PRISM",
     n_boot=200,
+    source_id=None, 
     deg=2,
     continuum_windows=None,
     lyman_cut="lya",
@@ -837,6 +838,7 @@ def bootstrap_excels_fit(
     save_dpi: int = 500,
     save_format: str = "png",
     save_transparent: bool = False,
+    lines_to_use=None,
 ):
     # -------- load once --------
     if isinstance(source, dict):
@@ -862,6 +864,7 @@ def bootstrap_excels_fit(
         fit_window_um=fit_window_um,
         plot=False, verbose=False,
         absorption_corrections=absorption_corrections,
+        lines_to_use=lines_to_use  # all in coverage
     )
     which_lines = list(base.get("which_lines", []))
     if not which_lines:
@@ -910,7 +913,9 @@ def bootstrap_excels_fit(
                 fit_window_um=fit_window_um,
                 plot=False, verbose=False,
                 absorption_corrections=absorption_corrections,
+                lines_to_use=lines_to_use,    # <<=== ADD THIS
             )
+
             ok_fit = True
         except Exception:
             ok_fit = False
@@ -1011,6 +1016,38 @@ def bootstrap_excels_fit(
         cont_flam = np.asarray(base.get("continuum_flam", np.zeros_like(lam_um)))
         cont_uJy  = flam_to_fnu_uJy(cont_flam, lam_um)
 
+                # ============================================================
+        # Mask blueward of Lyα (avoid plotting extrapolated continuum)
+        # ============================================================
+        disp_mask = np.ones_like(lam_um, dtype=bool)
+
+        # 1) If lyman_cut == "lya", hide all λ < (1+z)*1216 Å
+        if (lyman_cut is not None) and (str(lyman_cut).lower() == "lya"):
+            lya_edge = 0.1216 * (1.0 + z)
+            disp_mask &= lam_um >= lya_edge
+
+        # 2) Optionally, if you passed explicit continuum windows, only show those
+        if continuum_windows and isinstance(continuum_windows, (list, tuple)):
+            cw_mask = np.zeros_like(lam_um, dtype=bool)
+            for lo, hi in continuum_windows:
+                cw_mask |= (lam_um >= lo) & (lam_um <= hi)
+            disp_mask &= cw_mask
+
+        # 3) Also restrict to fit_window_um (if set)
+        if fit_window_um:
+            lo, hi = fit_window_um
+            disp_mask &= (lam_um >= lo) & (lam_um <= hi)
+
+        # Apply mask to continuum + model arrays (NaN elsewhere)
+        cont_uJy_plot = cont_uJy.copy()
+        mu_uJy_plot   = mu_uJy.copy()
+        sig_uJy_plot  = sig_uJy.copy()
+
+        cont_uJy_plot[~disp_mask] = np.nan
+        mu_uJy_plot[~disp_mask]   = np.nan
+        sig_uJy_plot[~disp_mask]  = np.nan
+
+
         # Centered bin edges + centers
         edges_um   = _bin_edges_from_centers_um(lam_um)
         centers_um = 0.5 * (edges_um[:-1] + edges_um[1:])
@@ -1063,49 +1100,66 @@ def bootstrap_excels_fit(
         )
 
         # Full panel (centers for errorbars, edges for stairs)
+        # --- Figure title (source ID + redshift) ---
+        if source_id is not None:
+            ax_full.set_title(f"{source_id}   (z = {z:.3f})", fontsize=12, pad=8)
+        else:
+            ax_full.set_title(f"z = {z:.3f}", fontsize=12, pad=8)
+
         ax_full.stairs(flux_uJy, edges_um, label="Data (bins)", color="k", linewidth=1, alpha=0.9, zorder=3)
         ax_full.errorbar(centers_um, flux_uJy, yerr=err_uJy, **errbar_kwargs)
-        ax_full.stairs(cont_uJy, edges_um, label="Continuum", color="b", linestyle="--", linewidth=0.7, zorder=2)
-        ax_full.stairs(mu_uJy,   edges_um, label="Model mean", color="r", linewidth=0.5, zorder=4)
-        ax_full.fill_between(centers_um, mu_uJy - sig_uJy, mu_uJy + sig_uJy,
-                             step='mid', color="r", alpha=0.18, linewidth=0,
-                             label="Model ±1σ (bootstrap)")
+        ax_full.stairs(cont_uJy_plot, edges_um, label="Continuum", color="b", linestyle="--", linewidth=0.7, zorder=2)
+        ax_full.stairs(mu_uJy_plot,   edges_um, label="Model mean", color="r", linewidth=0.5, zorder=4)
+        ax_full.fill_between(centers_um,
+                     mu_uJy_plot - sig_uJy_plot, mu_uJy_plot + sig_uJy_plot,
+                     step='mid', color="r", alpha=0.18, linewidth=0,
+                     label="Model ±1σ (bootstrap)")
+
         ax_full.set_ylabel("Flux density [µJy]")
         ax_full.set_xlabel("Observed wavelength [µm]")
         ax_full.legend(ncol=3, fontsize=9, frameon=False)
         _annotate_lines(ax_full, which_lines, z, per_line=base["lines"], min_dx_um=0.01)
 
-        # Zoom panels (use centers/edges within each window)
+        # --- Zoom panels (always show all 3) ---
         for ax, zd, show in zip(ax_zoom, zoom_defs, show_flags):
-            if not show:
-                ax.set_visible(False)
-                continue
             sel = (lam_um >= zd["lo"]) & (lam_um <= zd["hi"])
-            if not np.any(sel):
-                ax.set_visible(False)
-                continue
 
-            lam_z   = lam_um[sel]
-            flux_z  = flux_uJy[sel]
-            err_z   = err_uJy[sel]
-            cont_z  = cont_uJy[sel]
-            mu_z    = mu_uJy[sel]
-            sig_z   = sig_uJy[sel]
+            if np.any(sel):
+                lam_z   = lam_um[sel]
+                flux_z  = flux_uJy[sel]
+                err_z   = err_uJy[sel]
+                cont_z  = cont_uJy[sel]
+                mu_z    = mu_uJy[sel]
+                sig_z   = sig_uJy[sel]
 
-            edges_z   = _bin_edges_from_centers_um(lam_z)
-            centers_z = 0.5 * (edges_z[:-1] + edges_z[1:])
+                edges_z   = _bin_edges_from_centers_um(lam_z)
+                centers_z = 0.5 * (edges_z[:-1] + edges_z[1:])
 
-            ax.stairs(flux_z, edges_z, label="Data (bins)", color="k", linewidth=1, alpha=0.9, zorder=3)
-            ax.errorbar(centers_z, flux_z, yerr=err_z, **errbar_kwargs)
-            ax.stairs(cont_z, edges_z, label="Continuum", linestyle="--", linewidth=0.7, zorder=2)
-            ax.stairs(mu_z,   edges_z, label="Model mean", linewidth=0.5, zorder=4)
-            ax.fill_between(centers_z, mu_z - sig_z, mu_z + sig_z, step='mid', alpha=0.18, linewidth=0)
+                ax.stairs(flux_z, edges_z, label="Data (bins)", color="k", linewidth=1, alpha=0.9, zorder=3)
+                ax.errorbar(centers_z, flux_z, yerr=err_z, **errbar_kwargs)
+                ax.stairs(cont_z, edges_z, label="Continuum", linestyle="--",color='b', linewidth=0.7, zorder=2)
+                ax.stairs(mu_z,   edges_z, label="Model mean",color='r', linewidth=0.5, zorder=4)
+                ax.fill_between(centers_z, mu_z - sig_z, mu_z + sig_z,
+                                step='mid', alpha=0.18, linewidth=0)
+                _annotate_lines(ax, which_lines, z, per_line=base["lines"],
+                                min_dx_um=0.002, levels=(0.92, 0.80, 0.68))
+            else:
+                # no data coverage → blank grey panel
+                ax.axhline(0, color='k', lw=0.5, alpha=0.3)
+                ax.text(0.5, 0.5, "No coverage", transform=ax.transAxes,
+                        ha="center", va="center", fontsize=9, color="0.5")
+
+            if not show:
+                # either low SNR or no line detected → overlay label
+                ax.text(0.5, 0.1, "No detection", transform=ax.transAxes,
+                        ha="center", va="bottom", fontsize=8, color="0.6", alpha=0.8)
+
             ax.set_xlim(zd["lo"], zd["hi"])
             ax.set_title(zd["title"], fontsize=10)
-            _annotate_lines(ax, which_lines, z, per_line=base["lines"],
-                            min_dx_um=0.002, levels=(0.92, 0.80, 0.68))
             ax.set_xlabel("Observed wavelength [µm]")
             ax.set_ylabel("µJy")
+            
+
 
         if save_path:
             root, ext = os.path.splitext(save_path)
@@ -1115,6 +1169,16 @@ def bootstrap_excels_fit(
                 fname = f"{save_path}.{save_format}" if ext == "" else save_path
             fig.savefig(fname, dpi=save_dpi, format=fname.split(".")[-1],
                         bbox_inches="tight", transparent=save_transparent)
+
+            # --- Save text summary beside figure ---
+            summary_txt = os.path.splitext(fname)[0] + "_summary.txt"
+            print_bootstrap_line_table(
+                dict(which_lines=which_lines, summary=summary),
+                save_path=summary_txt
+            )
+
+            
+        
 
         plt.show()
         plt.close(fig)
@@ -1130,16 +1194,39 @@ def bootstrap_excels_fit(
     }
 
 
-def print_bootstrap_line_table(boot):
-    print("\n=== BOOTSTRAP SUMMARY (value ± error) ===")
-    print(f"{'Line':10s} {'F_line [erg/s/cm²]':>26s} {'EW₀ [Å]':>16s} {'σ_A [Å]':>14s} "
-          f"{'μ_obs [Å]':>16s} {'SNR':>12s}")
-    print("-"*100)
+def print_bootstrap_line_table(boot, save_path: str | None = None):
+    """
+    Print a formatted bootstrap summary to console.
+    Optionally save the same output to a text file.
+    """
+
+    header = (
+        "\n=== BOOTSTRAP SUMMARY (value ± error) ===\n"
+        f"{'Line':10s} {'F_line [erg/s/cm²]':>26s} {'EW₀ [Å]':>16s} "
+        f"{'σ_A [Å]':>14s} {'μ_obs [Å]':>16s} {'SNR':>12s}\n"
+        + "-" * 100 + "\n"
+    )
+
+    lines = []
     for ln in boot["which_lines"]:
         s = boot["summary"][ln]
-        print(f"{ln:10s} "
-              f"{s['F_line']['text']:>26s} "
-              f"{s['EW0_A']['text']:>16s} "
-              f"{s['sigma_A']['text']:>14s} "
-              f"{s['lam_obs_A']['text']:>16s} "
-              f"{s['SNR']['text']:>12s}")
+        lines.append(
+            f"{ln:10s} "
+            f"{s['F_line']['text']:>26s} "
+            f"{s['EW0_A']['text']:>16s} "
+            f"{s['sigma_A']['text']:>14s} "
+            f"{s['lam_obs_A']['text']:>16s} "
+            f"{s['SNR']['text']:>12s}"
+        )
+
+    table_text = header + "\n".join(lines)
+
+    # Print to console
+    print(table_text)
+
+    # Optionally save to text file
+    if save_path is not None:
+        with open(save_path, "w") as f:
+            f.write(table_text)
+        print(f"\nSaved bootstrap summary → {save_path}")
+
