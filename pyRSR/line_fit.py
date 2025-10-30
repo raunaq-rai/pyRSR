@@ -545,31 +545,24 @@ def excels_fit_poly(source, z, grating="PRISM", lines_to_use=None,
     g = str(grating).lower()
 
     if "prism" in g:
-        # Very low resolution PRISM (R ≈ 100)
-        # Allow wide range — blended features, coarse sampling
-        sigmaA_lo = np.maximum(0.40 * pix_A, 0.45 * sigmaA_inst)   # ≥ 0.45×σ_inst
-        sigmaA_hi = np.maximum(1.50 * pix_A, 1.75 * sigmaA_inst)   # ≤ 1.75×σ_inst
+        sigmaA_lo = np.maximum(0.40 * pix_A, 0.45 * sigmaA_inst)
+        sigmaA_hi = np.maximum(1.50 * pix_A, 1.70 * sigmaA_inst)
 
-    elif any(k in g for k in ["m", "med"]):
-        # Medium-resolution gratings (G140M/G235M/G395M, R ≈ 1000)
-        # Narrower bounds: moderate resolving power, well-behaved LSF
-        sigmaA_lo = np.maximum(0.30 * pix_A, 0.80 * sigmaA_inst)   # ≥ 0.8×σ_inst
-        sigmaA_hi = np.maximum(0.70 * pix_A, 1.20 * sigmaA_inst)   # ≤ 1.2×σ_inst
+    elif any(k in g for k in ["m", "med"]):  # G140M/G235M/G395M
+        # allow a bit narrower than LSF to match sharp peaks after bin-averaging
+        sigmaA_lo = np.maximum(0.30 * pix_A, 0.60 * sigmaA_inst)   # ↓ from 0.80
+        sigmaA_hi = np.maximum(0.70 * pix_A, 1.15 * sigmaA_inst)   # ↓ from 1.20
 
-    elif any(k in g for k in ["h", "high"]):
-        # High-resolution gratings (G140H/G235H/G395H, R ≈ 2700)
-        # Tightest bounds: LSF highly stable, velocity dispersion dominates
-        sigmaA_lo = np.maximum(0.25 * pix_A, 0.90 * sigmaA_inst)   # ≥ 0.9×σ_inst
-        sigmaA_hi = np.maximum(0.50 * pix_A, 1.15 * sigmaA_inst)   # ≤ 1.15×σ_inst
+    elif any(k in g for k in ["h", "high"]):  # Gx95H
+        sigmaA_lo = np.maximum(0.25 * pix_A, 0.80 * sigmaA_inst)
+        sigmaA_hi = np.maximum(0.60 * pix_A, 1.12 * sigmaA_inst)
 
     else:
-        # Fallback default (medium-like)
-        sigmaA_lo = np.maximum(0.30 * pix_A, 0.80 * sigmaA_inst)
-        sigmaA_hi = np.maximum(0.70 * pix_A, 1.20 * sigmaA_inst)
-
+        sigmaA_lo = np.maximum(0.30 * pix_A, 0.60 * sigmaA_inst)
+        sigmaA_hi = np.maximum(0.70 * pix_A, 1.15 * sigmaA_inst)
 
     # --- σ seeds near instrumental width, clipped into [lo, hi]
-    sigmaA_seed = np.clip(0.95 * sigmaA_inst, sigmaA_lo, sigmaA_hi)
+    sigmaA_seed = np.clip(0.9 * sigmaA_inst, sigmaA_lo, sigmaA_hi)
 
     # --- Amplitude seeds in area units (erg s^-1 cm^-2), consistent with σ
     # peak_Fλ ≈ A / (sqrt(2π) σ_A)  =>  A ≈ peak_Fλ * sqrt(2π) * σ_A
@@ -589,7 +582,7 @@ def excels_fit_poly(source, z, grating="PRISM", lines_to_use=None,
         A_seed = peak_flam * SQRT2PI * sigmaA_seed[j]
 
         # set a generous upper bound but scale with σ_hi to avoid runaway broad fits
-        A_upper = 10.0 * max(peak_flam, 3.0 * rms_flam) * SQRT2PI * np.maximum(sigmaA_hi[j], sigmaA_seed[j])
+        A_upper = 15.0 * max(peak_flam, 3.0 * rms_flam) * SQRT2PI * np.maximum(sigmaA_hi[j], sigmaA_seed[j])
 
         A0.append(A_seed)
         A_hi.append(A_upper)
@@ -893,7 +886,7 @@ def bootstrap_excels_fit(
     save_dpi: int = 500,
     save_format: str = "png",
     save_transparent: bool = False,
-    lines_to_use=None,
+    lines_to_use=None, 
 ):
     # -------- load once --------
     if isinstance(source, dict):
