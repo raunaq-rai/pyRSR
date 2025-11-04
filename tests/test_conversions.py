@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 from uncertainties import ufloat
-from pyRSR import conversions as conv
+from PyRSR import conversions as conv
 from astropy.cosmology import Planck15
 
 

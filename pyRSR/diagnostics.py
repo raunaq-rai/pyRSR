@@ -18,9 +18,9 @@ References
 import numpy as np
 from astropy.constants import c
 from astropy.cosmology import Planck15
-import cosmicdawn
-from pyRSR import conversions
-from pyRSR.conversions import AB_to_flux, flux_to_AB
+import PyRSR
+from PyRSR import conversions
+from PyRSR.conversions import AB_to_flux, flux_to_AB
 
 
 # --------------------------

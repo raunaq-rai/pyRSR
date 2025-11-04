@@ -1,8 +1,8 @@
 # tests/test_diagnostics.py
 import numpy as np
 import pytest
-import pyRSR
-from pyRSR import diagnostics
+import PyRSR
+from PyRSR import diagnostics
 
 
 def test_MUV_from_spec_valid():
