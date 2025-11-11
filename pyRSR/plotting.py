@@ -186,3 +186,135 @@ def plot_spectrum_basic(
         plt.show()
 
     return fig
+
+import numpy as np
+import matplotlib.pyplot as plt
+from adjustText import adjust_text
+
+def plot_spectrum_with_2d(
+    lam_um,
+    flux_uJy,
+    err_uJy=None,
+    sci2d=None,
+    model_uJy=None,
+    cont_uJy=None,
+    title=None,
+    xlim=None,
+    ylim=None,
+    color="#6a0dad",
+    alpha=0.9,
+    save_path=None,
+    show=True,
+    z=None,
+    annotate_lines=True,
+    fontsize=7,
+    cmap="plasma",
+    vmin=None,
+    vmax=None,
+):
+    """
+    Plot a JWST/NIRSpec 1D spectrum with optional 2D spectrum above.
+
+    Parameters
+    ----------
+    lam_um : array
+        Wavelength array [µm]
+    flux_uJy : array
+        Flux density [µJy]
+    err_uJy : array, optional
+        1σ uncertainty [µJy]
+    sci2d : 2D array, optional
+        Rectified 2D spectral image (for top panel)
+    z : float, optional
+        Redshift (for line annotation)
+    cmap, vmin, vmax : optional
+        Matplotlib colormap and limits for 2D display
+    """
+
+    lam_um = np.asarray(lam_um, float)
+    flux_uJy = np.asarray(flux_uJy, float)
+    err_uJy = np.asarray(err_uJy, float) if err_uJy is not None else None
+
+    # --- bin edges for stairs/pcolormesh ---
+    dlam = np.median(np.diff(lam_um))
+    edges_um = np.concatenate(([lam_um[0] - dlam / 2],
+                               0.5 * (lam_um[1:] + lam_um[:-1]),
+                               [lam_um[-1] + dlam / 2]))
+
+    # ----------------------------------------------------
+    # Create figure layout
+    # ----------------------------------------------------
+    if sci2d is not None:
+        fig, (ax2d, ax1d) = plt.subplots(
+            2, 1, figsize=(9, 5.5),
+            gridspec_kw={"height_ratios": [0.35, 1.0], "hspace": 0.03},
+            sharex=True,
+        )
+    else:
+        fig, ax1d = plt.subplots(figsize=(8, 4))
+        ax2d = None
+
+    # ----------------------------------------------------
+    # --- Top panel: 2D spectrum ---
+    # ----------------------------------------------------
+    if sci2d is not None:
+        ny = sci2d.shape[0]
+        y_edges = np.arange(ny + 1)
+        if vmin is None or vmax is None:
+            vmin, vmax = np.nanpercentile(sci2d, [5, 99.5])
+        im = ax2d.pcolormesh(edges_um, y_edges, sci2d, shading="auto",
+                             cmap=cmap, vmin=vmin, vmax=vmax)
+        ax2d.set_ylabel("Spatial pixel", fontsize=9)
+        ax2d.tick_params(labelbottom=False, direction="in")
+        ax2d.set_ylim(ny * 0.25, ny * 0.75)
+
+    # ----------------------------------------------------
+    # --- Bottom panel: 1D spectrum ---
+    # ----------------------------------------------------
+    if err_uJy is not None:
+        ax1d.fill_between(lam_um, flux_uJy - err_uJy, flux_uJy + err_uJy,
+                          step="mid", color="grey", alpha=0.25, linewidth=0)
+
+    ax1d.stairs(flux_uJy, edges_um, color=color, lw=0.5, alpha=alpha, label="Data")
+
+    if cont_uJy is not None:
+        ax1d.stairs(cont_uJy, edges_um, color="b", ls="--", lw=0.5, label="Continuum")
+
+    if model_uJy is not None:
+        ax1d.stairs(model_uJy, edges_um, color="r", lw=0.5, label="Model")
+
+    ax1d.axhline(0, color="k", ls="--", lw=0.5, alpha=0.5)
+    ax1d.set_xlabel("Observed wavelength [µm]")
+    ax1d.set_ylabel("Flux density [µJy]")
+    if title:
+        ax1d.set_title(title, fontsize=11)
+    if xlim:
+        ax1d.set_xlim(*xlim)
+    if ylim:
+        ax1d.set_ylim(*ylim)
+
+    ax1d.legend(fontsize=8, frameon=False, ncol=3)
+    ax1d.grid(alpha=0.25, linestyle=":", linewidth=0.5)
+    ax1d.tick_params(direction="in", top=True, right=True)
+
+    # ----------------------------------------------------
+    # --- Annotate emission lines ---
+    # ----------------------------------------------------
+    if annotate_lines and z is not None:
+        annotate_lines_no_overlap(ax1d, z, lam_um.min(), lam_um.max(), fontsize=fontsize)
+        if sci2d is not None:
+            # faint vertical lines on 2D panel for same features
+            rest_waves_A = np.array(list(REST_LINES_A.values()))
+            obs_um = rest_waves_A * (1 + z) / 1e4
+            for x in obs_um[(obs_um > lam_um.min()) & (obs_um < lam_um.max())]:
+                ax2d.axvline(x, color="white", lw=0.5, ls=":", alpha=0.5, zorder=5)
+
+
+    if save_path:
+        fig.savefig(save_path, dpi=500, bbox_inches="tight", transparent=False)
+        print(f"Saved → {save_path}")
+
+    if show:
+        plt.show()
+
+    return fig
