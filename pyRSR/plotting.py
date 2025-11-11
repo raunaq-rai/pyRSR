@@ -30,66 +30,77 @@ def _bin_edges_from_centers_um(lam_um):
 
 from adjustText import adjust_text
 
-def annotate_lines_no_overlap(ax, z, lam_min, lam_max, fontsize=7):
+def annotate_lines_no_overlap(ax, z, lam_min, lam_max, lam_data=None, flux_data=None, fontsize=7):
     """
     Annotate emission lines without overlaps, keeping labels inside the axes.
+    Skips lines that fall in wavelength regions without valid data.
     """
-    # Build observed wavelengths for lines in range
+    ax.autoscale(False)
+
+    # --- Build observed wavelengths for all lines ---
     rest_waves_A = np.array(list(REST_LINES_A.values()))
     line_names   = np.array(list(REST_LINES_A.keys()))
     obs_um       = rest_waves_A * (1 + z) / 1e4
 
+    # --- Only keep lines inside visible range ---
     m = (obs_um > lam_min) & (obs_um < lam_max)
-    if not np.any(m):
+    obs_um, names_in = obs_um[m], line_names[m]
+    if len(obs_um) == 0:
         return
 
-    obs_um   = obs_um[m]
-    names_in = line_names[m]
+    # --- If lam_data provided, filter lines with no actual data coverage ---
+    if lam_data is not None:
+        lam_data = np.asarray(lam_data, float)
+        valid_mask = np.isfinite(lam_data)
+        if flux_data is not None:
+            valid_mask &= np.isfinite(flux_data)
+        lam_valid = lam_data[valid_mask]
 
-    # Sort by wavelength
+        # define min/max of valid wavelength region(s)
+        if len(lam_valid) > 0:
+            lam_min_valid, lam_max_valid = np.nanmin(lam_valid), np.nanmax(lam_valid)
+            in_coverage = (obs_um >= lam_min_valid) & (obs_um <= lam_max_valid)
+            obs_um, names_in = obs_um[in_coverage], names_in[in_coverage]
+
+    if len(obs_um) == 0:
+        return
+
+    # --- Sort lines by wavelength ---
     order = np.argsort(obs_um)
     obs_um, names_in = obs_um[order], names_in[order]
 
-    # Base y near the top
+    # --- Label positioning ---
     ymin, ymax = ax.get_ylim()
-    yspan  = ymax - ymin
-    y_base = ymin + 0.90 * yspan
+    y_base = ymin + 0.90 * (ymax - ymin)
 
-    # Put a faint guide line for orientation (optional)
-    for x in obs_um:
-        ax.axvline(x, color="0.7", lw=0.4, alpha=0.5, zorder=1)
-
-    # Create all Text artists first (same initial y); rotation vertical
+    # --- Draw vertical lines + text ---
     texts = []
     for x, label in zip(obs_um, names_in):
-        t = ax.text(
-            x, y_base, label,
-            rotation=90, ha="center", va="bottom",
-            fontsize=fontsize, color="0.2", alpha=0.9,
-            bbox=dict(facecolor="white", edgecolor="none", alpha=0.55, pad=0.2),
-            clip_on=False,  # adjustText keeps us in-bounds via lim=...
-            zorder=10,
+        ax.axvline(x, color="0.7", lw=0.4, alpha=0.5, zorder=1)
+        texts.append(
+            ax.text(
+                x, y_base, label,
+                rotation=90, ha="center", va="bottom",
+                fontsize=fontsize, color="0.2", alpha=0.9,
+                bbox=dict(facecolor="white", edgecolor="none", alpha=0.55, pad=0.2),
+                clip_on=False, zorder=10,
+            )
         )
-        texts.append(t)
 
-    # Tell adjustText to move labels but keep them in-bounds
+    # --- Tidy layout ---
     x0, x1 = ax.get_xlim()
     y0, y1 = ax.get_ylim()
     adjust_text(
         texts,
-        # allow both x & y motion for text; don’t move data points
         only_move={'points': 'none', 'text': 'xy'},
-        # make collisions “bigger” so labels don’t touch
         expand_text=(1.1, 1.25),
-        # slight repulsion strength
         force_text=(0.05, 0.2),
-        # keep inside axes rectangle
         lim=(x0, x1, y0, y1),
-        # draw short connectors to their x-position if moved sideways
         arrowprops=dict(arrowstyle='-', lw=0.4, color='0.4', alpha=0.7),
-        autoalign='y',  # prefer vertical stacking
+        autoalign='y',
         ax=ax,
     )
+
 
 
 def plot_spectrum_basic(
@@ -186,10 +197,15 @@ def plot_spectrum_basic(
         plt.show()
 
     return fig
-
 import numpy as np
 import matplotlib.pyplot as plt
 from adjustText import adjust_text
+import numpy as np
+import matplotlib.pyplot as plt
+import numpy as np
+import matplotlib.pyplot as plt
+
+
 
 def plot_spectrum_with_2d(
     lam_um,
@@ -200,7 +216,7 @@ def plot_spectrum_with_2d(
     cont_uJy=None,
     title=None,
     xlim=None,
-    ylim=None,
+    ylim=(-1,None),
     color="#6a0dad",
     alpha=0.9,
     save_path=None,
@@ -212,34 +228,17 @@ def plot_spectrum_with_2d(
     vmin=None,
     vmax=None,
 ):
-    """
-    Plot a JWST/NIRSpec 1D spectrum with optional 2D spectrum above.
-
-    Parameters
-    ----------
-    lam_um : array
-        Wavelength array [µm]
-    flux_uJy : array
-        Flux density [µJy]
-    err_uJy : array, optional
-        1σ uncertainty [µJy]
-    sci2d : 2D array, optional
-        Rectified 2D spectral image (for top panel)
-    z : float, optional
-        Redshift (for line annotation)
-    cmap, vmin, vmax : optional
-        Matplotlib colormap and limits for 2D display
-    """
-
     lam_um = np.asarray(lam_um, float)
     flux_uJy = np.asarray(flux_uJy, float)
     err_uJy = np.asarray(err_uJy, float) if err_uJy is not None else None
 
-    # --- bin edges for stairs/pcolormesh ---
+    # --- bin edges for 1D stairs ---
     dlam = np.median(np.diff(lam_um))
-    edges_um = np.concatenate(([lam_um[0] - dlam / 2],
-                               0.5 * (lam_um[1:] + lam_um[:-1]),
-                               [lam_um[-1] + dlam / 2]))
+    edges_um = np.concatenate((
+        [lam_um[0] - dlam / 2],
+        0.5 * (lam_um[1:] + lam_um[:-1]),
+        [lam_um[-1] + dlam / 2]
+    ))
 
     # ----------------------------------------------------
     # Create figure layout
@@ -255,40 +254,82 @@ def plot_spectrum_with_2d(
         ax2d = None
 
     # ----------------------------------------------------
-    # --- Top panel: 2D spectrum ---
+    # --- Top panel: 2D spectrum (auto-mask empty regions) ---
     # ----------------------------------------------------
     if sci2d is not None:
-        ny = sci2d.shape[0]
-        y_edges = np.arange(ny + 1)
+        ny, nx = sci2d.shape
+        lam2d = np.linspace(lam_um.min(), lam_um.max(), nx)
+
+        # detect wavelength columns with no data
+        col_is_empty = np.all(~np.isfinite(sci2d) | (np.abs(sci2d) < 1e-8), axis=0)
+        col_is_empty |= (np.nanstd(sci2d, axis=0) < 1e-8)
+
+        # crop 2D array and wavelength grid to valid region only
+        valid_cols = np.where(~col_is_empty)[0]
+        if len(valid_cols) > 1:
+            i0, i1 = valid_cols[0], valid_cols[-1] + 1
+            sci2d_valid = sci2d[:, i0:i1]
+            lam2d_valid = lam2d[i0:i1]
+            lam_valid_min, lam_valid_max = lam2d_valid[0], lam2d_valid[-1]
+        else:
+            sci2d_valid = sci2d
+            lam2d_valid = lam2d
+            lam_valid_min, lam_valid_max = lam_um.min(), lam_um.max()
+
+        # build edges for valid wavelength region
+        dlam2d = np.median(np.diff(lam2d_valid))
+        edges_2d = np.concatenate((
+            [lam2d_valid[0] - dlam2d / 2],
+            0.5 * (lam2d_valid[1:] + lam2d_valid[:-1]),
+            [lam2d_valid[-1] + dlam2d / 2]
+        ))
+
+        # colour limits ignoring NaNs
         if vmin is None or vmax is None:
-            vmin, vmax = np.nanpercentile(sci2d, [5, 99.5])
-        im = ax2d.pcolormesh(edges_um, y_edges, sci2d, shading="auto",
-                             cmap=cmap, vmin=vmin, vmax=vmax)
+            vmin, vmax = np.nanpercentile(sci2d_valid, [5, 99.5])
+
+        y_edges = np.arange(ny + 1)
+
+        # plot cleaned 2D
+        ax2d.pcolormesh(
+            edges_2d, y_edges, sci2d_valid,
+            shading="auto", cmap=cmap, vmin=vmin, vmax=vmax
+        )
+
         ax2d.set_ylabel("Spatial pixel", fontsize=9)
         ax2d.tick_params(labelbottom=False, direction="in")
         ax2d.set_ylim(ny * 0.25, ny * 0.75)
+
+        # sync x-range to actual coverage
+        ax2d.set_xlim(lam_valid_min, lam_valid_max)
+        ax1d_xlim = (lam_valid_min, lam_valid_max)
+    else:
+        ax1d_xlim = (lam_um.min(), lam_um.max())
 
     # ----------------------------------------------------
     # --- Bottom panel: 1D spectrum ---
     # ----------------------------------------------------
     if err_uJy is not None:
-        ax1d.fill_between(lam_um, flux_uJy - err_uJy, flux_uJy + err_uJy,
-                          step="mid", color="grey", alpha=0.25, linewidth=0)
+        ax1d.fill_between(
+            lam_um, flux_uJy - err_uJy, flux_uJy + err_uJy,
+            step="mid", color="grey", alpha=0.25, linewidth=0
+        )
 
     ax1d.stairs(flux_uJy, edges_um, color=color, lw=0.5, alpha=alpha, label="Data")
 
     if cont_uJy is not None:
         ax1d.stairs(cont_uJy, edges_um, color="b", ls="--", lw=0.5, label="Continuum")
-
     if model_uJy is not None:
         ax1d.stairs(model_uJy, edges_um, color="r", lw=0.5, label="Model")
 
     ax1d.axhline(0, color="k", ls="--", lw=0.5, alpha=0.5)
     ax1d.set_xlabel("Observed wavelength [µm]")
     ax1d.set_ylabel("Flux density [µJy]")
-    if title:
-        ax1d.set_title(title, fontsize=11)
-    if xlim:
+
+    # consistent limits
+    if xlim is None:
+        ax1d.set_xlim(*ax1d_xlim)
+    else:
         ax1d.set_xlim(*xlim)
     if ylim:
         ax1d.set_ylim(*ylim)
@@ -301,14 +342,19 @@ def plot_spectrum_with_2d(
     # --- Annotate emission lines ---
     # ----------------------------------------------------
     if annotate_lines and z is not None:
-        annotate_lines_no_overlap(ax1d, z, lam_um.min(), lam_um.max(), fontsize=fontsize)
+        annotate_lines_no_overlap(ax1d, z, *ax1d.get_xlim(), fontsize=fontsize)
         if sci2d is not None:
-            # faint vertical lines on 2D panel for same features
             rest_waves_A = np.array(list(REST_LINES_A.values()))
             obs_um = rest_waves_A * (1 + z) / 1e4
-            for x in obs_um[(obs_um > lam_um.min()) & (obs_um < lam_um.max())]:
+            mask = (obs_um > ax1d_xlim[0]) & (obs_um < ax1d_xlim[1])
+            for x in obs_um[mask]:
                 ax2d.axvline(x, color="white", lw=0.5, ls=":", alpha=0.5, zorder=5)
 
+    # ----------------------------------------------------
+    # --- Title and save ---
+    # ----------------------------------------------------
+    if title:
+        fig.text(0.5, -0.02, title, ha="center", va="top", fontsize=11)
 
     if save_path:
         fig.savefig(save_path, dpi=500, bbox_inches="tight", transparent=False)
