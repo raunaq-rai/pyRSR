@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 # === REST wavelengths (Å) ===
 REST_LINES_A = {
     "NIII_1": 989.790, "NIII_2": 991.514, "NIII_3": 991.579,
-    "NV_1": 1238.821, "NV_2": 1242.804, "NIV_1": 1486.496,
+    "NV_1": 1238.821, "NV_2": 1242.804, "NIV": 1486.496,
     "HEII_1": 1640.420, "OIII_05": 1663.4795, "CIII": 1908.734,
     "OII_UV_1": 3727.092, "OII_UV_2": 3729.875,
     "NEIII_UV_1": 3869.86, "NEIII_UV_2": 3968.59,
@@ -81,7 +81,7 @@ def annotate_lines_no_overlap(ax, z, lam_min, lam_max, lam_data=None, flux_data=
             ax.text(
                 x, y_base, label,
                 rotation=90, ha="center", va="bottom",
-                fontsize=fontsize, color="0.2", alpha=0.9,
+                fontsize=fontsize, color="black", alpha=1,
                 bbox=dict(facecolor="white", edgecolor="none", alpha=0.55, pad=0.2),
                 clip_on=False, zorder=10,
             )
@@ -348,7 +348,7 @@ def plot_spectrum_with_2d(
             obs_um = rest_waves_A * (1 + z) / 1e4
             mask = (obs_um > ax1d_xlim[0]) & (obs_um < ax1d_xlim[1])
             for x in obs_um[mask]:
-                ax2d.axvline(x, color="white", lw=0.5, ls=":", alpha=0.5, zorder=5)
+                ax2d.axvline(x, color="white", lw=0.4, ls=":", alpha=1, zorder=5)
 
     # ----------------------------------------------------
     # --- Title and save ---
