@@ -76,14 +76,14 @@ REST_LINES_A = {
     "HEII_1": 1640.420,  "OIII_05": 1663.4795, "CIII": 1908.734,
 
     "OII_UV_1": 3727.092, "OII_UV_2": 3729.875,
-    "NEIII_UV_1": 3869.86, "NEIII_UV_2": 3968.59,
+    "NEIII_UV_1": 3869.86,"HEI_1": 3889.749, "NEIII_UV_2": 3968.59,
     "HDELTA": 4102.8922, "HGAMMA": 4341.6837, "OIII_1": 4364.436,
-    "HEI_1": 4471.479, 
+    "HEI_2": 4471.479, 
     
     "HEII_2": 4685.710, "HBETA": 4862.6830,
     "OIII_2": 4960.295, "OIII_3": 5008.240, 
     
-    "NII_1":5756.19,"HEI": 5877.252,
+    "NII_1":5756.19,"HEI_3": 5877.252,
     
     "NII_2":6549.86,"HALPHA": 6564.608,"NII_3":6585.27, "SII_1": 6718.295, "SII_2": 6732.674,
 }
@@ -1141,24 +1141,31 @@ def bootstrap_excels_fit(
             lo, hi = fit_window_um
             disp_mask &= (lam_um >= lo) & (lam_um <= hi)
 
-        # reusable zoom definitions
-        o3hb_names = ["HBETA", "OIII_2", "OIII_3"]
-        aur_names  = ["HDELTA", "OIII_1"]
-        oiiuv_names = ["OII_UV_1", "OII_UV_2"]
+        # Define line groups for zoom panels
+        o3hb_names  = ["HBETA", "OIII_2", "OIII_3"]
+        aur_names   = ["HDELTA", "OIII_1"]
+        halpha_names = ["NII6548", "HALPHA", "NII6583"]
+
+        # Zoom panels: order from low → high wavelength
         zoom_defs = [
-            dict(title="Hβ + [O III]4959,5007", names=o3hb_names),
             dict(title="Hδ + [O III]4363 (auroral)", names=aur_names),
-            dict(title="[O II] UV 3727,3729", names=oiiuv_names),
+            dict(title="Hβ + [O III]4959,5007", names=o3hb_names),
+            dict(title="Hα + [N II]6548,6583", names=halpha_names),
         ]
+
+        # Compute observed windows for each zoom region
         for zd in zoom_defs:
-            restA = [REST_LINES_A[n] for n in zd["names"]]
+            restA = [REST_LINES_A[n] for n in zd["names"] if n in REST_LINES_A]
             zd["lo"], zd["hi"] = _window_from_lines_um(restA, z, pad_A=100.0)
+
+        # Visibility flags (same logic as before)
         base_lines = base.get("lines", {})
         show_flags = []
         for zd in zoom_defs:
             cov = _has_coverage_window(lam_um, zd["lo"], zd["hi"])
             fitok = _has_fit_in_window(base_lines, zd["names"], snr_min=1.0)
             show_flags.append(cov and fitok)
+
 
         # ----------------------------------------------
         # helper: single plotting routine for any unit
@@ -1246,13 +1253,23 @@ def bootstrap_excels_fit(
                 ax.set_ylabel(ylabel)
 
             # save
+            # ----------------------------------------------
+            # save section inside _plot_unit()
+            # ----------------------------------------------
             if save_path:
                 root, ext = os.path.splitext(save_path)
                 fname = f"{root}_{tag}.{save_format}" if ext == "" else f"{root}_{tag}{ext}"
                 fig.savefig(fname, dpi=save_dpi, bbox_inches="tight", transparent=save_transparent)
-                summary_txt = os.path.splitext(fname)[0] + "_summary.txt"
-                print_bootstrap_line_table(dict(which_lines=which_lines, summary=summary),
-                                           save_path=summary_txt)
+
+                # --- save summary only once (for Fν unit) ---
+                if tag.lower() == "fnu":
+                    summary_txt = f"{root}_summary.txt"   # ← only one per source
+                    print_bootstrap_line_table(
+                        dict(which_lines=which_lines, summary=summary),
+                        save_path=summary_txt
+                    )
+
+
             plt.show()
             plt.close(fig)
 
