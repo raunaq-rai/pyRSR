@@ -1,5 +1,5 @@
 """
-again
+again...
 PyRSR line_fit — Gaussian line-fitting in linear wavelength (F_λ)
 =================================================================
 
@@ -435,20 +435,40 @@ def _prune_lines_without_data(
 # Seeds: local peaks for μ
 # ============================================================
 
-def _find_local_peaks(lam_um, resid_flam, expected_um, sigma_gr_um, min_window_um=0.001):
+
+def _find_local_peaks(lam_um, resid_flam, expected_um,
+                      sigma_gr_um=None,                 # kept for backward compatibility
+                      min_window_um=0.001,
+                      per_line_halfwidth_um=None):      # explicit half-widths per line
+    """
+    Find local peaks near expected wavelengths.
+
+    If per_line_halfwidth_um is given (array-like matching expected_um),
+    each line is searched within ±per_line_halfwidth_um[i].
+    Otherwise, fall back to ±max(5*sigma_gr_um[i], min_window_um).
+    """
     peaks = []
-    for mu0, s_um in zip(expected_um, sigma_gr_um):
-        w = max(5.0 * s_um, float(min_window_um))
+    expected_um = np.asarray(expected_um, float)
+    if per_line_halfwidth_um is not None:
+        per_line_halfwidth_um = np.asarray(per_line_halfwidth_um, float)
+
+    for i, mu0 in enumerate(expected_um):
+        if per_line_halfwidth_um is not None:
+            w = float(max(per_line_halfwidth_um[i], min_window_um))
+        else:
+            if sigma_gr_um is None:
+                w = float(min_window_um)
+            else:
+                w = float(max(5.0 * float(np.asarray(sigma_gr_um)[i]), min_window_um))
+
         m = (lam_um > mu0 - w) & (lam_um < mu0 + w)
         if np.count_nonzero(m) > 2:
             y = resid_flam[m]
-            if np.any(np.isfinite(y)):
-                peaks.append(lam_um[m][np.nanargmax(y)])
-            else:
-                peaks.append(mu0)
+            peaks.append(lam_um[m][np.nanargmax(y)] if np.any(np.isfinite(y)) else mu0)
         else:
             peaks.append(mu0)
     return np.array(peaks, float)
+
 
 # ============================================================
 # Model: sum of area-normalized Gaussians in Fλ
@@ -583,15 +603,36 @@ def excels_fit_poly(source, z, grating="PRISM", lines_to_use=None,
     sigmaA_inst  = muA_nom * LN10 * sigma_gr_log              # Å (instrumental σ)
     sigma_um_inst = sigmaA_inst / 1e4                         # µm (for peak search)
 
-    mu_seed_um = _find_local_peaks(lam_fit, resid_fit, expected_um, sigma_um_inst, min_window_um=0.001)
+    # NEW: per-line local pixel size in Å/µm (needed for tight peak search)
+    lamA_fit = lam_fit * 1e4
+    pix_A_global = float(np.median(np.diff(lamA_fit))) if lamA_fit.size > 1 else 1.0
+
+    def _local_pix_A_for(mu_um):
+        mloc = np.abs(lam_fit - mu_um) < 0.02  # 0.02 µm window to estimate Δλ
+        if np.count_nonzero(mloc) >= 3:
+            return float(np.median(np.diff((lam_fit[mloc] * 1e4))))
+        return pix_A_global
+
+    pixA_local   = np.array([_local_pix_A_for(mu) for mu in expected_um], float)  # Å
+    pix_um_local = pixA_local / 1e4                                              # µm
+
+    # NEW: pixel-sized peak search windows
+    g = str(grating).lower()
+    if "prism" in g:
+        # PRISM: tolerant (as before) but never smaller than ±2 pixels
+        peak_half_um = np.maximum(5.0 * sigma_um_inst, 2.0 * pix_um_local)
+    else:
+        # MED/HIGH: search only within ±2 pixels of the expected position
+        peak_half_um = 2.0 * pix_um_local
+
+    # REPLACE your old _find_local_peaks call with this one:
+    mu_seed_um = _find_local_peaks(
+        lam_fit, resid_fit, expected_um,
+        sigma_gr_um=sigma_um_inst,
+        per_line_halfwidth_um=peak_half_um
+    )
     muA_seed   = mu_seed_um * 1e4  # Å
 
-    # ============================
-    # Seeds & bounds — corrected
-    # ============================
-    # ============================
-    # Seeds & bounds — improved
-    # ============================
     nL = len(which_lines)
 
     # --- pixel scale in Å (for gentle floors to avoid sub-pixel collapse)
@@ -675,13 +716,38 @@ def excels_fit_poly(source, z, grating="PRISM", lines_to_use=None,
 
 
 
-    # Centroids μ_A (Å) — allow several σ of freedom (wider for PRISM)
+    # NEW: Centroid bounds (Å) — tight for MED/HIGH, generous for PRISM
     if "prism" in g:
         muA_lo = muA_seed - 12.0 * np.maximum(sigmaA_inst, 1.0)
         muA_hi = muA_seed + 12.0 * np.maximum(sigmaA_inst, 1.0)
     else:
-        muA_lo = muA_seed - 1.0  * np.maximum(sigmaA_inst, 1.0)
-        muA_hi = muA_seed + 1.0  * np.maximum(sigmaA_inst, 1.0)
+        # Allow only ±max( Npix * Δλ_pix , Δv ) around the *seed*
+        C_KMS   = 299792.458
+        VEL_KMS = 120.0   # systemic allowance; tune 80–150 if desired
+        NPIX_CENT = 2.0   # "a pixel or two either side"
+
+        dvA   = muA_nom * (VEL_KMS / C_KMS)        # Å per line
+        pixA  = pixA_local                         # Å per line
+        halfA = np.maximum(NPIX_CENT * pixA, dvA)  # Å
+
+        muA_lo = muA_seed - halfA
+        muA_hi = muA_seed + halfA
+
+        # Hard guards so [N II] cannot jump onto Hα
+        HaA       = REST_LINES_A["HALPHA"] * (1.0 + z)                # Å
+        mid_N2_Ha = 0.5 * (REST_LINES_A["NII_2"] + REST_LINES_A["HALPHA"]) * (1.0 + z)
+        mid_Ha_N3 = 0.5 * (REST_LINES_A["HALPHA"] + REST_LINES_A["NII_3"]) * (1.0 + z)
+
+        for j, nm in enumerate(which_lines):
+            if nm == "NII_2":     # keep strictly blueward of Hα
+                muA_hi[j] = min(muA_hi[j], mid_N2_Ha)
+            elif nm == "NII_3":   # keep strictly redward of Hα
+                muA_lo[j] = max(muA_lo[j], mid_Ha_N3)
+            # Optional: fence Hα between the midpoints so it can't drift into NII:
+            # elif nm == "HALPHA":
+            #     muA_lo[j] = max(muA_lo[j], mid_N2_Ha)
+            #     muA_hi[j] = min(muA_hi[j], mid_Ha_N3)
+
 
     # Pack parameters and finalize to guarantee x0 inside bounds
     p0 = np.r_[A0,           sigmaA_seed, muA_seed]
@@ -984,61 +1050,12 @@ def _has_fit_in_window(base_lines, candidate_names, snr_min=1.0):
             return True
     return False
 
-def _make_zoom_panel(ax, lam_um, flux_uJy, err_uJy, cont_uJy, mu_uJy, sig_uJy,
-                     which_lines, per_line, z, lo_um, hi_um, title, annotate_min_dx_um=0.002):
-    """Render one zoom panel; returns True if drawn, else False (axis hidden)."""
-    sel = (lam_um >= lo_um) & (lam_um <= hi_um)
-    if not np.any(sel):
-        ax.setVisible(False)
-        return False
-
-    left, right = _pixel_edges_um(lam_um[sel])
-    edges = np.r_[left[0], right]
-
-    ax.stairs(flux_uJy[sel], edges, label="Data (bins)", linewidth=0.9, alpha=0.9)
-    ax.errorbar(lam_um[sel], flux_uJy[sel], yerr=err_uJy[sel], fmt='o', ms=2.2,
-                color='0.35', mfc='none', mec=(0,0,0,0.25), mew=0.4,
-                ecolor=(0,0,0,0.16), elinewidth=0.45, capsize=0, zorder=1,
-                label="±1σ")
-    ax.stairs(cont_uJy[sel], edges, label="Continuum", linestyle="--", linewidth=0.9)
-    ax.stairs(mu_uJy[sel],   edges, label="Model mean", linewidth=1.0)
-    ax.fill_between(lam_um[sel], mu_uJy[sel] - sig_uJy[sel], mu_uJy[sel] + sig_uJy[sel],
-                    step='mid', alpha=0.18, linewidth=0)
-    ax.set_xlim(lo_um, hi_um)
-    ax.set_title(title, fontsize=10)
-    _annotate_lines(ax, which_lines, z, per_line=per_line,
-                    min_dx_um=annotate_min_dx_um, levels=(0.92, 0.80, 0.68))
-    return True
-
 import os
 import numpy as np
 import matplotlib.pyplot as plt
 from astropy.io import fits
 from tqdm.auto import tqdm
 
-# assumes these come from your module namespace already:
-# - excels_fit_poly
-# - flam_to_fnu_uJy
-# - _sigma_clip_mean_std
-# - _window_from_lines_um, _has_coverage_window, _has_fit_in_window
-# - REST_LINES_A
-# - _annotate_lines
-
-def _bin_edges_from_centers_um(lam_um: np.ndarray) -> np.ndarray:
-    """
-    Given wavelength centers in µm (possibly non-uniform), return bin edges in µm
-    such that each center is the midpoint of its bin.
-    """
-    lam = np.asarray(lam_um, float)
-    if lam.size < 2:
-        # fabricate a tiny symmetric bin if we only have one point
-        d = 1e-6
-        return np.array([lam[0] - d, lam[0] + d], float)
-
-    mid = 0.5 * (lam[1:] + lam[:-1])                 # interior edges
-    left  = lam[0]  - 0.5 * (lam[1]  - lam[0])       # first edge
-    right = lam[-1] + 0.5 * (lam[-1] - lam[-2])      # last edge
-    return np.r_[left, mid, right]
 
 def _edges_median_spacing(lam_um: np.ndarray) -> np.ndarray:
     """
