@@ -1,4 +1,5 @@
 """
+again
 PyRSR line_fit — Gaussian line-fitting in linear wavelength (F_λ)
 =================================================================
 
@@ -76,7 +77,7 @@ REST_LINES_A = {
     "HEII_1": 1640.420,  "OIII_05": 1663.4795, "CIII": 1908.734,
 
     "OII_UV_1": 3727.092, "OII_UV_2": 3729.875,
-    "NEIII_UV_1": 3869.86,"HEI_1": 3889.749, "NEIII_UV_2": 3968.59,
+    "NEIII_UV_1": 3869.86,"HEI_1": 3889.749, "NEIII_UV_2": 3968.59, "HEPSILON": 3971.1951,
     "HDELTA": 4102.8922, "HGAMMA": 4341.6837, "OIII_1": 4364.436,
     "HEI_2": 4471.479, 
     
@@ -134,6 +135,7 @@ def _safe_median(x, default):
     x = np.asarray(x, float)
     v = np.nanmedian(x[np.isfinite(x)]) if np.any(np.isfinite(x)) else np.nan
     return v if np.isfinite(v) else default
+
 
 from matplotlib.transforms import blended_transform_factory
 import numpy as np
@@ -388,6 +390,46 @@ def fit_continuum_polynomial(lam_um, flam, z, deg=2, windows=None,
 
     return Fcont, p_coefs
 
+def _prune_lines_without_data(
+    lam_fit, resid_fit, sig_fit, which_lines, z, grating,
+    min_pts_per_line: int = 3,
+    window_sigma: float = 4.0,          # half-width in units of σ_inst
+    window_um: float | None = None,     # override with fixed half-width [µm]
+    verbose: bool = False,
+):
+    """
+    Keep only lines that have >= min_pts_per_line finite samples within
+    ±(window_um or window_sigma*σ_inst) around the expected observed center.
+
+    Returns
+    -------
+    kept_lines : list[str]
+    kept_idx   : np.ndarray[bool] mask aligned with which_lines
+    """
+
+    if not which_lines:
+        return [], np.zeros(0, dtype=bool)
+
+    # Expected observed positions and instrumental widths
+    expected_um  = np.array([REST_LINES_A[nm]*(1+z)/1e4 for nm in which_lines])
+    sigma_gr_log = np.array([sigma_grating_logA(grating, mu_um) for mu_um in expected_um])  # log10
+    sigmaA_inst  = expected_um * 1e4 * LN10 * sigma_gr_log    # Å
+    sigma_um_inst = sigmaA_inst / 1e4                         # µm
+
+    finite = np.isfinite(resid_fit) & np.isfinite(sig_fit) & (sig_fit > 0)
+    keep = []
+
+    for mu_um, s_um, nm in zip(expected_um, sigma_um_inst, which_lines):
+        half = float(window_um) if (window_um is not None) else (window_sigma * s_um)
+        m = (lam_fit > mu_um - half) & (lam_fit < mu_um + half) & finite
+        ok = (np.count_nonzero(m) >= int(min_pts_per_line))
+        keep.append(ok)
+        if verbose and not ok:
+            print(f"[skip] {nm}: no usable pixels within ±{half:.5f} µm")
+
+    keep = np.asarray(keep, bool)
+    return [ln for ln, k in zip(which_lines, keep) if k], keep
+
 
 # ============================================================
 # Seeds: local peaks for μ
@@ -519,8 +561,20 @@ def excels_fit_poly(source, z, grating="PRISM", lines_to_use=None,
 
     # --- Lines in coverage ---
     which_lines = _lines_in_range(z, lam_fit, lines_to_use, margin_um=0.02)
+
+    # NEW: drop lines that have no finite data locally
+    which_lines, _keep_mask = _prune_lines_without_data(
+        lam_fit, resid_fit, sig_fit, which_lines, z, grating,   # <--- was sig_flam_fit
+        min_pts_per_line=3,
+        window_sigma=4.0,
+        window_um=None,
+        verbose=bool(verbose),
+    )
+
+
     if not which_lines:
-        raise ValueError("No emission lines in wavelength coverage.")
+        raise ValueError("No emission lines with local data in the fit window.")
+
 
     # --- Instrument σ and centroid seeds ---
     expected_um  = np.array([REST_LINES_A[nm]*(1+z)/1e4 for nm in which_lines])
@@ -626,8 +680,8 @@ def excels_fit_poly(source, z, grating="PRISM", lines_to_use=None,
         muA_lo = muA_seed - 12.0 * np.maximum(sigmaA_inst, 1.0)
         muA_hi = muA_seed + 12.0 * np.maximum(sigmaA_inst, 1.0)
     else:
-        muA_lo = muA_seed - 6.0  * np.maximum(sigmaA_inst, 1.0)
-        muA_hi = muA_seed + 6.0  * np.maximum(sigmaA_inst, 1.0)
+        muA_lo = muA_seed - 1.0  * np.maximum(sigmaA_inst, 1.0)
+        muA_hi = muA_seed + 1.0  * np.maximum(sigmaA_inst, 1.0)
 
     # Pack parameters and finalize to guarantee x0 inside bounds
     p0 = np.r_[A0,           sigmaA_seed, muA_seed]
@@ -672,23 +726,100 @@ def excels_fit_poly(source, z, grating="PRISM", lines_to_use=None,
         fluxes = apply_balmer_absorption_correction(fluxes, absorption_corrections)
 
     # --- Collect per-line outputs ---
+    # Use robust matched-filter noise estimate to avoid inflated SNRs
+    def _matched_filter_variance_A(lam_um, sig_flam, muA, sigmaA):
+        # work in Å
+        lamA = lam_um * 1e4
+        left_A, right_A = _pixel_edges_A(lamA)
+
+        # unit-area, bin-averaged template t_i in Fλ per Å  (∑ t_i Δλ_i = 1)
+        t = _gauss_binavg_area_normalized_A(left_A, right_A, muA, sigmaA)
+
+        # weights from per-pixel σ(Fλ)
+        w = 1.0 / np.clip(sig_flam, 1e-30, None)**2
+
+        S = np.nansum(w * t**2)     # == t^T C_n^{-1} t
+        if not np.isfinite(S) or S <= 0:
+            return np.inf
+        return 1.0 / S              # Var(Â) = 1 / (t^T C^{-1} t)
+
+
+
+    def _corr_noise_factor(resid, max_lag=3):
+        r = resid[np.isfinite(resid)]
+        if r.size < max_lag + 5:
+            return 1.0
+        r -= np.nanmean(r)
+        rho = [np.corrcoef(r[:-k], r[k:])[0,1] for k in range(1, max_lag+1)]
+        rho = np.nan_to_num(rho, nan=0.0)
+        f_corr = np.sqrt(max(1.0, 1.0 + 2.0 * np.sum(np.clip(rho, -0.99, 0.99))))
+        return f_corr
+
+    resid_best = resid_fit - model_flam_win  # residuals from best-fit model
+
     per_line = {}
     for j, name in enumerate(which_lines):
-        F_line   = fluxes.get(name, {}).get("F_line", np.nan)
-        sig_line = fluxes.get(name, {}).get("sigma_line", np.nan)
-        ew_obs   = ews.get(name, {}).get("EW_obs_A", np.nan)
-        ew0      = ews.get(name, {}).get("EW0_A", np.nan)
-        snr      = np.nan if not np.isfinite(sig_line) or sig_line == 0 else F_line / sig_line
+        F_line = fluxes.get(name, {}).get("F_line", np.nan)
+        sig_line_nominal = fluxes.get(name, {}).get("sigma_line", np.nan)
+        ew_obs = ews.get(name, {}).get("EW_obs_A", np.nan)
+        ew0    = ews.get(name, {}).get("EW0_A", np.nan)
 
         muA, sigma_logA = centers[name]
         sigma_A  = sigma_logA * muA * LN10
         FWHM_A   = 2.0 * np.sqrt(2.0 * np.log(2.0)) * sigma_A
 
+        # --- local window: ±3 σ_A in µm (robust for PRISM and M gratings)
+        win_um = 3.0 * (sigma_A / 1e4)                 # Å -> µm
+        mask_loc = (lam_fit >= (muA/1e4 - win_um)) & (lam_fit <= (muA/1e4 + win_um))
+
+        # --- matched-filter σ(A) with correct normalization
+        sig_mf = np.sqrt(_matched_filter_variance_A(lam_fit, sig_fit, muA, sigma_A))
+
+        # --- correlated-noise inflation factor from *whitened* residuals
+        if np.any(mask_loc):
+            r_loc = resid_best[mask_loc] / np.clip(sig_fit[mask_loc], 1e-30, None)
+            f_corr = _corr_noise_factor(r_loc, max_lag=3)
+        else:
+            f_corr = 1.0
+
+        # --- final per-line flux uncertainty and SNR
+        sig_line_final = max(sig_line_nominal, sig_mf * f_corr)
+        snr = np.nan if (not np.isfinite(sig_line_final) or sig_line_final <= 0) else (F_line / sig_line_final)
+
+
+                # >>> ADD: Peak SNRs (data-driven and model-based) <<<
+        # window of ±3 sigma_A in wavelength units around the centroid
+        win_um = 3.0 * (sigma_A / 1e4)   # convert Å -> µm
+        mpeak = (lam_fit >= (muA/1e4 - win_um)) & (lam_fit <= (muA/1e4 + win_um))
+
+        # local noise with correlated-noise inflation
+        if np.any(mpeak):
+            sigma_loc = np.nanmedian(sig_fit[mpeak])
+            # reuse f_corr estimated above from residuals
+            sigma_loc_eff = sigma_loc * f_corr
+            # data-driven peak SNR from residuals (data - continuum), not from the model
+            peak_data = np.nanmax(resid_fit[mpeak])
+            peak_snr_data = peak_data / np.clip(sigma_loc_eff, 1e-30, None)
+        else:
+            peak_snr_data = np.nan
+
+        # model-based peak height for a Gaussian with area F_line and width sigma_A
+        SQRT2PI = np.sqrt(2.0*np.pi)
+        peak_model = F_line / (SQRT2PI * np.clip(sigma_A, 1e-30, None))
+        peak_snr_model = peak_model / np.clip(sigma_loc_eff if np.any(mpeak) else np.nan, 1e-30, None)
+
+
         per_line[name] = dict(
-            F_line=F_line, sigma_line=sig_line, SNR=snr,
+            F_line=F_line,
+            sigma_line=sig_line_final,
+            SNR=snr,                               # integrated SNR (matched-filter)
+            SNR_peak_data=peak_snr_data,           # NEW: peak SNR from data residual
+            SNR_peak_model=peak_snr_model,         # NEW: peak SNR from model peak
             EW_obs_A=ew_obs, EW0_A=ew0,
             lam_obs_A=muA, sigma_A=sigma_A, FWHM_A=FWHM_A
         )
+
+
 
     # --- Plot (unchanged except for your existing styling) ---
     if plot:
@@ -909,6 +1040,20 @@ def _bin_edges_from_centers_um(lam_um: np.ndarray) -> np.ndarray:
     right = lam[-1] + 0.5 * (lam[-1] - lam[-2])      # last edge
     return np.r_[left, mid, right]
 
+def _edges_median_spacing(lam_um: np.ndarray) -> np.ndarray:
+    """
+    Build bin edges exactly like plot_spectrum_with_2d:
+    use the *median* Δλ for the first/last edges, and midpoints in between.
+    """
+    lam = np.asarray(lam_um, float)
+    if lam.size < 2:
+        d = 1e-6
+        return np.array([lam[0]-d, lam[0]+d], float)
+    dlam = np.median(np.diff(lam))
+    mids = 0.5 * (lam[1:] + lam[:-1])
+    return np.concatenate(([lam[0] - dlam/2], mids, [lam[-1] + dlam/2]))
+
+
 
 def bootstrap_excels_fit(
     source,
@@ -978,7 +1123,7 @@ def bootstrap_excels_fit(
            else np.random.default_rng(random_state))
 
     # -------- storage --------
-    samples = {ln: {"F_line": [], "sigma_A": [], "lam_obs_A": [], "EW0_A": [], "SNR": []}
+    samples = {ln: {"F_line": [], "sigma_A": [], "lam_obs_A": [], "EW0_A": [], "SNR": [],"SNR_peak_data": [], "SNR_peak_model": []}
                for ln in which_lines}
     model_stack_flam, keep_mask = [], []
 
@@ -1110,11 +1255,17 @@ def bootstrap_excels_fit(
         vS, eS   = _ve(samples[ln]["sigma_A"])
         vMu, eMu = _ve(samples[ln]["lam_obs_A"])
         vSN, eSN = _ve(samples[ln]["SNR"])
+        vSNpkD, eSNpkD = _ve(samples[ln]["SNR_peak_data"])
+        vSNpkM, eSNpkM = _ve(samples[ln]["SNR_peak_model"])
         summary[ln]["F_line"]    = {"value": vF,  "err": eF,  "text": f"{vF:.3e} ± {eF:.3e}"}
         summary[ln]["EW0_A"]     = {"value": vEW, "err": eEW, "text": f"{vEW:.2f} ± {eEW:.2f}"}
         summary[ln]["sigma_A"]   = {"value": vS,  "err": eS,  "text": f"{vS:.2f} ± {eS:.2f}"}
         summary[ln]["lam_obs_A"] = {"value": vMu, "err": eMu, "text": f"{vMu:.1f} ± {eMu:.1f}"}
         summary[ln]["SNR"]       = {"value": vSN, "err": eSN, "text": f"{vSN:.2f} ± {eSN:.2f}"}
+        summary[ln]["SNR_peak_data"]  = {"value": vSNpkD, "err": eSNpkD, "text": f"{vSNpkD:.2f} ± {eSNpkD:.2f}"}
+        summary[ln]["SNR_peak_model"] = {"value": vSNpkM, "err": eSNpkM, "text": f"{vSNpkM:.2f} ± {eSNpkM:.2f}"}
+
+
 
     # -------- plotting + optional saving --------
     if plot:
@@ -1175,16 +1326,14 @@ def bootstrap_excels_fit(
                 flux = fnu_uJy_to_flam(flux_uJy, lam_um)
                 err  = fnu_uJy_to_flam(err_uJy,  lam_um)
                 cont = cont_flam
-                mu   = mu_flam
-                sig  = sig_flam
+                mu   = mu_flam               # model total (continuum+lines) mean in Fλ
                 ylabel = r"$F_\lambda$ [erg s$^{-1}$ cm$^{-2}$ Å$^{-1}$]"
                 tag = "flam"
             else:
                 flux = flux_uJy
                 err  = err_uJy
                 cont = cont_uJy
-                mu   = mu_uJy
-                sig  = sig_uJy
+                mu   = mu_uJy                # model total (continuum+lines) mean in Fν
                 ylabel = r"$F_\nu$ [µJy]"
                 tag = "fnu"
 
@@ -1194,50 +1343,56 @@ def bootstrap_excels_fit(
             ax_full = fig.add_subplot(gs[0, :])
             ax_z = [fig.add_subplot(gs[1, i]) for i in range(3)]
 
-            edges = _bin_edges_from_centers_um(lam_um)
-            centers = 0.5 * (edges[:-1] + edges[1:])
-            errbar_kwargs = dict(
-                fmt='o', ms=1,
-                mfc='white',
-                mec=(0,0,0,0.35),   # marker edge much lighter
-                mew=0.4,
+            # --- FULL PANEL (match plot_spectrum_with_2d) ---
+            edges = _edges_median_spacing(lam_um)
 
-                ecolor=(0,0,0,0.11),  # << reduce opacity of the *error bar*
-                elinewidth=0.3,      # optionally thin the error lines
-                capsize=1.0,
-
-                alpha=0.5,            # marker transparency (still controls the dot)
-                zorder=2.5
+            # error band (±1σ), *not* errorbars
+            ax_full.fill_between(
+                lam_um, flux - err, flux + err,
+                step="mid", color="grey", alpha=0.25, linewidth=0
             )
 
+            # stairs for data, continuum, model — same edges for all
+            ax_full.stairs(flux, edges, color="#6a0dad", lw=0.5, alpha=0.9, label="Data")
+            ax_full.stairs(cont, edges, color="b", ls="--", lw=0.5, label="Continuum")
+            ax_full.stairs(mu,   edges, color="r", lw=0.5, label="Model")
 
-            title = f"{source_id}   (z = {z:.3f})" if source_id else f"z = {z:.3f}"
-            ax_full.set_title(title, fontsize=12, pad=8)
-            ax_full.stairs(flux, edges, color="k", lw=1, alpha=0.9, label="Data")
-            ax_full.errorbar(centers, flux, yerr=err, **errbar_kwargs)
-            ax_full.stairs(cont, edges, color="b", ls="--", lw=0.7, label="Continuum")
-            ax_full.stairs(mu, edges, color="r", lw=0.7, label="Model mean")
-            ax_full.fill_between(centers, mu - sig, mu + sig, step='mid', color="r", alpha=0.18, lw=0)
+            title_txt = f"{source_id}   (z = {z:.3f})" if source_id else f"z = {z:.3f}"
+            ax_full.set_title(title_txt, fontsize=12, pad=8)
+            ax_full.axhline(0, color="k", ls="--", lw=0.5, alpha=0.5)
             ax_full.set_xlabel("Observed wavelength [µm]")
             ax_full.set_ylabel(ylabel)
             ax_full.legend(ncol=3, fontsize=9, frameon=False)
+            ax_full.grid(alpha=0.25, linestyle=":", linewidth=0.5)
+            ax_full.tick_params(direction="in", top=True, right=True)
             _annotate_lines(ax_full, which_lines, z, per_line=base["lines"], min_dx_um=0.01)
 
-            # zoom panels
+            # --- ZOOM PANELS (match the same style) ---
             for ax, zd, show in zip(ax_z, zoom_defs, show_flags):
                 sel = (lam_um >= zd["lo"]) & (lam_um <= zd["hi"])
                 if np.any(sel):
                     lam_z = lam_um[sel]
                     flux_z, err_z = flux[sel], err[sel]
-                    cont_z, mu_z, sig_z = cont[sel], mu[sel], sig[sel]
-                    edges_z = _bin_edges_from_centers_um(lam_z)
-                    centers_z = 0.5 * (edges_z[:-1] + edges_z[1:])
-                    ax.stairs(flux_z, edges_z, color="k", lw=1, alpha=0.9)
-                    ax.errorbar(centers_z, flux_z, yerr=err_z, **errbar_kwargs)
-                    ax.stairs(cont_z, edges_z, color="b", lw=0.7, ls="--")
-                    ax.stairs(mu_z, edges_z, color="r", lw=0.7)
-                    ax.fill_between(centers_z, mu_z - sig_z, mu_z + sig_z,
-                                    step="mid", alpha=0.18, lw=0)
+                    cont_z, mu_z  = cont[sel],  mu[sel]
+
+                    edges_z = _edges_median_spacing(lam_z)
+
+                    ax.fill_between(
+                        lam_z, flux_z - err_z, flux_z + err_z,
+                        step="mid", color="grey", alpha=0.25, linewidth=0
+                    )
+                    ax.stairs(flux_z, edges_z, color="#6a0dad", lw=0.5, alpha=0.9, label="Data")
+                    ax.stairs(cont_z, edges_z, color="b", ls="--", lw=0.5, label="Continuum")
+                    ax.stairs(mu_z,   edges_z, color="r", lw=0.5, label="Model")
+
+                    ax.set_xlim(zd["lo"], zd["hi"])
+                    ax.set_title(zd["title"], fontsize=10)
+                    ax.set_xlabel("Observed wavelength [µm]")
+                    ax.set_ylabel(ylabel)
+                    ax.axhline(0, color="k", ls="--", lw=0.5, alpha=0.5)
+                    ax.grid(alpha=0.25, linestyle=":", linewidth=0.5)
+                    ax.tick_params(direction="in", top=True, right=True)
+
                     _annotate_lines(ax, which_lines, z, per_line=base["lines"],
                                     min_dx_um=0.002, levels=(0.92, 0.80, 0.68))
                 else:
@@ -1247,31 +1402,23 @@ def bootstrap_excels_fit(
                 if not show:
                     ax.text(0.5, 0.1, "No detection", transform=ax.transAxes,
                             ha="center", va="bottom", fontsize=8, color="0.6", alpha=0.8)
-                ax.set_xlim(zd["lo"], zd["hi"])
-                ax.set_title(zd["title"], fontsize=10)
-                ax.set_xlabel("Observed wavelength [µm]")
-                ax.set_ylabel(ylabel)
 
-            # save
-            # ----------------------------------------------
-            # save section inside _plot_unit()
-            # ----------------------------------------------
+            # --- save ---
             if save_path:
                 root, ext = os.path.splitext(save_path)
                 fname = f"{root}_{tag}.{save_format}" if ext == "" else f"{root}_{tag}{ext}"
                 fig.savefig(fname, dpi=save_dpi, bbox_inches="tight", transparent=save_transparent)
 
-                # --- save summary only once (for Fν unit) ---
                 if tag.lower() == "fnu":
-                    summary_txt = f"{root}_summary.txt"   # ← only one per source
+                    summary_txt = f"{root}_summary.txt"
                     print_bootstrap_line_table(
                         dict(which_lines=which_lines, summary=summary),
                         save_path=summary_txt
                     )
 
-
             plt.show()
             plt.close(fig)
+
 
         # --- make plot(s) ---
         if plot_unit.lower() in ("flam", "both"):
@@ -1297,23 +1444,33 @@ def print_bootstrap_line_table(boot, save_path: str | None = None):
     Optionally save the same output to a text file.
     """
 
+    # Extended header with Peak SNRs
     header = (
         "\n=== BOOTSTRAP SUMMARY (value ± error) ===\n"
         f"{'Line':10s} {'F_line [erg/s/cm²]':>26s} {'EW₀ [Å]':>16s} "
-        f"{'σ_A [Å]':>14s} {'μ_obs [Å]':>16s} {'SNR':>12s}\n"
-        + "-" * 100 + "\n"
+        f"{'σ_A [Å]':>14s} {'μ_obs [Å]':>16s} {'SNR_int':>10s} "
+        f"{'SNR_peak(data)':>16s} {'SNR_peak(model)':>18s}\n"
+        + "-" * 125 + "\n"
     )
 
     lines = []
     for ln in boot["which_lines"]:
         s = boot["summary"][ln]
+
+        # handle missing keys gracefully (older runs without new fields)
+        snr_int   = s.get("SNR", {}).get("text", "—")
+        snr_pdata = s.get("SNR_peak_data", {}).get("text", "—")
+        snr_pmod  = s.get("SNR_peak_model", {}).get("text", "—")
+
         lines.append(
             f"{ln:10s} "
             f"{s['F_line']['text']:>26s} "
             f"{s['EW0_A']['text']:>16s} "
             f"{s['sigma_A']['text']:>14s} "
             f"{s['lam_obs_A']['text']:>16s} "
-            f"{s['SNR']['text']:>12s}"
+            f"{snr_int:>10s} "
+            f"{snr_pdata:>16s} "
+            f"{snr_pmod:>18s}"
         )
 
     table_text = header + "\n".join(lines)
@@ -1326,4 +1483,5 @@ def print_bootstrap_line_table(boot, save_path: str | None = None):
         with open(save_path, "w") as f:
             f.write(table_text)
         print(f"\nSaved bootstrap summary → {save_path}")
+
 
