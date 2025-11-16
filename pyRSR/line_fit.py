@@ -1,27 +1,23 @@
 """
-again...
 PyRSR line_fit — Gaussian line-fitting in linear wavelength (F_λ)
 =================================================================
 
 This module implements a *linear-wavelength, pure-Gaussian* emission–line fitter
 for JWST/NIRSpec 1D spectra. It provides:
 
-1) A σ–weighted polynomial continuum fitter with robust masking of emission lines.
-2) Independent Gaussian fits for each emission line:
+* A σ–weighted polynomial continuum fitter with robust masking of emission lines.
+* Independent Gaussian fits for each emission line:
    - integrated flux A  [erg s⁻¹ cm⁻²]
    - Gaussian width σ_A [Å]
-   - centroid μ_A       [Å]
-   Each line is fitted *independently* (no tied amplitudes/ratios).
-3) Pixel-integrated model evaluation (bin-averaged Gaussians on pixel edges) so
-   the fitted model respects spectral sampling and does not look “knife–edged”.
-4) Automatic centroid seeding from *local observed peaks* near catalog positions.
-5) Flux density plots in **both** µJy and F_λ using bin-aware “stairs” rendering,
+   - centroid μ_A       [Å] - check this
+   - Integrated SNR
+   - Peak SNR
+* Automatic centroid seeding from local observed peaks near catalog positions.
+* Flux density plots in both µJy and F_λ using bin-aware “stairs” rendering,
    plus zoom windows around Hβ+[O III] for high-z galaxies (in µJy and F_λ).
    Data points with ±1σ uncertainties are overplotted in grey on all panels.
-6) A parametric bootstrap utility to propagate uncertainties by repeatedly
-   re-fitting spectra with noise realizations (with tqdm progress bar,
-   optional figure saving, and ready-to-print line summaries).
-7) Grey vertical guides with non-overlapping labels for each emission line.
+* A parametric bootstrap utility to propagate uncertainties by repeatedly
+   re-fitting spectra with noise realizations.
 
 Units & conventions
 -------------------
