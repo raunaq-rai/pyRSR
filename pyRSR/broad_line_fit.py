@@ -214,6 +214,32 @@ def _annotate_lines(ax, which_lines, z, per_line=None,
 def _obs_um_from_rest_A(rest_A, z):
     return (np.asarray(rest_A, float) * (1.0 + z)) / 1e4
 
+def _build_width_tie_groups(which_lines):
+    """
+    Return list of groups of indices in `which_lines` whose Gaussian σ_A
+    should be tied together.
+
+    For now:
+      - Tie the *narrow* Hα + [N II] λλ6549,6585 components:
+        (NII_2, HALPHA, NII_3) share a single σ.
+
+    We deliberately do NOT include HALPHA_BROAD here.
+    """
+    name_to_idx = {nm: i for i, nm in enumerate(which_lines)}
+    groups = []
+
+    ha_triplet = ["NII_2", "HALPHA", "NII_3"]
+    if all(nm in name_to_idx for nm in ha_triplet):
+        groups.append([name_to_idx[nm] for nm in ha_triplet])
+
+    # If you later want to tie broad components too, e.g.:
+    # broad_grp = ["HBETA_BROAD", "HALPHA_BROAD"]
+    # if all(nm in name_to_idx for nm in broad_grp):
+    #     groups.append([name_to_idx[nm] for nm in broad_grp])
+
+    return groups
+
+
 # --------------------------------------------------------------------
 # Continuum helpers
 # --------------------------------------------------------------------
@@ -659,24 +685,87 @@ def _fit_emission_system(
         if nm.endswith("_BROAD"):
             sigmaA_seed[j] = np.clip(5.0 * sigmaA_inst[j], sigmaA_lo[j], sigmaA_hi[j])
 
+    # ------------------------------------------------------------
+    # Tie widths for selected groups (e.g. NII_2, HALPHA, NII_3)
+    # ------------------------------------------------------------
+    nL = len(which_lines)
+    width_groups = _build_width_tie_groups(which_lines)
+
+    # Map each line j → σ-DOF index (0 .. nSigmaDOF-1)
+    sigma_dof_index = np.full(nL, -1, dtype=int)
+    nSigmaDOF = 0
+
+    for grp in width_groups:
+        if len(grp) <= 1:
+            continue
+        for j in grp:
+            sigma_dof_index[j] = nSigmaDOF
+        nSigmaDOF += 1
+
+    # Any line not in a group gets its own σ parameter
+    for j in range(nL):
+        if sigma_dof_index[j] < 0:
+            sigma_dof_index[j] = nSigmaDOF
+            nSigmaDOF += 1
+
+    # Aggregate seeds + bounds per σ-DOF
+    sigma_seed_dof = np.zeros(nSigmaDOF)
+    sigma_lo_dof   = np.zeros(nSigmaDOF)
+    sigma_hi_dof   = np.zeros(nSigmaDOF)
+
+    for g_idx in range(nSigmaDOF):
+        members = np.where(sigma_dof_index == g_idx)[0]
+        sigma_seed_dof[g_idx] = np.median(sigmaA_seed[members])
+        sigma_lo_dof[g_idx]   = np.min(sigmaA_lo[members])
+        sigma_hi_dof[g_idx]   = np.max(sigmaA_hi[members])
+
+    sigma_seed_dof = np.clip(sigma_seed_dof, sigma_lo_dof, sigma_hi_dof)
+
+    # ------------------------------------------------------------
+    # Amplitudes (unchanged)
+    # ------------------------------------------------------------
+    # ------------------------------------------------------------
+    # Amplitudes — allow negative (emission or absorption)
+    # ------------------------------------------------------------
+    # ------------------------------------------------------------
+    # Amplitudes – allow positive *and* negative lines
+    # ------------------------------------------------------------
     SQRT2PI = np.sqrt(2.0 * np.pi)
-    A0, A_lo, A_hi = [], np.zeros(len(sigmaA_seed)), []
+    A0, A_lo, A_hi = [], [], []
     rms_flam = float(_safe_median(np.abs(resid_fit), 0.0))
     rms_flam = max(rms_flam, 1e-30)
 
     for j, mu_um in enumerate(expected_um):
         win = (lam_fit > mu_um - 0.05) & (lam_fit < mu_um + 0.05)
-        peak_flam = np.nanmax(resid_fit[win]) if np.any(win) else 3.0 * rms_flam
-        peak_flam = max(peak_flam, 3.0 * rms_flam)
+
+        if np.any(win):
+            # Take the most extreme excursion (pos or neg) near the line
+            y_loc = resid_fit[win]
+            # argmax of |residual| to capture absorption as well
+            idx = np.nanargmax(np.abs(y_loc))
+            peak_val = y_loc[idx]
+        else:
+            peak_val = 3.0 * rms_flam  # default small emission
+
+        # Magnitude at least ~3σ, sign from data
+        peak_mag  = max(abs(peak_val), 3.0 * rms_flam)
+        peak_sign = np.sign(peak_val) if np.isfinite(peak_val) and (peak_val != 0.0) else 1.0
+        peak_flam = peak_sign * peak_mag
 
         A_seed = peak_flam * SQRT2PI * max(sigmaA_seed[j], 0.9 * sigmaA_inst[j])
-        A_upper = 150.0 * max(peak_flam, 3.0 * rms_flam) * SQRT2PI * np.maximum(sigmaA_hi[j], sigmaA_seed[j])
+
+        # Upper bound is *magnitude* only
+        A_upper_mag = 150.0 * peak_mag * SQRT2PI * np.maximum(sigmaA_hi[j], sigmaA_seed[j])
 
         A0.append(A_seed)
-        A_hi.append(A_upper)
+        A_hi.append(+A_upper_mag)
+        A_lo.append(-A_upper_mag)  # symmetric: allow negative flux
 
-    A0 = np.array(A0, float)
-    A_hi = np.array(A_hi, float)
+    A0 = np.asarray(A0, float)
+    A_hi = np.asarray(A_hi, float)
+    A_lo = np.asarray(A_lo, float)
+
+
 
     if "prism" in g:
         muA_lo = muA_seed - 12.0 * np.maximum(sigmaA_inst, 1.0)
@@ -703,10 +792,13 @@ def _fit_emission_system(
             elif nm == "NII_3":
                 muA_lo[j] = max(muA_lo[j], mid_Ha_N3)
 
-    p0 = np.r_[A0,           sigmaA_seed, muA_seed]
-    lb = np.r_[A_lo,         sigmaA_lo,   muA_lo]
-    ub = np.r_[A_hi,         sigmaA_hi,   muA_hi]
+    # compressed parameter vector:
+    #   [ A_j (nL) , σ_g (nSigmaDOF) , μ_j (nL) ]
+    p0 = np.r_[A0, sigma_seed_dof, muA_seed]
+    lb = np.r_[A_lo, sigma_lo_dof, muA_lo]
+    ub = np.r_[A_hi, sigma_hi_dof, muA_hi]
     p0, lb, ub = _finalize_seeds_and_bounds(p0, lb, ub)
+
 
     dlA = np.gradient(lamA_fit)
     rat = dlA / np.nanmedian(dlA)
@@ -714,20 +806,63 @@ def _fit_emission_system(
     w_pix = (np.nanmedian(dlA) / np.clip(dlA, 1e-12, None))**0.35
     w_pix = np.clip(w_pix, 0.8, 1.25)
 
+        # Expand compressed parameters → full [A_1..A_nL, σ_1..σ_nL, μ_1..μ_nL]
+    def _expand_params(p_comp):
+        p_comp = np.asarray(p_comp, float)
+        A = p_comp[:nL]
+        sigma_params = p_comp[nL:nL + nSigmaDOF]
+        muA = p_comp[nL + nSigmaDOF:]
+        sigmaA_full = sigma_params[sigma_dof_index]
+        return np.r_[A, sigmaA_full, muA]
+
+
     def fun(p):
-        model, _, _ = build_model_flam_linear(p, lam_fit, z, grating, which_lines, mu_seed_um)
+        full_p = _expand_params(p)
+        model, _, _ = build_model_flam_linear(
+            full_p, lam_fit, z, grating, which_lines, mu_seed_um
+        )
         return w_pix * (resid_fit - model) / np.clip(sig_fit, 1e-30, None)
 
-    res = least_squares(fun, p0, bounds=(lb, ub), max_nfev=80000, xtol=1e-8, ftol=1e-8)
-
-    model_flam_win, profiles_win, centers = build_model_flam_linear(
-        res.x, lam_fit, z, grating, which_lines, mu_seed_um
+    res = least_squares(
+        fun, p0, bounds=(lb, ub),
+        max_nfev=80000, xtol=1e-8, ftol=1e-8
     )
 
+    full_p = _expand_params(res.x)
+    model_flam_win, profiles_win, centers = build_model_flam_linear(
+        full_p, lam_fit, z, grating, which_lines, mu_seed_um
+    )
+
+    # First nL params are the Gaussian amplitudes A_j (integrated fluxes)
+    nL = len(which_lines)
+    A_fit = np.asarray(full_p[:nL], float)
+
+    # Measure fluxes with the standard helper
     fluxes = measure_fluxes_profile_weighted(
         lam_fit, resid_fit, sig_fit, model_flam_win, profiles_win, centers
     )
+
+    for j, name in enumerate(which_lines):
+        if name not in fluxes:
+            continue
+        fd = fluxes[name]
+        F_raw = fd.get("F_line", np.nan)
+        A_j   = A_fit[j]
+
+        # If measure_fluxes_profile_weighted failed, fall back to the fitted amplitude
+        if not np.isfinite(F_raw) and np.isfinite(A_j):
+            F_raw = A_j
+
+        if np.isfinite(F_raw) and np.isfinite(A_j):
+            # enforce sign consistency with the Gaussian amplitude
+            fd["F_line"] = np.sign(A_j) * abs(F_raw)
+        else:
+            fd["F_line"] = np.nan   # truly broken case
+
+
+    # Now EWs are computed from signed fluxes (absorption → negative EW)
     ews = equivalent_widths_A(fluxes, lam_fit, Fcont_fit, z, centers)
+
     if absorption_corrections:
         fluxes = apply_balmer_absorption_correction(fluxes, absorption_corrections)
 
@@ -749,6 +884,27 @@ def _fit_emission_system(
         win_um = 3.0 * (sigma_A / 1e4)
         mask_loc = (lam_fit >= (muA/1e4 - win_um)) & (lam_fit <= (muA/1e4 + win_um))
 
+                # --- Force sign of F_line to follow data–continuum residual ---
+        # resid_fit is (data - continuum), so its integral carries the physical sign.
+        if np.isfinite(F_line):
+            if np.any(mask_loc):
+                res_int = np.nansum(resid_fit[mask_loc])
+                if np.isfinite(res_int) and res_int != 0.0:
+                    sign_resid = np.sign(res_int)
+                else:
+                    sign_resid = 1.0
+            else:
+                sign_resid = 1.0
+
+            # Make the *magnitude* from the profile-weighted measurement,
+            # but the *sign* from the residual.
+            F_line = sign_resid * abs(F_line)
+
+            # Also push the signed value back into `fluxes` so EWs use it.
+            if name in fluxes:
+                fluxes[name]["F_line"] = F_line
+
+
         sig_mf = np.sqrt(_matched_filter_variance_A(lam_fit, sig_fit, muA, sigma_A))
 
         if np.any(mask_loc):
@@ -758,7 +914,12 @@ def _fit_emission_system(
             f_corr = 1.0
 
         sig_line_final = max(sig_line_nominal, sig_mf * f_corr)
-        snr = np.nan if (not np.isfinite(sig_line_final) or sig_line_final <= 0) else (F_line / sig_line_final)
+        snr = (
+            np.nan 
+            if (not np.isfinite(sig_line_final) or sig_line_final <= 0)
+            else (abs(F_line) / sig_line_final)
+        )
+
 
         win_um = 3.0 * (sigma_A / 1e4)
         mpeak = (lam_fit >= (muA/1e4 - win_um)) & (lam_fit <= (muA/1e4 + win_um))
@@ -772,8 +933,9 @@ def _fit_emission_system(
             peak_snr_data = np.nan
             sigma_loc_eff = np.nan
 
-        peak_model = F_line / (SQRT2PI * np.clip(sigma_A, 1e-30, None))
+        peak_model = abs(F_line) / (SQRT2PI * np.clip(sigma_A, 1e-30, None))
         peak_snr_model = peak_model / np.clip(sigma_loc_eff, 1e-30, None)
+
 
         per_line[name] = dict(
             F_line=F_line,
@@ -786,6 +948,7 @@ def _fit_emission_system(
             lam_obs_A=muA,
             sigma_A=sigma_A,
             FWHM_A=FWHM_A,
+            A_gauss=A_fit[j],
         )
 
     resid_vec = fun(res.x)
@@ -1252,6 +1415,26 @@ def bootstrap_excels_fit_broad(
         raise ValueError("No emission lines in coverage (cannot bootstrap).")
 
     base_lines = base["lines"]
+
+
+    base_sign = {}
+    for ln in which_lines:
+        d = base_lines.get(ln, {})
+        F0 = d.get("F_line", np.nan)
+        A0 = d.get("A_gauss", np.nan)
+
+        if np.isfinite(F0) and F0 != 0.0:
+            s = np.sign(F0)
+        elif np.isfinite(A0) and A0 != 0.0:
+            # fall back to the Gaussian amplitude sign
+            s = np.sign(A0)
+        else:
+            s = np.nan
+
+        base_sign[ln] = s
+
+
+
     flux_cap  = {ln: 10.0 * abs(base_lines[ln]["F_line"])  if ln in base_lines else np.inf
                  for ln in which_lines}
     width_cap = {ln: 10.0 * abs(base_lines[ln]["sigma_A"]) if ln in base_lines else np.inf
@@ -1328,13 +1511,23 @@ def bootstrap_excels_fit_broad(
 
         for ln in which_lines:
             d = fb["lines"][ln]
-            samples[ln]["F_line"].append(d["F_line"])
+
+            # Start from the per-fit signed flux
+            F_val = d["F_line"]
+            s0 = base_sign.get(ln, np.nan)
+
+            # If the base fit has a well-defined sign, enforce it on this draw
+            if np.isfinite(s0) and s0 != 0 and np.isfinite(F_val):
+                F_val = s0 * abs(F_val)
+
+            samples[ln]["F_line"].append(F_val)
             samples[ln]["sigma_A"].append(d["sigma_A"])
             samples[ln]["lam_obs_A"].append(d["lam_obs_A"])
             samples[ln]["EW0_A"].append(d["EW0_A"])
             samples[ln]["SNR"].append(d["SNR"])
             samples[ln]["SNR_peak_data"].append(d["SNR_peak_data"])
             samples[ln]["SNR_peak_model"].append(d["SNR_peak_model"])
+
 
         cont = fb.get("continuum_flam", np.zeros_like(lam_um))
 
@@ -1506,28 +1699,29 @@ def bootstrap_excels_fit_broad(
             narrow_color = "tab:green"
             broad_color  = "tab:purple"
 
-            # For plotting we’ll build per-unit versions lazily
-            balmer_comp = {}
-            if has_broad_balmers_base:
-                for base_name in ("HBETA", "HALPHA"):
-                    n_name = base_name
-                    b_name = base_name + "_BROAD"
+            # --- Build component curves (continuum + line) on base-fit grid ---
+            # Narrow components: Hβ, Hα, [N II]6549,6585
+            narrow_comp = {}
+            for nm in ("HBETA", "HALPHA", "NII_2", "NII_3"):
+                if nm in profiles_base:
+                    comp_flam = cont_fit_base + profiles_base[nm]
+                    if unit == "flam":
+                        y = comp_flam
+                    else:
+                        y = flam_to_fnu_uJy(comp_flam, lam_fit_base)
+                    narrow_comp[nm] = y
 
-                    if n_name in profiles_base:
-                        comp_n_flam = cont_fit_base + profiles_base[n_name]
-                        if unit == "flam":
-                            y_n = comp_n_flam
-                        else:
-                            y_n = flam_to_fnu_uJy(comp_n_flam, lam_fit_base)
-                        balmer_comp[n_name] = y_n
+            # Broad components: Hβ_broad, Hα_broad
+            broad_comp = {}
+            for nm in ("HBETA_BROAD", "HALPHA_BROAD"):
+                if nm in profiles_base:
+                    comp_flam = cont_fit_base + profiles_base[nm]
+                    if unit == "flam":
+                        y = comp_flam
+                    else:
+                        y = flam_to_fnu_uJy(comp_flam, lam_fit_base)
+                    broad_comp[nm] = y
 
-                    if b_name in profiles_base:
-                        comp_b_flam = cont_fit_base + profiles_base[b_name]
-                        if unit == "flam":
-                            y_b = comp_b_flam
-                        else:
-                            y_b = flam_to_fnu_uJy(comp_b_flam, lam_fit_base)
-                        balmer_comp[b_name] = y_b
 
             # --- FULL PANEL ---
             edges = _edges_median_spacing(lam_disp)
@@ -1551,28 +1745,40 @@ def bootstrap_excels_fit_broad(
                 label="Mean model"
             )
 
-            # overlay Balmer narrow/broad on full panel ONLY if broad exists
+            # overlay narrow Hβ, Hα, [N II] in green; broad Balmer in purple
+            # Narrow components
+            for nm in ("HBETA", "HALPHA", "NII_2", "NII_3"):
+                if nm in narrow_comp:
+                    label = {
+                        "HBETA": "Hβ narrow",
+                        "HALPHA": "Hα narrow",
+                        "NII_2": "[N II]6549 narrow",
+                        "NII_3": "[N II]6585 narrow",
+                    }.get(nm, f"{nm} narrow")
+                    ax_full.plot(
+                        lam_fit_base,
+                        narrow_comp[nm],
+                        color=narrow_color,
+                        lw=1.0,
+                        alpha=0.9,
+                        label=label,
+                    )
+
+            # Broad components (only if present)
             if has_broad_balmers_base:
                 for base_name in ("HBETA", "HALPHA"):
-                    n_name = base_name
                     b_name = base_name + "_BROAD"
-
-                    if n_name in balmer_comp:
+                    if b_name in broad_comp:
                         ax_full.plot(
-                            lam_fit_base, balmer_comp[n_name],
-                            color=narrow_color,
-                            lw=1.0, alpha=0.9,
-                            label=f"{base_name} narrow",
-                        )
-
-                    if b_name in balmer_comp:
-                        ax_full.plot(
-                            lam_fit_base, balmer_comp[b_name],
+                            lam_fit_base,
+                            broad_comp[b_name],
                             color=broad_color,
-                            lw=1.0, alpha=0.9,
+                            lw=1.0,
+                            alpha=0.9,
                             linestyle="--",
                             label=f"{base_name} broad",
                         )
+
 
             title_txt = f"{source_id}   (z = {z:.3f})" if source_id else f"z = {z:.3f}"
             ax_full.set_title(title_txt, fontsize=12, pad=8)
@@ -1616,30 +1822,33 @@ def bootstrap_excels_fit_broad(
                         lw=0.5, label="Mean model"
                     )
 
-                    # NEW: overlay Balmer narrow/broad on zooms as well
-                    if has_broad_balmers_base:
-                        mask_b = (lam_fit_base >= zd["lo"]) & (lam_fit_base <= zd["hi"])
-                        if np.any(mask_b):
-                            for base_name in ("HBETA", "HALPHA"):
-                                n_name = base_name
-                                b_name = base_name + "_BROAD"
+                    # overlay narrow Hβ, Hα, [N II], and broad Balmer on zooms
+                    mask_b = (lam_fit_base >= zd["lo"]) & (lam_fit_base <= zd["hi"])
+                    if np.any(mask_b):
+                        # narrow Hβ, Hα, [N II]
+                        for nm in ("HBETA", "HALPHA", "NII_2", "NII_3"):
+                            if nm in narrow_comp:
+                                ax.plot(
+                                    lam_fit_base[mask_b],
+                                    narrow_comp[nm][mask_b],
+                                    color=narrow_color,
+                                    lw=1.0,
+                                    alpha=0.9,
+                                )
 
-                                if n_name in balmer_comp:
-                                    ax.plot(
-                                        lam_fit_base[mask_b],
-                                        balmer_comp[n_name][mask_b],
-                                        color=narrow_color,
-                                        lw=1.0, alpha=0.9,
-                                    )
+                        # broad Hβ/Hα if present
+                        for base_name in ("HBETA", "HALPHA"):
+                            b_name = base_name + "_BROAD"
+                            if b_name in broad_comp:
+                                ax.plot(
+                                    lam_fit_base[mask_b],
+                                    broad_comp[b_name][mask_b],
+                                    color=broad_color,
+                                    lw=1.0,
+                                    alpha=0.9,
+                                    linestyle="--",
+                                )
 
-                                if b_name in balmer_comp:
-                                    ax.plot(
-                                        lam_fit_base[mask_b],
-                                        balmer_comp[b_name][mask_b],
-                                        color=broad_color,
-                                        lw=1.0, alpha=0.9,
-                                        linestyle="--",
-                                    )
 
                     ax.set_xlim(zd["lo"], zd["hi"])
                     ax.set_title(zd["title"], fontsize=10)
