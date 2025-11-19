@@ -57,7 +57,6 @@ from PyRSR.ma_line_fit import (
     measure_fluxes_profile_weighted,
     equivalent_widths_A,
     rescale_uncertainties,
-    _lines_in_range,
     apply_balmer_absorption_correction,
 )
 
@@ -83,7 +82,7 @@ REST_LINES_A = {
     
     "NII_1":5756.19,"HEI_3": 5877.252,
     
-    "NII_2":6549.86,"HALPHA": 6564.608,"NII_3":6585.27, "SII_1": 6718.295, "SII_2": 6732.674,
+    "NII_2":6549.86,"HALPHA": 6564.608,"NII_3":6585.27,"HEI_4": 6679.9956, "SII_1": 6718.295, "SII_2": 6732.674,
 }
 
 # ============================================================
@@ -95,6 +94,20 @@ def _lyman_cut_um(z: float, which: str | None = "lya") -> float:
         return -np.inf
     lam_rest_A = 1215.67 if str(which).lower() == "lya" else 912.0
     return lam_rest_A * (1.0 + z) / 1e4  # µm
+
+def _lines_in_range(z, lam_obs_um, lines=None, margin_um=0.02):
+    """
+    Return the subset of `lines` (or all REST_LINES_A if None) whose
+    observed centres fall within the provided wavelength array (±margin).
+    """
+    lo, hi = np.nanmin(lam_obs_um), np.nanmax(lam_obs_um)
+    pool = REST_LINES_A if lines is None else {k: REST_LINES_A[k] for k in lines}
+    keep = []
+    for nm, lam0_A in pool.items():
+        mu_um = lam0_A * (1.0 + z) / 1e4
+        if (lo - margin_um) <= mu_um <= (hi + margin_um):
+            keep.append(nm)
+    return keep
 
 def _pixel_edges_A(lam_A: np.ndarray):
     """Pixel edges in Å from a center-grid wavelength array in Å."""

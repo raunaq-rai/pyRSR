@@ -197,6 +197,7 @@ def plot_spectrum_basic(
         plt.show()
 
     return fig
+
 import numpy as np
 import matplotlib.pyplot as plt
 from adjustText import adjust_text
@@ -204,7 +205,30 @@ import numpy as np
 import matplotlib.pyplot as plt
 import numpy as np
 import matplotlib.pyplot as plt
+import numpy as np
+import matplotlib.pyplot as plt
 
+C_CGS = 2.99792458e10  # cm/s
+
+def fnu_uJy_to_flam(flux_uJy, lam_um):
+    """
+    Convert F_ν [µJy] at wavelength [µm] → F_λ [erg/s/cm²/Å].
+    """
+    lam_cm = np.asarray(lam_um, float) * 1e-4      # µm → cm
+    fnu_cgs = np.asarray(flux_uJy, float) * 1e-29  # µJy → erg/s/cm²/Hz
+    flam = fnu_cgs * C_CGS / (lam_cm**2)           # erg/s/cm²/cm
+    flam /= 1e8                                    # cm → Å
+    return flam
+
+
+def flam_to_fnu_uJy(flam, lam_um):
+    """
+    Convert F_λ [erg/s/cm²/Å] → F_ν [µJy].
+    """
+    lam_cm = np.asarray(lam_um, float) * 1e-4       # µm → cm
+    fnu_cgs = np.asarray(flam, float) * (lam_cm**2) / C_CGS * 1e8
+    flux_uJy = fnu_cgs * 1e29                      # erg/s/cm²/Hz → µJy
+    return flux_uJy
 
 
 def plot_spectrum_with_2d(
@@ -216,7 +240,7 @@ def plot_spectrum_with_2d(
     cont_uJy=None,
     title=None,
     xlim=None,
-    ylim=(-1,None),
+    ylim=(-1, None),
     color="#6a0dad",
     alpha=0.9,
     save_path=None,
@@ -227,18 +251,56 @@ def plot_spectrum_with_2d(
     cmap="plasma",
     vmin=None,
     vmax=None,
+    # --- new options ---
+    flux_space="fnu",   # "fnu" (µJy) or "flam" (erg/s/cm²/Å)
+    frame="obs",        # "obs" or "rest" (requires z)
 ):
-    lam_um = np.asarray(lam_um, float)
+    lam_um   = np.asarray(lam_um, float)
     flux_uJy = np.asarray(flux_uJy, float)
-    err_uJy = np.asarray(err_uJy, float) if err_uJy is not None else None
+    err_uJy  = np.asarray(err_uJy, float)  if err_uJy  is not None else None
+    model_uJy = np.asarray(model_uJy,float) if model_uJy is not None else None
+    cont_uJy  = np.asarray(cont_uJy,float)  if cont_uJy  is not None else None
 
-    # --- bin edges for 1D stairs ---
-    dlam = np.median(np.diff(lam_um))
-    edges_um = np.concatenate((
-        [lam_um[0] - dlam / 2],
-        0.5 * (lam_um[1:] + lam_um[:-1]),
-        [lam_um[-1] + dlam / 2]
+    if frame not in {"obs", "rest"}:
+        raise ValueError("frame must be 'obs' or 'rest'.")
+
+    # ----------------------------------------------------
+    # Wavelength frame (x-axis)
+    # ----------------------------------------------------
+    if frame == "rest":
+        if z is None:
+            raise ValueError("frame='rest' requested but z is None.")
+        lam_plot = lam_um / (1.0 + z)
+    else:
+        lam_plot = lam_um.copy()
+
+    # --- bin edges for 1D stairs (in chosen frame) ---
+    dlam = np.median(np.diff(lam_plot))
+    edges_plot = np.concatenate((
+        [lam_plot[0] - dlam / 2],
+        0.5 * (lam_plot[1:] + lam_plot[:-1]),
+        [lam_plot[-1] + dlam / 2]
     ))
+
+    # ----------------------------------------------------
+    # Flux space: Fν(µJy) vs Fλ(cgs)
+    # (inputs are always Fν in µJy)
+    # ----------------------------------------------------
+    flux_space = flux_space.lower()
+    if flux_space == "fnu":
+        flux_plot  = flux_uJy
+        err_plot   = err_uJy
+        model_plot = model_uJy
+        cont_plot  = cont_uJy
+        y_label = "Flux density [µJy]"
+    elif flux_space == "flam":
+        flux_plot  = fnu_uJy_to_flam(flux_uJy,  lam_um)
+        err_plot   = fnu_uJy_to_flam(err_uJy,   lam_um) if err_uJy  is not None else None
+        model_plot = fnu_uJy_to_flam(model_uJy, lam_um) if model_uJy is not None else None
+        cont_plot  = fnu_uJy_to_flam(cont_uJy,  lam_um) if cont_uJy  is not None else None
+        y_label = r"$F_\lambda$ [erg s$^{-1}$ cm$^{-2}$ Å$^{-1}$]"
+    else:
+        raise ValueError("flux_space must be 'fnu' or 'flam'.")
 
     # ----------------------------------------------------
     # Create figure layout
@@ -258,7 +320,10 @@ def plot_spectrum_with_2d(
     # ----------------------------------------------------
     if sci2d is not None:
         ny, nx = sci2d.shape
+
+        # wavelength grid for 2D (start in observed frame)
         lam2d = np.linspace(lam_um.min(), lam_um.max(), nx)
+        lam2d_plot = lam2d / (1.0 + z) if (frame == "rest" and z is not None) else lam2d
 
         # detect wavelength columns with no data
         col_is_empty = np.all(~np.isfinite(sci2d) | (np.abs(sci2d) < 1e-8), axis=0)
@@ -269,12 +334,12 @@ def plot_spectrum_with_2d(
         if len(valid_cols) > 1:
             i0, i1 = valid_cols[0], valid_cols[-1] + 1
             sci2d_valid = sci2d[:, i0:i1]
-            lam2d_valid = lam2d[i0:i1]
+            lam2d_valid = lam2d_plot[i0:i1]
             lam_valid_min, lam_valid_max = lam2d_valid[0], lam2d_valid[-1]
         else:
             sci2d_valid = sci2d
-            lam2d_valid = lam2d
-            lam_valid_min, lam_valid_max = lam_um.min(), lam_um.max()
+            lam2d_valid = lam2d_plot
+            lam_valid_min, lam_valid_max = lam2d_valid.min(), lam2d_valid.max()
 
         # build edges for valid wavelength region
         dlam2d = np.median(np.diff(lam2d_valid))
@@ -304,35 +369,51 @@ def plot_spectrum_with_2d(
         ax2d.set_xlim(lam_valid_min, lam_valid_max)
         ax1d_xlim = (lam_valid_min, lam_valid_max)
     else:
-        ax1d_xlim = (lam_um.min(), lam_um.max())
+        ax1d_xlim = (lam_plot.min(), lam_plot.max())
 
     # ----------------------------------------------------
     # --- Bottom panel: 1D spectrum ---
     # ----------------------------------------------------
-    if err_uJy is not None:
+    if err_plot is not None:
         ax1d.fill_between(
-            lam_um, flux_uJy - err_uJy, flux_uJy + err_uJy,
+            lam_plot, flux_plot - err_plot, flux_plot + err_plot,
             step="mid", color="grey", alpha=0.25, linewidth=0
         )
 
-    ax1d.stairs(flux_uJy, edges_um, color=color, lw=0.5, alpha=alpha, label="Data")
+    ax1d.stairs(flux_plot, edges_plot, color=color, lw=0.5, alpha=alpha, label="Data")
 
-    if cont_uJy is not None:
-        ax1d.stairs(cont_uJy, edges_um, color="b", ls="--", lw=0.5, label="Continuum")
-    if model_uJy is not None:
-        ax1d.stairs(model_uJy, edges_um, color="r", lw=0.5, label="Model")
+    if cont_plot is not None:
+        ax1d.stairs(cont_plot, edges_plot, color="b", ls="--", lw=0.5, label="Continuum")
+    if model_plot is not None:
+        ax1d.stairs(model_plot, edges_plot, color="r", lw=0.5, label="Model")
 
     ax1d.axhline(0, color="k", ls="--", lw=0.5, alpha=0.5)
-    ax1d.set_xlabel("Observed wavelength [µm]")
-    ax1d.set_ylabel("Flux density [µJy]")
 
-    # consistent limits
+    if frame == "rest":
+        ax1d.set_xlabel("Rest wavelength [µm]")
+    else:
+        ax1d.set_xlabel("Observed wavelength [µm]")
+    ax1d.set_ylabel(y_label)
+
+    # consistent x-limits
     if xlim is None:
         ax1d.set_xlim(*ax1d_xlim)
     else:
         ax1d.set_xlim(*xlim)
-    if ylim:
-        ax1d.set_ylim(*ylim)
+
+    # Y-limits:
+    # - default (-1, None) is good for µJy
+    # - but *terrible* for Fλ, so ignore that default and autoscale for Fλ
+    ylim_use = None
+    if ylim is not None:
+        if isinstance(ylim, (tuple, list)):
+            if not (flux_space == "flam" and tuple(ylim) == (-1, None)):
+                ylim_use = ylim
+        else:
+            ylim_use = ylim
+
+    if ylim_use is not None:
+        ax1d.set_ylim(*ylim_use)
 
     ax1d.legend(fontsize=8, frameon=False, ncol=3)
     ax1d.grid(alpha=0.25, linestyle=":", linewidth=0.5)
@@ -342,13 +423,31 @@ def plot_spectrum_with_2d(
     # --- Annotate emission lines ---
     # ----------------------------------------------------
     if annotate_lines and z is not None:
-        annotate_lines_no_overlap(ax1d, z, *ax1d.get_xlim(), fontsize=fontsize)
-        if sci2d is not None:
-            rest_waves_A = np.array(list(REST_LINES_A.values()))
-            obs_um = rest_waves_A * (1 + z) / 1e4
-            mask = (obs_um > ax1d_xlim[0]) & (obs_um < ax1d_xlim[1])
-            for x in obs_um[mask]:
-                ax2d.axvline(x, color="white", lw=0.4, ls=":", alpha=1, zorder=5)
+        if frame == "obs":
+            # original behaviour: annotate at observed wavelengths
+            annotate_lines_no_overlap(ax1d, z, *ax1d.get_xlim(), fontsize=fontsize)
+            if sci2d is not None:
+                rest_waves_A = np.array(list(REST_LINES_A.values()))
+                obs_um = rest_waves_A * (1 + z) / 1e4
+                mask = (obs_um > ax1d_xlim[0]) & (obs_um < ax1d_xlim[1])
+                for x in obs_um[mask]:
+                    ax2d.axvline(x, color="white", lw=0.4, ls=":", alpha=1, zorder=5)
+        else:
+            # rest-frame annotation at rest wavelengths
+            x_min, x_max = ax1d.get_xlim()
+            for name, lam_rest_A in REST_LINES_A.items():
+                lam_rest_um = lam_rest_A / 1e4
+                if not (x_min < lam_rest_um < x_max):
+                    continue
+                ax1d.axvline(lam_rest_um, color="k", lw=0.4, ls=":", alpha=0.5)
+                ax1d.text(
+                    lam_rest_um, 0.98, name, rotation=90,
+                    va="top", ha="center",
+                    transform=ax1d.get_xaxis_transform(),
+                    fontsize=fontsize,
+                )
+                if sci2d is not None:
+                    ax2d.axvline(lam_rest_um, color="white", lw=0.4, ls=":", alpha=1, zorder=5)
 
     # ----------------------------------------------------
     # --- Title and save ---
