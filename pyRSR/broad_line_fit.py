@@ -84,6 +84,9 @@ REST_LINES_A: Dict[str, float] = {
 # Broad Balmer aliases (same rest λ, but allowed much larger σ)
 REST_LINES_A["HBETA_BROAD"] = REST_LINES_A["HBETA"]
 REST_LINES_A["HALPHA_BROAD"] = REST_LINES_A["HALPHA"]
+# Second broad Hα component (same rest λ)
+REST_LINES_A["HALPHA_BROAD2"] = REST_LINES_A["HALPHA"]
+
 
 # Max broad Balmer width: FWHM ≈ 0.05 µm  →  σ ≈ 0.021 µm ≈ 2.1×10² Å
 MAX_BROAD_FWHM_UM = 0.02
@@ -401,6 +404,7 @@ def _prune_lines_without_data(
     sigma_gr_log = np.array([sigma_grating_logA(grating, mu_um) for mu_um in expected_um])
     sigmaA_inst  = expected_um * 1e4 * LN10 * sigma_gr_log
     sigma_um_inst = sigmaA_inst / 1e4
+    
 
     finite = np.isfinite(resid_fit) & np.isfinite(sig_fit) & (sig_fit > 0)
     keep: List[bool] = []
@@ -666,7 +670,8 @@ def _fit_emission_system(
     # Widen σ bounds + seeds for explicitly broad components,
     # but *cap* the width so FWHM ≲ MAX_BROAD_FWHM_UM.
     for j, nm in enumerate(which_lines):
-        if nm.endswith("_BROAD"):
+        if "BROAD" in nm:
+
             # Lower bound: still enforce “broader than narrow”
             sigmaA_lo[j] = np.maximum(sigmaA_lo[j], 3.0 * sigmaA_inst[j])
 
@@ -990,18 +995,24 @@ def excels_fit_poly_broad(
     force_lines: Optional[List[str]] = None,
     bic_delta_prefer: float = 0.0,
     snr_broad_threshold: float = 5.0,
-    broad_mode: str = "auto",   # <--- NEW
+    broad_mode: str = "auto",
 ):
     """
-    Fit emission lines with optional broad Balmer components.
+    Fit the Hα + [N II] complex with optional *two* broad Hα components.
+
+    Models compared (via BIC):
+        M0: NII_2 + HALPHA + NII_3 (all narrow)
+        M1: M0 + HALPHA_BROAD
+        M2: M1 + HALPHA_BROAD2
 
     broad_mode:
-        "auto"  -> (default) fit narrow-only and (if SNR high enough) narrow+broad,
-                    compare BIC and keep the better model.
-        "off"   -> never fit broad components; narrow-only model.
-        "force" -> always include broad Balmer components (for any Balmer line
-                    that is detected), regardless of BIC; still return both
-                    BIC_narrow and BIC_broad for diagnostics.
+        "auto"  -> (default) try M0, M1, M2 and keep the model with the lowest
+                   BIC, optionally requiring an improvement of at least
+                   `bic_delta_prefer` over the narrow-only model.
+        "off"   -> only fit the narrow-only model M0.
+        "force" -> always use the most complex model that successfully fits
+                   (preferring 2-broad, then 1-broad, then narrow-only),
+                   ignoring BIC for the final choice.
     """
     if broad_mode not in {"auto", "off", "force"}:
         raise ValueError(f"broad_mode must be 'auto', 'off' or 'force', got {broad_mode!r}")
@@ -1049,136 +1060,197 @@ def excels_fit_poly_broad(
     resid_full   = flam - Fcont
     sig_flam_fit = rescale_uncertainties(resid_full, sig_flam)
 
-    # --- Fit window ---
+    # --- Default fit window: Hα + [N II] only, if not supplied ---
+    if fit_window_um is None:
+        ha_triplet_rest = [REST_LINES_A["NII_2"], REST_LINES_A["HALPHA"], REST_LINES_A["NII_3"]]
+        fit_window_um = _window_from_lines_um(ha_triplet_rest, z, pad_A=150.0)
+
     if fit_window_um:
         lo, hi = fit_window_um
         w = (lam_um >= lo) & (lam_um <= hi)
         lam_fit, resid_fit, sig_fit, Fcont_fit = lam_um[w], resid_full[w], sig_flam_fit[w], Fcont[w]
     else:
         lam_fit, resid_fit, sig_fit, Fcont_fit = lam_um, resid_full, sig_flam_fit, Fcont
+        lo, hi = lam_um[0], lam_um[-1]
 
-    # --- Lines in coverage (narrow-only set) ---
-    which_lines_auto = _lines_in_range(z, lam_fit, lines_to_use, margin_um=0.02)
+    # --- Lines in coverage (narrow-only set, restricted to Hα+[N II]) ---
+    if lines_to_use is None:
+        candidate_lines = ["NII_2", "HALPHA", "NII_3"]
+    else:
+        allowed = {"NII_2", "HALPHA", "NII_3"}
+        candidate_lines = [ln for ln in lines_to_use if ln in allowed] or ["NII_2", "HALPHA", "NII_3"]
+
+    which_lines_auto = _lines_in_range(z, lam_fit, candidate_lines, margin_um=0.02)
     which_lines_auto, _keep_mask = _prune_lines_without_data(
         lam_fit, resid_fit, sig_fit, which_lines_auto, z, grating,
         min_pts_per_line=3, window_sigma=4.0, window_um=None,
         verbose=bool(verbose),
     )
     if not which_lines_auto:
-        raise ValueError("No emission lines with local data in the fit window.")
+        raise ValueError("No emission lines with local data in the Hα+[N II] fit window.")
 
-    # --- If force_lines is given (bootstrap), bypass BIC logic ---
-    # --- Lines in coverage (narrow-only set) ---
-    which_lines_auto = _lines_in_range(z, lam_fit, lines_to_use, margin_um=0.02)
-    which_lines_auto, _keep_mask = _prune_lines_without_data(
-        lam_fit, resid_fit, sig_fit, which_lines_auto, z, grating,
-        min_pts_per_line=3, window_sigma=4.0, window_um=None,
-        verbose=bool(verbose),
-    )
-    if not which_lines_auto:
-        raise ValueError("No emission lines with local data in the fit window.")
-
-    # --- If force_lines is given (bootstrap), bypass BIC logic and broad_mode ---
+    # ------------------------------------------------------------------
+    # Model selection:
+    #   force_lines -> fixed list, no BIC switching
+    #   otherwise   -> narrow-only vs 1-broad vs 2-broad
+    # ------------------------------------------------------------------
     if force_lines is not None:
         which_lines = list(force_lines)
-        fit_narrow = _fit_emission_system(
+        fit_best = _fit_emission_system(
             lam_fit, resid_fit, sig_fit, Fcont_fit,
             z, grating, which_lines,
             absorption_corrections=absorption_corrections,
-            verbose=False
+            verbose=False,
         )
-        fit_best   = fit_narrow
-        fit_broad  = None
-        BIC_narrow = fit_narrow["BIC"]
-        BIC_broad  = np.nan
+
+        res             = fit_best["res"]
+        model_flam_win  = fit_best["model_flam"]
+        profiles_win    = fit_best["profiles"]
+        centers         = fit_best["centers"]
+        per_line        = fit_best["per_line"]
+        which_lines_out = fit_best["which_lines"]
+
+        BIC_best   = fit_best["BIC"]
+        BIC_narrow = BIC_best
+        BIC_1broad = np.nan
+        BIC_2broad = np.nan
+        broad_choice = "forced"
 
     else:
-        # -------- Base narrow-only fit --------
+        # -------- Base narrow-only (M0) --------
         which_lines = which_lines_auto
         fit_narrow = _fit_emission_system(
             lam_fit, resid_fit, sig_fit, Fcont_fit,
             z, grating, which_lines,
             absorption_corrections=absorption_corrections,
-            verbose=verbose
+            verbose=verbose,
         )
         BIC_narrow = fit_narrow["BIC"]
-        fit_broad  = None
-        BIC_broad  = np.nan
 
-        # --- broad_mode = "off": stop here ---
+        fit_1broad = None
+        fit_2broad = None
+        BIC_1broad = np.nan
+        BIC_2broad = np.nan
+        broad_choice = "none"
+
         if broad_mode == "off":
             if verbose:
-                print("broad_mode='off' → using narrow-only fit.")
+                print("broad_mode='off' → narrow-only Hα+[N II] model.")
             fit_best = fit_narrow
+            BIC_best = BIC_narrow
 
         else:
-            # Decide which Balmer lines are eligible for broad components
-            if broad_mode == "force":
-                # any Balmer line that was fitted at all
-                broad_base = [nm for nm in ("HBETA", "HALPHA")
-                              if nm in fit_narrow["per_line"]]
-            else:  # broad_mode == "auto"
-                broad_base = []
-                for nm in ("HBETA", "HALPHA"):
-                    if nm in fit_narrow["per_line"]:
-                        snr_nm = fit_narrow["per_line"][nm].get("SNR", 0.0)
-                        if snr_nm >= snr_broad_threshold:
-                            broad_base.append(nm)
+            # Require a reasonably detected narrow Hα unless broad_mode='force'
+            ha_info = fit_narrow["per_line"].get("HALPHA", None)
+            ha_snr  = ha_info.get("SNR", 0.0) if ha_info is not None else 0.0
+            eligible = (ha_info is not None) and np.isfinite(ha_snr)
 
-            if broad_base:
-                # build extended line list with *_BROAD twins
-                which_lines_broad = list(which_lines)
-                for nm in broad_base:
-                    bname = nm + "_BROAD"
-                    REST_LINES_A.setdefault(bname, REST_LINES_A[nm])
-                    if bname not in which_lines_broad:
-                        which_lines_broad.append(bname)
-
-                fit_broad = _fit_emission_system(
-                    lam_fit, resid_fit, sig_fit, Fcont_fit,
-                    z, grating, which_lines_broad,
-                    absorption_corrections=absorption_corrections,
-                    verbose=verbose
-                )
-                BIC_broad = fit_broad["BIC"]
-
-                if broad_mode == "force":
-                    # Always use broad model, regardless of BIC
-                    if verbose:
-                        print(f"broad_mode='force' → using broad Balmer model "
-                              f"(BIC_narrow={BIC_narrow:.2f}, BIC_broad={BIC_broad:.2f})")
-                    fit_best = fit_broad
-
-                else:  # broad_mode == "auto" → compare BIC
-                    if BIC_broad + bic_delta_prefer < BIC_narrow:
-                        if verbose:
-                            print(f"Using broad Balmer model: "
-                                  f"BIC_broad={BIC_broad:.2f} < BIC_narrow={BIC_narrow:.2f}")
-                        fit_best = fit_broad
-                    else:
-                        if verbose:
-                            print(f"Keeping narrow-only model: "
-                                  f"BIC_narrow={BIC_narrow:.2f} <= BIC_broad={BIC_broad:.2f}")
-                        fit_best = fit_narrow
-            else:
-                # no eligible broad Balmer lines -> narrow only
-                if verbose and broad_mode != "off":
-                    print("No Balmer lines above SNR threshold for broad component.")
+            if (broad_mode == "auto") and (not eligible or ha_snr < snr_broad_threshold):
+                if verbose:
+                    print(f"No strong Hα line (SNR={ha_snr:.1f}) → staying narrow-only.")
                 fit_best = fit_narrow
+                BIC_best = BIC_narrow
+            else:
+                # -------- Try 1-broad (M1) and 2-broad (M2) --------
+                def _safe_fit(which, label):
+                    try:
+                        fb = _fit_emission_system(
+                            lam_fit, resid_fit, sig_fit, Fcont_fit,
+                            z, grating, which,
+                            absorption_corrections=absorption_corrections,
+                            verbose=verbose,
+                        )
+                        return fb, fb["BIC"]
+                    except Exception as e:
+                        if verbose:
+                            print(f"{label} model failed: {e}")
+                        return None, np.nan
 
+                # M1 = narrow set + HALPHA_BROAD
+                which_1 = list(which_lines)
+                if "HALPHA_BROAD" not in which_1:
+                    which_1.append("HALPHA_BROAD")
+                fit_1broad, BIC_1broad = _safe_fit(which_1, "1-broad Hα")
 
-    # --- Unpack best fit ---
-    res             = fit_best["res"]
-    model_flam_win  = fit_best["model_flam"]
-    profiles_win    = fit_best["profiles"]
-    centers         = fit_best["centers"]
-    per_line        = fit_best["per_line"]
-    which_lines_out = fit_best["which_lines"]
-    BIC_best        = fit_best["BIC"]
-    BIC_narrow      = fit_narrow["BIC"]
-    BIC_broad       = fit_broad["BIC"] if fit_broad is not None else np.nan
+                # M2 = M1 + HALPHA_BROAD2
+                which_2 = list(which_1)
+                if "HALPHA_BROAD2" not in which_2:
+                    which_2.append("HALPHA_BROAD2")
+                fit_2broad, BIC_2broad = _safe_fit(which_2, "2-broad Hα")
 
-    # --- Plot ---
+                # Collect viable candidates
+                candidates = [(BIC_narrow, "none", fit_narrow)]
+                if fit_1broad is not None and np.isfinite(BIC_1broad):
+                    candidates.append((BIC_1broad, "one", fit_1broad))
+                if fit_2broad is not None and np.isfinite(BIC_2broad):
+                    candidates.append((BIC_2broad, "two", fit_2broad))
+
+                # If only narrow succeeded, we're done
+                if len(candidates) == 1:
+                    fit_best = fit_narrow
+                    broad_choice = "none"
+                    BIC_best = BIC_narrow
+                else:
+                    if broad_mode == "force":
+                        # In 'force' mode choose the *most complex* model that worked
+                        if fit_2broad is not None and np.isfinite(BIC_2broad):
+                            fit_best = fit_2broad
+                            broad_choice = "two"
+                            BIC_best = BIC_2broad
+                        elif fit_1broad is not None and np.isfinite(BIC_1broad):
+                            fit_best = fit_1broad
+                            broad_choice = "one"
+                            BIC_best = BIC_1broad
+                        else:
+                            fit_best = fit_narrow
+                            broad_choice = "none"
+                            BIC_best = BIC_narrow
+                    else:
+                        # 'auto' mode: choose lowest-BIC model, but require
+                        # an improvement of at least bic_delta_prefer over narrow-only.
+                        BIC_vals = [c[0] for c in candidates]
+                        i_best = int(np.argmin(BIC_vals))
+                        BIC_best, broad_choice, fit_best = candidates[i_best]
+
+                        if broad_choice != "none":
+                            if (not np.isfinite(BIC_narrow)) or (BIC_best + bic_delta_prefer >= BIC_narrow):
+                                if verbose:
+                                    print("Broad models do not improve BIC sufficiently → reverting to narrow-only.")
+                                fit_best = fit_narrow
+                                broad_choice = "none"
+                                BIC_best = BIC_narrow
+
+                if verbose:
+                    print("Hα+[N II] BIC comparison:")
+                    print(f"  narrow-only : BIC = {BIC_narrow:.2f}")
+                    if np.isfinite(BIC_1broad):
+                        print(f"  +1 broad Hα: BIC = {BIC_1broad:.2f}")
+                    else:
+                        print("  +1 broad Hα: (fit failed)")
+                    if np.isfinite(BIC_2broad):
+                        print(f"  +2 broad Hα: BIC = {BIC_2broad:.2f}")
+                    else:
+                        print("  +2 broad Hα: (fit failed)")
+                    print(f"  → selected model: {broad_choice!r}")
+
+        # Unpack best (non-force) fit
+        res             = fit_best["res"]
+        model_flam_win  = fit_best["model_flam"]
+        profiles_win    = fit_best["profiles"]
+        centers         = fit_best["centers"]
+        per_line        = fit_best["per_line"]
+        which_lines_out = fit_best["which_lines"]
+
+    # For convenience keep a "best broad" BIC (min of the two, or NaN)
+    if np.isfinite(BIC_1broad) or np.isfinite(BIC_2broad):
+        finite_bics = [b for b in (BIC_1broad, BIC_2broad) if np.isfinite(b)]
+        BIC_broad = min(finite_bics) if finite_bics else np.nan
+    else:
+        BIC_broad = np.nan
+
+    # ------------------------------------------------------------------
+    # Plotting
+    # ------------------------------------------------------------------
     if plot:
         if fit_window_um:
             model_full = np.zeros_like(lam_um)
@@ -1209,48 +1281,61 @@ def excels_fit_poly_broad(
         ax1.stairs(cont_uJy, edges_um, label=f'Continuum (deg={deg})',
                    color='b', linestyle='--', linewidth=1.0)
         ax1.stairs(model_uJy, edges_um, label='Continuum + Lines',
-                   color='r', linewidth=1.2)
+           
 
-        # Overplot Balmer components in µJy (continuum + line)
+ color='r', linewidth=1.2)
+
+        # Overplot Hα+[N II] narrow components + up to two broad Hα in µJy
         narrow_color = "tab:green"
         broad_color  = "tab:purple"
 
-        for base_name in ("HBETA", "HALPHA"):
-            n_name = base_name
-            b_name = base_name + "_BROAD"
+        cont_fit_flam = Fcont_fit
 
-            # continuum on the fit grid
-            cont_fit_flam = Fcont_fit
-
-            if n_name in profiles_win:
-                comp_n_flam = cont_fit_flam + profiles_win[n_name]
-                comp_n_uJy  = flam_to_fnu_uJy(comp_n_flam, lam_fit)
+        for nm, pretty in [
+            ("NII_2", "[N II]6549 narrow"),
+            ("HALPHA", "Hα narrow"),
+            ("NII_3", "[N II]6585 narrow"),
+        ]:
+            if nm in profiles_win:
+                comp_flam = cont_fit_flam + profiles_win[nm]
+                comp_uJy  = flam_to_fnu_uJy(comp_flam, lam_fit)
                 ax1.plot(
                     lam_fit,
-                    comp_n_uJy,
+                    comp_uJy,
                     color=narrow_color,
                     lw=1.0,
                     alpha=0.9,
-                    label=f"{base_name} narrow (lines)",
+                    label=pretty,
                 )
 
-            if b_name in profiles_win:
-                comp_b_flam = cont_fit_flam + profiles_win[b_name]
-                comp_b_uJy  = flam_to_fnu_uJy(comp_b_flam, lam_fit)
-                ax1.plot(
-                    lam_fit,
-                    comp_b_uJy,
-                    color=broad_color,
-                    lw=1.0,
-                    alpha=0.9,
-                    linestyle="--",
-                    label=f"{base_name} broad (lines)",
-                )
-
+        if "HALPHA_BROAD" in profiles_win:
+            comp_b1_flam = cont_fit_flam + profiles_win["HALPHA_BROAD"]
+            comp_b1_uJy  = flam_to_fnu_uJy(comp_b1_flam, lam_fit)
+            ax1.plot(
+                lam_fit,
+                comp_b1_uJy,
+                color=broad_color,
+                lw=1.0,
+                alpha=0.9,
+                linestyle="--",
+                label="Hα broad 1",
+            )
+        if "HALPHA_BROAD2" in profiles_win:
+            comp_b2_flam = cont_fit_flam + profiles_win["HALPHA_BROAD2"]
+            comp_b2_uJy  = flam_to_fnu_uJy(comp_b2_flam, lam_fit)
+            ax1.plot(
+                lam_fit,
+                comp_b2_uJy,
+                color=broad_color,
+                lw=1.0,
+                alpha=0.9,
+                linestyle=":",
+                label="Hα broad 2",
+            )
 
         ax1.set_ylabel('Flux density [µJy]')
         ax1.legend(ncol=3, fontsize=9, frameon=False)
-        _annotate_lines(ax1, which_lines_out, z, per_line=per_line, min_dx_um=0.01)
+        _annotate_lines(ax1, which_lines_out, z, per_line=per_line, min_dx_um=0.005)
 
         # --- F_lambda panel ---
         data_flam = flam
@@ -1266,48 +1351,52 @@ def excels_fit_poly_broad(
         ax2.stairs(total_model_flam, edges_um, label='Model (Fλ)',
                    color='r', linewidth=1.2)
 
-        # Overplot Balmer narrow vs broad components (Fλ) as continuum + line
-        narrow_color = "tab:green"
-        broad_color  = "tab:purple"
-
-        for base_name in ("HBETA", "HALPHA"):
-            n_name = base_name
-            b_name = base_name + "_BROAD"
-
-            cont_fit_flam = Fcont_fit
-
-            if n_name in profiles_win:
-                comp_n_flam = cont_fit_flam + profiles_win[n_name]
+        for nm, pretty in [
+            ("NII_2", "[N II]6549 narrow"),
+            ("HALPHA", "Hα narrow"),
+            ("NII_3", "[N II]6585 narrow"),
+        ]:
+            if nm in profiles_win:
+                comp_flam = cont_fit_flam + profiles_win[nm]
                 ax2.plot(
                     lam_fit,
-                    comp_n_flam,
+                    comp_flam,
                     color=narrow_color,
                     lw=1.0,
                     alpha=0.9,
-                    label=f"{base_name} narrow",
+                    label=pretty,
                 )
 
-            if b_name in profiles_win:
-                comp_b_flam = cont_fit_flam + profiles_win[b_name]
-                ax2.plot(
-                    lam_fit,
-                    comp_b_flam,
-                    color=broad_color,
-                    lw=1.0,
-                    alpha=0.9,
-                    linestyle="--",
-                    label=f"{base_name} broad",
-                )
-
+        if "HALPHA_BROAD" in profiles_win:
+            comp_b1_flam = cont_fit_flam + profiles_win["HALPHA_BROAD"]
+            ax2.plot(
+                lam_fit,
+                comp_b1_flam,
+                color=broad_color,
+                lw=1.0,
+                alpha=0.9,
+                linestyle="--",
+                label="Hα broad 1",
+            )
+        if "HALPHA_BROAD2" in profiles_win:
+            comp_b2_flam = cont_fit_flam + profiles_win["HALPHA_BROAD2"]
+            ax2.plot(
+                lam_fit,
+                comp_b2_flam,
+                color=broad_color,
+                lw=1.0,
+                alpha=0.9,
+                linestyle=":",
+                label="Hα broad 2",
+            )
 
         ax2.set_ylabel(r'$F_\lambda$ [erg s$^{-1}$ cm$^{-2}$ Å$^{-1}$]')
         ax2.set_xlabel('Observed wavelength [µm]')
         ax2.legend(ncol=3, fontsize=9, frameon=False)
-        _annotate_lines(ax2, which_lines_out, z, per_line=per_line, min_dx_um=0.01)
+        _annotate_lines(ax2, which_lines_out, z, per_line=per_line, min_dx_um=0.005)
 
         plt.tight_layout()
         plt.show()
-
 
     return dict(
         success=res.success,
@@ -1320,8 +1409,12 @@ def excels_fit_poly_broad(
         BIC=BIC_best,
         BIC_narrow=BIC_narrow,
         BIC_broad=BIC_broad,
-        profiles_window_flam=profiles_win,   # <--- NEW
+        BIC_1broad=BIC_1broad,
+        BIC_2broad=BIC_2broad,
+        broad_choice=broad_choice,
+        profiles_window_flam=profiles_win,
     )
+
 
 
 
@@ -1444,7 +1537,17 @@ def bootstrap_excels_fit_broad(
         lo, hi = fit_window_um
         wfit = (lam_um >= lo) & (lam_um <= hi)
     else:
-        wfit = slice(None)
+        # Derive window from the base fit's lam_fit
+        lam_fit_base = np.asarray(base.get("lam_fit", lam_um), float)
+
+        # If the base fit used the full grid, keep the old behaviour
+        if (lam_fit_base.size == lam_um.size) and np.allclose(lam_fit_base, lam_um, rtol=0, atol=0):
+            wfit = slice(None)
+        else:
+            lo = float(np.min(lam_fit_base))
+            hi = float(np.max(lam_fit_base))
+            wfit = (lam_um >= lo) & (lam_um <= hi)
+
 
     rng = (random_state if isinstance(random_state, np.random.Generator)
            else np.random.default_rng(random_state))
