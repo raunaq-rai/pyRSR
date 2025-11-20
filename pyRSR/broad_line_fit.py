@@ -949,9 +949,8 @@ def _fit_emission_system(
 
     # Factors (in σ_v space) relative to the *narrow* component.
     # i.e. σ_v(broad1) ≈ FACT_B1["seed"] × σ_v(narrow), etc.
-    FACT_B1 = dict(lo=1, seed=2.0, hi=4.0)   # “intermediate” broad
-    FACT_B2 = dict(lo=1.0, seed=2.5, hi=3.5) 
-
+    FACT_B1 = dict(lo=1.5, seed=3.0, hi=5.0)   # “intermediate” broad
+    FACT_B2 = dict(lo=4.0, seed=7.0, hi=12.0)  # “very” broad
 
     # Start with instrument-based bounds for everyone
     sigmaA_lo   = np.array(sigmaA_lo,  float)
@@ -1060,23 +1059,22 @@ def _fit_emission_system(
         #
         # For area-normalised Gaussians, peak_j ∝ flux_fraction_j, so set:
         r1 = 0.25  # desired peak(BROAD1) / peak(narrow)
-        r2 = 0.005 # desired peak(BROAD2) / peak(narrow) -- vanishingly low for wings
+        r2 = 0.10  # desired peak(BROAD2) / peak(narrow)
 
-        f_narrow = 1.0 / (1.0 + r1 + r2)
-        f_b1     = r1 * f_narrow
-        f_b2     = r2 * f_narrow
+        f_narrow = 1.0 / (1.0 + r1 + r2)   # ≈ 0.7407
+        f_b1     = r1 * f_narrow          # ≈ 0.1852
+        f_b2     = r2 * f_narrow          # ≈ 0.0741
 
         nm = which_lines[j]
 
         if "BROAD2" in nm:
             flux_fraction = f_b2
-            # very broad wings — keep the integrated flux cap very tight
-            # to force it to be a low-amplitude wing component
-            A_multiplier = 0.05
+            # very broad wings — keep the integrated flux cap modest
+            A_multiplier = 10.0  # tweak if you want broader allowed wings
         elif "BROAD" in nm:
             flux_fraction = f_b1
             # intermediate broad component
-            A_multiplier = 20.0
+            A_multiplier = 40.0
         else:
             flux_fraction = f_narrow
             A_multiplier = 150.0
@@ -1087,17 +1085,12 @@ def _fit_emission_system(
         A0.append(A_seed)
 
 
-        # Upper bound on integrated flux (area) for this Gaussian.
-        # For BROAD2, we use sigmaA_lo (min width) to calculate the area limit.
-        # This guarantees that P_fit <= P_limit * (sigma_lo / sigma_fit) <= P_limit.
-        # This prevents the optimizer from trading width for height.
-        if "BROAD2" in nm:
-            width_for_limit = sigmaA_lo[j]
-        else:
-            # For others, be permissive and use the max width
-            width_for_limit = np.maximum(sigmaA_hi[j], sigmaA_seed[j])
-
-        A_upper = A_multiplier * max(peak_flam, 3.0 * rms_flam) * SQRT2PI * width_for_limit
+        # Upper bound on integrated flux (area) for this Gaussian. BROAD2 is
+        # intentionally capped more tightly to prevent the wings from absorbing
+        # most of the flux during optimisation.
+        A_upper = A_multiplier * max(peak_flam, 3.0 * rms_flam) * SQRT2PI * np.maximum(
+            sigmaA_hi[j], sigmaA_seed[j]
+        )
         A_hi.append(A_upper)
 
     A0 = np.asarray(A0, float)
@@ -1164,9 +1157,38 @@ def _fit_emission_system(
     A_fit = np.asarray(res.x[:nL], float)
 
     # --- fluxes & EWs using the standard helpers (same as excels_fit_poly) ---
-    fluxes = measure_fluxes_profile_weighted(
+    # NOTE: For overlapping components (e.g., broad Hα spilling into NII),
+    # measure_fluxes_profile_weighted can double-count flux because it extracts
+    # from the data independently for each component.
+    # 
+    # Since our Gaussians are area-normalized in build_model_flam_linear,
+    # the fitted amplitudes A_fit[j] ARE the integrated line fluxes.
+    # We use measure_fluxes_profile_weighted only for uncertainty estimation.
+    
+    fluxes_mf = measure_fluxes_profile_weighted(
         lam_fit, resid_fit, sig_fit, model_flam_win, profiles_win, centers
     )
+    
+    # Build corrected fluxes dict using fitted amplitudes as the true fluxes
+    fluxes = {}
+    for j, name in enumerate(which_lines):
+        # Use fitted amplitude as the integrated flux (correct for overlapping components)
+        F_line_correct = A_fit[j]
+        
+        # Use matched-filter uncertainty estimate (still valid for noise estimation)
+        if name in fluxes_mf:
+            sigma_line = fluxes_mf[name].get("sigma_line", np.nan)
+            mask_idx = fluxes_mf[name].get("mask_idx", np.array([]))
+        else:
+            sigma_line = np.nan
+            mask_idx = np.array([])
+        
+        fluxes[name] = dict(
+            F_line=F_line_correct,
+            sigma_line=sigma_line,
+            mask_idx=mask_idx
+        )
+    
     ews = equivalent_widths_A(fluxes, lam_fit, Fcont_fit, z, centers)
 
     if absorption_corrections:
@@ -1888,54 +1910,63 @@ def excels_fit_poly_broad(
 
  color='r', linewidth=1.2)
 
-        # Overplot Hα+[N II] narrow components + up to two broad Hα in µJy
+        # --- Hα complex: stacked components in µJy (narrow + broad + broad2) ---
+
         narrow_color = "tab:blue"
         broad_color  = "tab:orange"
         broad_color2 = "tab:pink"
 
-        cont_fit_flam = Fcont_fit
+        # Window around the Hα+[N II] complex
+        rest_list = [REST_LINES_A["NII_2"], REST_LINES_A["H⍺"], REST_LINES_A["NII_3"]]
+        lo_ha, hi_ha = _window_from_lines_um(rest_list, z, pad_A=150.0)
+        m_ha = (lam_fit >= lo_ha) & (lam_fit <= hi_ha)
 
-        for nm, pretty in [
-            ("NII_2", "[N II]6549 narrow"),
-            ("H⍺", "Hα narrow"),
-            ("NII_3", "[N II]6585 narrow"),
-        ]:
-            if nm in profiles_win:
-                comp_flam = cont_fit_flam + profiles_win[nm]
-                comp_uJy  = flam_to_fnu_uJy(comp_flam, lam_fit)
-                ax1.plot(
-                    lam_fit,
-                    comp_uJy,
-                    color=narrow_color,
-                    lw=1.0,
-                    alpha=0.9,
-                    label=pretty,
+        if np.any(m_ha):
+            lam_ha      = lam_fit[m_ha]
+            cont_ha_flam = Fcont_fit[m_ha]
+
+            # emission-only contribution of each component in Fλ
+            em_narrow = np.zeros_like(lam_ha)
+            for nm in ("NII_2", "H⍺", "NII_3"):
+                if nm in profiles_win:
+                    em_narrow += profiles_win[nm][m_ha]
+
+            em_b1 = profiles_win.get("H⍺_BROAD",  np.zeros_like(lam_fit))[m_ha]
+            em_b2 = profiles_win.get("H⍺_BROAD2", np.zeros_like(lam_fit))[m_ha]
+
+            # successive baselines in Fλ
+            base_flam      = cont_ha_flam
+            top_narrow     = base_flam + em_narrow
+            top_narrow_b1  = top_narrow + em_b1
+            top_narrow_b12 = top_narrow_b1 + em_b2  # full Hα model
+
+            # convert each layer to µJy
+            base_uJy      = flam_to_fnu_uJy(base_flam,      lam_ha)
+            top_narrow_uJy = flam_to_fnu_uJy(top_narrow,    lam_ha)
+            top_b1_uJy     = flam_to_fnu_uJy(top_narrow_b1, lam_ha)
+            top_b2_uJy     = flam_to_fnu_uJy(top_narrow_b12, lam_ha)
+
+            # stacked areas: each layer *adds* to the previous one
+            ax1.fill_between(
+                lam_ha, base_uJy, top_narrow_uJy,
+                step="mid", color=narrow_color, alpha=0.35,
+                label="Hα+[N II] narrow",
+            )
+
+            if np.any(np.isfinite(em_b1)) and np.nanmax(np.abs(em_b1)) > 0:
+                ax1.fill_between(
+                    lam_ha, top_narrow_uJy, top_b1_uJy,
+                    step="mid", color=broad_color, alpha=0.25,
+                    label="Hα broad 1",
                 )
 
-        if "H⍺_BROAD" in profiles_win:
-            comp_b1_flam = cont_fit_flam + profiles_win["H⍺_BROAD"]
-            comp_b1_uJy  = flam_to_fnu_uJy(comp_b1_flam, lam_fit)
-            ax1.plot(
-                lam_fit,
-                comp_b1_uJy,
-                color=broad_color,
-                lw=1.0,
-                alpha=0.5,
-                linestyle="--",
-                label="Hα broad 1",
-            )
-        if "H⍺_BROAD2" in profiles_win:
-            comp_b2_flam = cont_fit_flam + profiles_win["H⍺_BROAD2"]
-            comp_b2_uJy  = flam_to_fnu_uJy(comp_b2_flam, lam_fit)
-            ax1.plot(
-                lam_fit,
-                comp_b2_uJy,
-                color=broad_color2,
-                lw=1.0,
-                alpha=0.5,
-                linestyle=":",
-                label="Hα broad 2",
-            )
+            if np.any(np.isfinite(em_b2)) and np.nanmax(np.abs(em_b2)) > 0:
+                ax1.fill_between(
+                    lam_ha, top_b1_uJy, top_b2_uJy,
+                    step="mid", color=broad_color2, alpha=0.20,
+                    label="Hα broad 2",
+                )
+
 
         ax1.set_ylabel('Flux density [µJy]')
         ax1.legend(ncol=3, fontsize=9, frameon=False)
@@ -1955,44 +1986,51 @@ def excels_fit_poly_broad(
         ax2.stairs(total_model_flam, edges_um, label='Model (Fλ)',
                    color='r', linewidth=1.2)
 
-        for nm, pretty in [
-            ("NII_2", "[N II]6549 narrow"),
-            ("H⍺", "Hα narrow"),
-            ("NII_3", "[N II]6585 narrow"),
-        ]:
-            if nm in profiles_win:
-                comp_flam = cont_fit_flam + profiles_win[nm]
-                ax2.plot(
-                    lam_fit,
-                    comp_flam,
-                    color=narrow_color,
-                    lw=1.0,
-                    alpha=0.9,
-                    label=pretty,
+        # --- Hα complex: stacked components in Fλ ---
+
+        cont_fit_flam = Fcont_fit  # continuum on lam_fit
+
+        rest_list = [REST_LINES_A["NII_2"], REST_LINES_A["H⍺"], REST_LINES_A["NII_3"]]
+        lo_ha, hi_ha = _window_from_lines_um(rest_list, z, pad_A=150.0)
+        m_ha = (lam_fit >= lo_ha) & (lam_fit <= hi_ha)
+
+        if np.any(m_ha):
+            lam_ha      = lam_fit[m_ha]
+            cont_ha_flam = cont_fit_flam[m_ha]
+
+            em_narrow = np.zeros_like(lam_ha)
+            for nm in ("NII_2", "H⍺", "NII_3"):
+                if nm in profiles_win:
+                    em_narrow += profiles_win[nm][m_ha]
+
+            em_b1 = profiles_win.get("H⍺_BROAD",  np.zeros_like(lam_fit))[m_ha]
+            em_b2 = profiles_win.get("H⍺_BROAD2", np.zeros_like(lam_fit))[m_ha]
+
+            base_flam      = cont_ha_flam
+            top_narrow     = base_flam + em_narrow
+            top_narrow_b1  = top_narrow + em_b1
+            top_narrow_b12 = top_narrow_b1 + em_b2
+
+            ax2.fill_between(
+                lam_ha, base_flam, top_narrow,
+                step="mid", color=narrow_color, alpha=0.35,
+                label="Hα+[N II] narrow",
+            )
+
+            if np.any(np.isfinite(em_b1)) and np.nanmax(np.abs(em_b1)) > 0:
+                ax2.fill_between(
+                    lam_ha, top_narrow, top_narrow_b1,
+                    step="mid", color=broad_color, alpha=0.25,
+                    label="Hα broad 1",
                 )
 
-        if "H⍺_BROAD" in profiles_win:
-            comp_b1_flam = cont_fit_flam + profiles_win["H⍺_BROAD"]
-            ax2.plot(
-                lam_fit,
-                comp_b1_flam,
-                color=broad_color,
-                lw=1.0,
-                alpha=0.9,
-                linestyle="--",
-                label="Hα broad 1",
-            )
-        if "H⍺_BROAD2" in profiles_win:
-            comp_b2_flam = cont_fit_flam + profiles_win["H⍺_BROAD2"]
-            ax2.plot(
-                lam_fit,
-                comp_b2_flam,
-                color=broad_color2,
-                lw=1.0,
-                alpha=0.9,
-                linestyle=":",
-                label="Hα broad 2",
-            )
+            if np.any(np.isfinite(em_b2)) and np.nanmax(np.abs(em_b2)) > 0:
+                ax2.fill_between(
+                    lam_ha, top_narrow_b1, top_narrow_b12,
+                    step="mid", color=broad_color2, alpha=0.20,
+                    label="Hα broad 2",
+                )
+
 
         ax2.set_ylabel(r'$F_\lambda$ [erg s$^{-1}$ cm$^{-2}$ Å$^{-1}$]')
         ax2.set_xlabel('Observed wavelength [µm]')
@@ -2312,6 +2350,64 @@ def bootstrap_excels_fit_broad(
         summary[ln]["SNR_peak_data"]  = {"value": vSNpkD, "err": eSNpkD, "text": f"{vSNpkD:.2f} ± {eSNpkD:.2f}"}
         summary[ln]["SNR_peak_model"] = {"value": vSNpkM, "err": eSNpkM, "text": f"{vSNpkM:.2f} ± {eSNpkM:.2f}"}
 
+    # -------- DIAGNOSTIC: Check flux conservation in Hα region --------
+    if verbose:
+        # Define Hα region (NII_2, H⍺, NII_3, and broad components)
+        ha_components = ["NII_2", "H⍺", "NII_3", "H⍺_BROAD", "H⍺_BROAD2"]
+        ha_in_fit = [ln for ln in ha_components if ln in which_lines]
+        
+        if ha_in_fit:
+            print("\n" + "="*70)
+            print("FLUX DIAGNOSTIC: Hα Region")
+            print("="*70)
+            
+            # Get Hα window
+            rest_list = [REST_LINES_A[nm] for nm in ["NII_2", "H⍺", "NII_3"] if nm in REST_LINES_A]
+            if rest_list:
+                lo_ha, hi_ha = _window_from_lines_um(rest_list, z, pad_A=150.0)
+                mask_ha = (lam_um >= lo_ha) & (lam_um <= hi_ha)
+                
+                if np.any(mask_ha):
+                    # Integrate total model flux in Hα window
+                    lam_ha_window = lam_um[mask_ha]
+                    
+                    # Get base fit model in this window
+                    base_model_flam = base.get("model_window_flam", np.zeros_like(lam_um))
+                    if isinstance(wfit, slice):
+                        model_in_window = base_model_flam
+                    else:
+                        model_in_window = np.zeros_like(lam_um)
+                        model_in_window[wfit] = base_model_flam
+                    
+                    model_ha = model_in_window[mask_ha]
+                    dlam_A = np.gradient(lam_ha_window * 1e4)
+                    
+                    total_model_flux = np.trapz(model_ha, lam_ha_window * 1e4)
+                    
+                    # Sum of individual component fluxes from base fit
+                    sum_component_flux = 0.0
+                    print(f"\nComponent fluxes in Hα region ({lo_ha:.4f} - {hi_ha:.4f} µm):")
+                    for ln in ha_in_fit:
+                        if ln in base_lines:
+                            F_comp = base_lines[ln].get("F_line", 0.0)
+                            sum_component_flux += F_comp
+                            print(f"  {ln:15s}: {F_comp:.3e} erg/s/cm²")
+                    
+                    print(f"\n{'Total (sum of components)':30s}: {sum_component_flux:.3e} erg/s/cm²")
+                    print(f"{'Total (integrated model)':30s}: {total_model_flux:.3e} erg/s/cm²")
+                    
+                    if abs(total_model_flux) > 1e-30:
+                        ratio = sum_component_flux / total_model_flux
+                        discrepancy = (ratio - 1.0) * 100
+                        print(f"{'Ratio (components/model)':30s}: {ratio:.4f}")
+                        print(f"{'Discrepancy':30s}: {discrepancy:+.2f}%")
+                        
+                        if abs(discrepancy) > 5:
+                            print(f"\n⚠️  WARNING: Component flux sum differs from model by {abs(discrepancy):.1f}%!")
+                            print("    This suggests flux measurement is double-counting overlapping components.")
+                    
+                    print("="*70 + "\n")
+
     # -------- plotting + optional saving --------
     if plot:
         # mean ± std (sigma-clipped) of total F_lambda model
@@ -2444,40 +2540,55 @@ def bootstrap_excels_fit_broad(
             cont_disp = cont[disp_mask]
             mu_disp   = mu[disp_mask]
 
-            # --- precompute component curves on base-fit grid, using bootstrap means ---
-            # Continuum on base-fit grid, then in correct unit
+            # --- continuum on base-fit grid (always in Fλ here) ---
             cont_fit_base = np.interp(lam_fit_base, lam_um, cont_flam)
-            if unit == "flam":
-                cont_base_unit = cont_fit_base
-            else:
-                cont_base_unit = flam_to_fnu_uJy(cont_fit_base, lam_fit_base)
 
-            # Colour for narrow vs broad components
+            # Colours for components
             narrow_color = "tab:blue"
             broad_color  = "tab:orange"
             broad_color2 = "tab:pink"
 
-            # Build dicts of continuum+line in plotting units from bootstrap samples
-            narrow_comp = {}
-            broad_comp  = {}
-            for nm in which_lines:
-                # line-only profile in F_lambda on lam_fit_base
-                prof_flam_mean = _mean_profile_from_boot(nm)
+            # --- build mean line profiles in Fλ on lam_fit_base ---
+            # IMPORTANT: We must ensure that sum of component means = mean of total model.
+            # To do this, we compute component profiles from the SAME bootstrap stack
+            # that was used to compute mu_flam.
+            
+            sum_narrow_flam = np.zeros_like(lam_fit_base)
+            sum_b1_flam     = np.zeros_like(lam_fit_base)
+            sum_b2_flam     = np.zeros_like(lam_fit_base)
+            has_b1 = False
+            has_b2 = False
 
-                # add continuum for plotting
-                comp_flam = cont_fit_base + prof_flam_mean
-                if unit == "flam":
-                    y = comp_flam
-                else:
-                    y = flam_to_fnu_uJy(comp_flam, lam_fit_base)
+            for nm in which_lines:
+                prof_flam_mean = _mean_profile_from_boot(nm)  # emission-only profile
 
                 if "BROAD" in nm:
-                    broad_comp[nm] = y
+                    if "BROAD2" in nm:
+                        sum_b2_flam += prof_flam_mean
+                        has_b2 = True
+                    else:
+                        sum_b1_flam += prof_flam_mean
+                        has_b1 = True
                 else:
-                    narrow_comp[nm] = y
+                    sum_narrow_flam += prof_flam_mean
 
+            # --- convert continuum + grouped components to the chosen plotting unit ---
+            if unit == "flam":
+                cont_base_unit       = cont_fit_base
+                narrow_tot_unit      = cont_fit_base + sum_narrow_flam
+                narrow_plus_b1_unit  = narrow_tot_unit + sum_b1_flam
+                full_unit            = narrow_plus_b1_unit + sum_b2_flam
+            else:
+                cont_base_unit       = flam_to_fnu_uJy(cont_fit_base, lam_fit_base)
+                narrow_tot_unit      = flam_to_fnu_uJy(cont_fit_base + sum_narrow_flam,
+                                                      lam_fit_base)
+                narrow_plus_b1_unit  = flam_to_fnu_uJy(cont_fit_base + sum_narrow_flam + sum_b1_flam,
+                                                      lam_fit_base)
+                full_unit            = flam_to_fnu_uJy(cont_fit_base + sum_narrow_flam +
+                                                       sum_b1_flam + sum_b2_flam,
+                                                      lam_fit_base)
 
-            # --- FULL PANEL ---
+            # --- FULL PANEL (data + stacked components) ---
             edges = _edges_median_spacing(lam_disp)
 
             # measurement error band
@@ -2499,70 +2610,64 @@ def bootstrap_excels_fit_broad(
                 label="Mean model"
             )
 
-            # Overlay components as smooth shaded regions (no lines)
-            narrow_label_done = False
-            broad_label_done  = False
-            broad2_label_done = False
-
-            # Pre-compute a fine grid over the full base-fit range
-            oversample = 6  # 5–10 is usually enough
+            # --- individual components on a fine grid (NOT stacked) ---
+            # This shows peak heights more clearly than stacked fills
+            oversample = 6
             lam_fine_full = np.linspace(
                 lam_fit_base.min(), lam_fit_base.max(),
                 max(lam_fit_base.size * oversample, 400)
             )
             cont_fine_full = np.interp(lam_fine_full, lam_fit_base, cont_base_unit)
-
-            # --- Narrow components: all non-BROAD lines ---
-            for i, (nm, comp_y) in enumerate(narrow_comp.items()):
-                label = None
-                if not narrow_label_done:
-                    label = "Narrow components"
-                    narrow_label_done = True
-
-                comp_fine = np.interp(lam_fine_full, lam_fit_base, comp_y)
-
+            
+            # Convert component sums to individual components
+            narrow_only_fine = np.interp(lam_fine_full, lam_fit_base, sum_narrow_flam)
+            b1_only_fine = np.interp(lam_fine_full, lam_fit_base, sum_b1_flam)
+            b2_only_fine = np.interp(lam_fine_full, lam_fit_base, sum_b2_flam)
+            
+            # Convert to plotting unit
+            if unit == "flam":
+                narrow_only_plot = narrow_only_fine
+                b1_only_plot = b1_only_fine
+                b2_only_plot = b2_only_fine
+            else:
+                narrow_only_plot = flam_to_fnu_uJy(narrow_only_fine, lam_fine_full)
+                b1_only_plot = flam_to_fnu_uJy(b1_only_fine, lam_fine_full)
+                b2_only_plot = flam_to_fnu_uJy(b2_only_fine, lam_fine_full)
+                
+            # Plot each component from continuum baseline (not stacked)
+            # This makes peak heights visually comparable
+            if np.nanmax(np.abs(narrow_only_plot)) > 0:
                 ax_full.fill_between(
                     lam_fine_full,
                     cont_fine_full,
-                    comp_fine,
+                    cont_fine_full + narrow_only_plot,
                     color=narrow_color,
-                    alpha=0.4,
-                    linewidth=1,
-                    linestyle="-",
-                    label=label,
+                    alpha=0.35,
+                    linewidth=0,
+                    label="Narrow components",
                 )
 
-            # --- Broad components: all *_BROAD* lines (HALPHA_BROAD, HALPHA_BROAD2, ...) ---
-            if has_broad_components_base:
-                for i, (nm, comp_y) in enumerate(broad_comp.items()):
-                    comp_fine = np.interp(lam_fine_full, lam_fit_base, comp_y)
-                    
-                    if "BROAD2" in nm:
-                        # Second broad component -> pink
-                        label = None
-                        if not broad2_label_done:
-                            label = "Broad component 2"
-                            broad2_label_done = True
-                        c_use = broad_color2
-                    else:
-                        # First broad component -> orange
-                        label = None
-                        if not broad_label_done:
-                            label = "Broad component 1"
-                            broad_label_done = True
-                        c_use = broad_color
-                    
-                    ax_full.fill_between(
-                        lam_fine_full,
-                        cont_fine_full,
-                        comp_fine,
-                        color=c_use,
-                        alpha=0.2,
-                        linewidth=0.2,
-                        linestyle="-",
-                        label=label,
-                    )
+            if has_b1 and np.nanmax(np.abs(b1_only_plot)) > 0:
+                ax_full.fill_between(
+                    lam_fine_full,
+                    cont_fine_full,
+                    cont_fine_full + b1_only_plot,
+                    color=broad_color,
+                    alpha=0.25,
+                    linewidth=0,
+                    label="Broad component 1",
+                )
 
+            if has_b2 and np.nanmax(np.abs(b2_only_plot)) > 0:
+                ax_full.fill_between(
+                    lam_fine_full,
+                    cont_fine_full,
+                    cont_fine_full + b2_only_plot,
+                    color=broad_color2,
+                    alpha=0.20,
+                    linewidth=0,
+                    label="Broad component 2",
+                )
 
             title_txt = f"{source_id}   (z = {z:.3f})" if source_id else f"z = {z:.3f}"
             ax_full.set_title(title_txt, fontsize=12, pad=8)
@@ -2573,7 +2678,6 @@ def bootstrap_excels_fit_broad(
             ax_full.grid(alpha=0.25, linestyle=":", linewidth=0.5)
             ax_full.tick_params(direction="in", top=True, right=True)
 
-            # NEW: horizontal labels, fixed offset above fitted model, no overlap with data
             _annotate_lines_above_model(
                 ax=ax_full,
                 lam=lam_disp,
@@ -2581,11 +2685,10 @@ def bootstrap_excels_fit_broad(
                 line_names=which_lines, # all fitted lines
                 z=z,
                 per_line=base["lines"],
-                label_offset_frac=0.06, # tweak if you want them closer/further
+                label_offset_frac=0.06,
                 x_margin_frac=0.01,
                 fontsize=8,
             )
-
 
             # --- ZOOM PANELS ---
             for ax, zd, show in zip(ax_z, zoom_defs, show_flags):
@@ -2616,53 +2719,56 @@ def bootstrap_excels_fit_broad(
                         lw=0.5, label="Mean model"
                     )
 
-                    # overlay narrow + broad components as smooth shaded regions
+                    # individual components (same logic, but restricted window)
                     mask_b = (lam_fit_base >= zd["lo"]) & (lam_fit_base <= zd["hi"])
                     if np.any(mask_b):
-                        lam_sub   = lam_fit_base[mask_b]
-                        cont_sub  = cont_base_unit[mask_b]
+                        lam_sub = lam_fit_base[mask_b]
+                        cont_sub_model = cont_base_unit[mask_b]
+                        
+                        # Get individual component profiles
+                        narrow_sub = sum_narrow_flam[mask_b]
+                        b1_sub = sum_b1_flam[mask_b]
+                        b2_sub = sum_b2_flam[mask_b]
 
-                        # Fine grid just for this zoom window
                         lam_fine = np.linspace(
                             lam_sub.min(), lam_sub.max(),
                             max(lam_sub.size * oversample, 200)
                         )
-                        cont_fine = np.interp(lam_fine, lam_sub, cont_sub)
+                        cont_fine = np.interp(lam_fine, lam_sub, cont_sub_model)
+                        
+                        # Interpolate individual components
+                        narrow_fine = np.interp(lam_fine, lam_sub, narrow_sub)
+                        b1_fine = np.interp(lam_fine, lam_sub, b1_sub)
+                        b2_fine = np.interp(lam_fine, lam_sub, b2_sub)
+                        
+                        # Convert to plotting unit
+                        if unit == "flam":
+                            narrow_plot = narrow_fine
+                            b1_plot = b1_fine
+                            b2_plot = b2_fine
+                        else:
+                            narrow_plot = flam_to_fnu_uJy(narrow_fine, lam_fine)
+                            b1_plot = flam_to_fnu_uJy(b1_fine, lam_fine)
+                            b2_plot = flam_to_fnu_uJy(b2_fine, lam_fine)
 
-                        # Narrow components
-                        for nm, comp_y in narrow_comp.items():
-                            comp_sub = comp_y[mask_b]
-                            comp_fine = np.interp(lam_fine, lam_sub, comp_sub)
+                        # Plot each component from continuum baseline
+                        if np.nanmax(np.abs(narrow_plot)) > 0:
                             ax.fill_between(
-                                lam_fine,
-                                cont_fine,
-                                comp_fine,
-                                color=narrow_color,
-                                alpha=0.4,
-                                linewidth=1,
-                                linestyle="-",
+                                lam_fine, cont_fine, cont_fine + narrow_plot,
+                                color=narrow_color, alpha=0.35, linewidth=0
                             )
 
-                        # Broad components
-                        for nm, comp_y in broad_comp.items():
-                            comp_sub = comp_y[mask_b]
-                            comp_fine = np.interp(lam_fine, lam_sub, comp_sub)
-                            
-                            if "BROAD2" in nm:
-                                c_use = broad_color2
-                            else:
-                                c_use = broad_color
-
+                        if has_b1 and np.nanmax(np.abs(b1_plot)) > 0:
                             ax.fill_between(
-                                lam_fine,
-                                cont_fine,
-                                comp_fine,
-                                color=c_use,
-                                alpha=0.2,
-                                linewidth=0.2,
-                                linestyle="-",
+                                lam_fine, cont_fine, cont_fine + b1_plot,
+                                color=broad_color, alpha=0.25, linewidth=0
                             )
 
+                        if has_b2 and np.nanmax(np.abs(b2_plot)) > 0:
+                            ax.fill_between(
+                                lam_fine, cont_fine, cont_fine + b2_plot,
+                                color=broad_color2, alpha=0.20, linewidth=0
+                            )
 
                     ax.set_xlim(zd["lo"], zd["hi"])
                     ax.set_title(zd["title"], fontsize=10)
@@ -2672,16 +2778,14 @@ def bootstrap_excels_fit_broad(
                     ax.grid(alpha=0.25, linestyle=":", linewidth=0.5)
                     ax.tick_params(direction="in", top=True, right=True)
 
-
-                    # NEW: same method as full plot, but only for lines in this window
                     _annotate_lines_above_model(
                         ax=ax,
                         lam=lam_z,
-                        model=mu_z,          # local model in this unit
+                        model=mu_z,
                         line_names=zd["names"],
                         z=z,
                         per_line=base["lines"],
-                        label_offset_frac=0.06,  # maybe a bit higher if zooms feel cramped
+                        label_offset_frac=0.06,
                         x_margin_frac=0.02,
                         fontsize=8,
                     )
@@ -2788,4 +2892,4 @@ def print_bootstrap_line_table_broad(boot, save_path: str | None = None):
             f.write(table_text)
         print(f"\nSaved bootstrap summary → {save_path}")
 
-print("change5")
+print("change7")
