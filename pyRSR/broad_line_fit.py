@@ -1192,8 +1192,8 @@ def excels_fit_poly_broad(
     skipped and the function just fits that fixed line list globally.
     """
 
-    if broad_mode not in {"auto", "off", "force"}:
-        raise ValueError(f"broad_mode must be 'auto', 'off' or 'force', got {broad_mode!r}")
+    if broad_mode not in {"auto", "off", "force", "1broad", "2broad"}:
+        raise ValueError(f"broad_mode must be 'auto', 'off', 'force', '1broad' or '2broad', got {broad_mode!r}")
 
     # --- Load spectrum (unchanged from your original) ---
     if isinstance(source, dict):
@@ -1361,6 +1361,22 @@ def excels_fit_poly_broad(
                     broad_choice = "one"
                 else:
                     broad_choice = "none"
+            elif broad_mode == "1broad":
+                # Strict 1-broad mode
+                if fit_1broad is not None and np.isfinite(BIC_1broad):
+                    broad_choice = "one"
+                else:
+                    if verbose:
+                        print("broad_mode='1broad' but fit failed → reverting to narrow-only.")
+                    broad_choice = "none"
+            elif broad_mode == "2broad":
+                # Strict 2-broad mode
+                if fit_2broad is not None and np.isfinite(BIC_2broad):
+                    broad_choice = "two"
+                else:
+                    if verbose:
+                        print("broad_mode='2broad' but fit failed → reverting to narrow-only.")
+                    broad_choice = "none"
             else:
                 # auto → pick lowest BIC, but require ΔBIC improvement
                 B_vals = [c[0] for c in candidates]
@@ -1499,6 +1515,22 @@ def excels_fit_poly_broad(
                 elif fit_1broad is not None and np.isfinite(BIC_1broad):
                     broad_choice = "one"
                 else:
+                    broad_choice = "none"
+            elif broad_mode == "1broad":
+                # Strict 1-broad mode
+                if fit_1broad is not None and np.isfinite(BIC_1broad):
+                    broad_choice = "one"
+                else:
+                    if verbose:
+                        print("broad_mode='1broad' (Hβ) but fit failed → reverting to narrow-only.")
+                    broad_choice = "none"
+            elif broad_mode == "2broad":
+                # Strict 2-broad mode
+                if fit_2broad is not None and np.isfinite(BIC_2broad):
+                    broad_choice = "two"
+                else:
+                    if verbose:
+                        print("broad_mode='2broad' (Hβ) but fit failed → reverting to narrow-only.")
                     broad_choice = "none"
             else:
                 # auto → pick lowest BIC, but require ΔBIC improvement
@@ -1689,7 +1721,7 @@ def excels_fit_poly_broad(
         # Overplot Hα+[N II] narrow components + up to two broad Hα in µJy
         narrow_color = "tab:blue"
         broad_color  = "tab:orange"
-        broad_color2 = "tab:red"
+        broad_color2 = "tab:pink"
 
         cont_fit_flam = Fcont_fit
 
@@ -2253,6 +2285,7 @@ def bootstrap_excels_fit_broad(
             # Colour for narrow vs broad components
             narrow_color = "tab:blue"
             broad_color  = "tab:orange"
+            broad_color2 = "tab:pink"
 
             # Build dicts of continuum+line in plotting units from bootstrap samples
             narrow_comp = {}
@@ -2299,6 +2332,7 @@ def bootstrap_excels_fit_broad(
             # Overlay components as smooth shaded regions (no lines)
             narrow_label_done = False
             broad_label_done  = False
+            broad2_label_done = False
 
             # Pre-compute a fine grid over the full base-fit range
             oversample = 6  # 5–10 is usually enough
@@ -2322,28 +2356,40 @@ def bootstrap_excels_fit_broad(
                     cont_fine_full,
                     comp_fine,
                     color=narrow_color,
-                    alpha=0.7,
-                    linewidth=0.0,
+                    alpha=0.4,
+                    linewidth=1,
+                    linestyle="-",
                     label=label,
                 )
 
             # --- Broad components: all *_BROAD* lines (HALPHA_BROAD, HALPHA_BROAD2, ...) ---
             if has_broad_components_base:
                 for i, (nm, comp_y) in enumerate(broad_comp.items()):
-                    label = None
-                    if not broad_label_done:
-                        label = "Broad components"
-                        broad_label_done = True
-
                     comp_fine = np.interp(lam_fine_full, lam_fit_base, comp_y)
-
+                    
+                    if "BROAD2" in nm:
+                        # Second broad component -> pink
+                        label = None
+                        if not broad2_label_done:
+                            label = "Broad component 2"
+                            broad2_label_done = True
+                        c_use = broad_color2
+                    else:
+                        # First broad component -> orange
+                        label = None
+                        if not broad_label_done:
+                            label = "Broad component 1"
+                            broad_label_done = True
+                        c_use = broad_color
+                    
                     ax_full.fill_between(
                         lam_fine_full,
                         cont_fine_full,
                         comp_fine,
-                        color=broad_color,
-                        alpha=0.3,
-                        linewidth=0.0,
+                        color=c_use,
+                        alpha=0.2,
+                        linewidth=0.2,
+                        linestyle="-",
                         label=label,
                     )
 
@@ -2422,21 +2468,29 @@ def bootstrap_excels_fit_broad(
                                 cont_fine,
                                 comp_fine,
                                 color=narrow_color,
-                                alpha=0.7,
-                                linewidth=0.0,
+                                alpha=0.4,
+                                linewidth=1,
+                                linestyle="-",
                             )
 
                         # Broad components
                         for nm, comp_y in broad_comp.items():
                             comp_sub = comp_y[mask_b]
                             comp_fine = np.interp(lam_fine, lam_sub, comp_sub)
+                            
+                            if "BROAD2" in nm:
+                                c_use = broad_color2
+                            else:
+                                c_use = broad_color
+
                             ax.fill_between(
                                 lam_fine,
                                 cont_fine,
                                 comp_fine,
-                                color=broad_color,
-                                alpha=0.3,
-                                linewidth=0.0,
+                                color=c_use,
+                                alpha=0.2,
+                                linewidth=0.2,
+                                linestyle="-",
                             )
 
 
