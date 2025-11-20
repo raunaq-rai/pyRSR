@@ -949,8 +949,9 @@ def _fit_emission_system(
 
     # Factors (in σ_v space) relative to the *narrow* component.
     # i.e. σ_v(broad1) ≈ FACT_B1["seed"] × σ_v(narrow), etc.
-    FACT_B1 = dict(lo=1.5, seed=3.0, hi=5.0)   # “intermediate” broad
-    FACT_B2 = dict(lo=4.0, seed=7.0, hi=12.0)  # “very” broad
+    FACT_B1 = dict(lo=1, seed=2.0, hi=4.0)   # “intermediate” broad
+    FACT_B2 = dict(lo=1.0, seed=2.5, hi=3.5) 
+
 
     # Start with instrument-based bounds for everyone
     sigmaA_lo   = np.array(sigmaA_lo,  float)
@@ -1036,8 +1037,8 @@ def _fit_emission_system(
         # Upper bound: allow BROAD2 to explore at least as wide a region
         sigmaA_hi[i2]   = max(sigmaA_hi[i2],   factor * sigmaA_hi[i1])
 
-    _force_broad2_broader("H⍺_BROAD",   "H⍺_BROAD2",   factor=1.5)
-    _force_broad2_broader("HBETA_BROAD","HBETA_BROAD2",factor=1.5)
+    _force_broad2_broader("H⍺_BROAD",   "H⍺_BROAD2",   factor=2)
+    _force_broad2_broader("HBETA_BROAD","HBETA_BROAD2",factor=2)
 
     # sigmaA_lo, sigmaA_hi, sigmaA_seed then flow into the rest of the fitter
 
@@ -1052,12 +1053,51 @@ def _fit_emission_system(
         peak_flam = np.nanmax(resid_fit[win]) if np.any(win) else 3.0 * rms_flam
         peak_flam = max(peak_flam, 3.0 * rms_flam)
 
-        A_seed = peak_flam * SQRT2PI * max(sigmaA_seed[j], 0.9 * sigmaA_inst[j])
+        # Split peak flux between components to control relative *peak* heights.
+        # We want:
+        #   peak(BROAD1) ≈ 0.25 * peak(narrow)
+        #   peak(BROAD2) ≈ 0.10 * peak(narrow)
+        #
+        # For area-normalised Gaussians, peak_j ∝ flux_fraction_j, so set:
+        r1 = 0.25  # desired peak(BROAD1) / peak(narrow)
+        r2 = 0.005 # desired peak(BROAD2) / peak(narrow) -- vanishingly low for wings
+
+        f_narrow = 1.0 / (1.0 + r1 + r2)
+        f_b1     = r1 * f_narrow
+        f_b2     = r2 * f_narrow
+
+        nm = which_lines[j]
+
+        if "BROAD2" in nm:
+            flux_fraction = f_b2
+            # very broad wings — keep the integrated flux cap very tight
+            # to force it to be a low-amplitude wing component
+            A_multiplier = 0.05
+        elif "BROAD" in nm:
+            flux_fraction = f_b1
+            # intermediate broad component
+            A_multiplier = 20.0
+        else:
+            flux_fraction = f_narrow
+            A_multiplier = 150.0
+
+        A_seed = flux_fraction * peak_flam * SQRT2PI * max(
+            sigmaA_seed[j], 0.9 * sigmaA_inst[j]
+        )
         A0.append(A_seed)
 
-        A_upper = 150.0 * max(peak_flam, 3.0 * rms_flam) * SQRT2PI * np.maximum(
-            sigmaA_hi[j], sigmaA_seed[j]
-        )
+
+        # Upper bound on integrated flux (area) for this Gaussian.
+        # For BROAD2, we use sigmaA_lo (min width) to calculate the area limit.
+        # This guarantees that P_fit <= P_limit * (sigma_lo / sigma_fit) <= P_limit.
+        # This prevents the optimizer from trading width for height.
+        if "BROAD2" in nm:
+            width_for_limit = sigmaA_lo[j]
+        else:
+            # For others, be permissive and use the max width
+            width_for_limit = np.maximum(sigmaA_hi[j], sigmaA_seed[j])
+
+        A_upper = A_multiplier * max(peak_flam, 3.0 * rms_flam) * SQRT2PI * width_for_limit
         A_hi.append(A_upper)
 
     A0 = np.asarray(A0, float)
@@ -2710,6 +2750,10 @@ def print_bootstrap_line_table_broad(boot, save_path: str | None = None):
     Print a formatted bootstrap summary to console, including peak SNRs.
     Optionally save the same output to a text file.
     """
+    # NOTE: The printed F_line values come directly from the fitter's
+    # integrated-area measurement (A in the area-normalised Gaussian model)
+    # and are in units of F_lambda (erg s^-1 cm^-2). These are not affected
+    # by any plotting/display scaling — the function prints the true measured fluxes.
     header = (
         "\n=== BOOTSTRAP SUMMARY (value ± error) ===\n"
         f"{'Line':10s} {'F_line [erg/s/cm²]':>26s} "
@@ -2744,4 +2788,4 @@ def print_bootstrap_line_table_broad(boot, save_path: str | None = None):
             f.write(table_text)
         print(f"\nSaved bootstrap summary → {save_path}")
 
-print("change2")
+print("change5")
