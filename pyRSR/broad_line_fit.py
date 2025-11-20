@@ -82,6 +82,9 @@ REST_LINES_A: Dict[str, float] = {
 
 # Broad Balmer aliases (same rest λ, but allowed much larger σ)
 REST_LINES_A["HBETA_BROAD"] = REST_LINES_A["HBETA"]
+REST_LINES_A["HBETA_BROAD2"] = REST_LINES_A["HBETA"]
+
+
 REST_LINES_A["H⍺_BROAD"] = REST_LINES_A["H⍺"]
 # Second broad Hα component (same rest λ)
 REST_LINES_A["H⍺_BROAD2"] = REST_LINES_A["H⍺"]
@@ -1163,8 +1166,8 @@ def excels_fit_poly_broad(
 ):
     """
     Fit *all* narrow lines in the chosen fit window, but decide how to
-    model the Hα+[N II] complex (narrow-only vs. broad Hα) using a
-    local BIC comparison in the Hα window.
+    model both the Hα+[N II] and Hβ+[O III] complexes using *local* BIC
+    comparisons, independently for each Balmer line.
 
     Logic:
       1. Fit continuum on the full spectrum.
@@ -1175,13 +1178,20 @@ def excels_fit_poly_broad(
            - M1: M0 + H⍺_BROAD
            - M2: M1 + H⍺_BROAD2
          using BIC.
-      5. Append the chosen broad Hα components to the global line list.
-      6. Do a *single global* fit with that final line list.
-      7. Plot and return results.
+      5. In a local Hβ window only, compare:
+           - NARROW : HBETA + [O III] (all narrow)
+           - +1 BROAD: + HBETA_BROAD
+           - +2 BROAD: + HBETA_BROAD2
+         using BIC.
+      6. Append whichever broad Hα / Hβ components are favoured by BIC
+         to the *global* line list.
+      7. Do a single global fit with that final line list.
+      8. Plot and return results.
 
-    If `force_lines` is provided (bootstrap path), the Hα BIC logic is
+    If `force_lines` is provided (bootstrap path), all BIC logic is
     skipped and the function just fits that fixed line list globally.
     """
+
     if broad_mode not in {"auto", "off", "force"}:
         raise ValueError(f"broad_mode must be 'auto', 'off' or 'force', got {broad_mode!r}")
 
@@ -1379,6 +1389,146 @@ def excels_fit_poly_broad(
             print(f"  → selected Hα model: {broad_choice!r}")
 
         return broad_choice, BIC_narrow, BIC_1broad, BIC_2broad, BIC_broad
+    
+        # ----------------------------------------------------------------
+    # Helper: decide Hβ model (none / one / two broad) in *local* window
+    # ----------------------------------------------------------------
+    def _select_hb_model(which_lines_all):
+        """
+        Use only a local Hβ+[O III] window for BIC comparison, but do not
+        change the global continuum or residuals. Returns:
+
+          broad_choice ∈ {"none","one","two"}
+          BIC_narrow, BIC_1broad, BIC_2broad, BIC_broad
+        """
+        BIC_narrow = np.nan
+        BIC_1broad = np.nan
+        BIC_2broad = np.nan
+        BIC_broad  = np.nan
+        broad_choice = "none"
+
+        # If Hβ isn't even in the global narrow list, nothing to do
+        if "HBETA" not in which_lines_all:
+            return broad_choice, BIC_narrow, BIC_1broad, BIC_2broad, BIC_broad
+
+        hb_triplet = ["HBETA", "OIII_2", "OIII_3"]
+        which_hb_narrow = [ln for ln in hb_triplet if ln in which_lines_all]
+        if "HBETA" not in which_hb_narrow:
+            return broad_choice, BIC_narrow, BIC_1broad, BIC_2broad, BIC_broad
+
+        # Local Hβ window: HBETA–[O III] ± padding
+        rest_list = [
+            REST_LINES_A["HBETA"],
+            REST_LINES_A["OIII_2"],
+            REST_LINES_A["OIII_3"],
+        ]
+        lo_hb, hi_hb = _window_from_lines_um(rest_list, z, pad_A=150.0)
+        m_hb = (lam_all >= lo_hb) & (lam_all <= hi_hb)
+        if np.count_nonzero(m_hb) < 5:
+            # basically no Hβ coverage
+            return broad_choice, BIC_narrow, BIC_1broad, BIC_2broad, BIC_broad
+
+        lam_hb   = lam_all[m_hb]
+        resid_hb = resid_all[m_hb]
+        sig_hb   = sig_all[m_hb]
+        Fcont_hb = Fcont_all[m_hb]
+
+        # Base narrow-only fit (M0)
+        fit_narrow = _fit_emission_system(
+            lam_hb, resid_hb, sig_hb, Fcont_hb,
+            z, grating, which_hb_narrow,
+            absorption_corrections=absorption_corrections,
+            verbose=verbose,
+        )
+        BIC_narrow = fit_narrow["BIC"]
+
+        if broad_mode == "off":
+            if verbose:
+                print("broad_mode='off' → using narrow-only Hβ+[O III] model.")
+            return "none", BIC_narrow, BIC_1broad, BIC_2broad, BIC_broad
+
+        # Check Hβ SNR for eligibility (auto mode)
+        hb_info = fit_narrow["per_line"].get("HBETA", None)
+        hb_snr  = hb_info.get("SNR", 0.0) if hb_info is not None else 0.0
+        eligible = (hb_info is not None) and np.isfinite(hb_snr)
+
+        if (broad_mode == "auto") and (not eligible or hb_snr < snr_broad_threshold):
+            if verbose:
+                print(f"No strong Hβ line (SNR={hb_snr:.1f}) → staying narrow-only.")
+            return "none", BIC_narrow, BIC_1broad, BIC_2broad, BIC_broad
+
+        # Try adding 1 and 2 broad Hβ components on the local window
+        def _safe_fit(which, label):
+            try:
+                fb = _fit_emission_system(
+                    lam_hb, resid_hb, sig_hb, Fcont_hb,
+                    z, grating, which,
+                    absorption_corrections=absorption_corrections,
+                    verbose=verbose,
+                )
+                return fb, fb["BIC"]
+            except Exception as e:
+                if verbose:
+                    print(f"{label} model (Hβ) failed: {e}")
+                return None, np.nan
+
+        which_1 = list(which_hb_narrow)
+        if "HBETA_BROAD" not in which_1:
+            which_1.append("HBETA_BROAD")
+        fit_1broad, BIC_1broad = _safe_fit(which_1, "1-broad Hβ")
+
+        which_2 = list(which_1)
+        if "HBETA_BROAD2" not in which_2:
+            which_2.append("HBETA_BROAD2")
+        fit_2broad, BIC_2broad = _safe_fit(which_2, "2-broad Hβ")
+
+        candidates = [(BIC_narrow, "none")]
+        if fit_1broad is not None and np.isfinite(BIC_1broad):
+            candidates.append((BIC_1broad, "one"))
+        if fit_2broad is not None and np.isfinite(BIC_2broad):
+            candidates.append((BIC_2broad, "two"))
+
+        if len(candidates) == 1:
+            broad_choice = "none"
+            BIC_broad = np.nan
+        else:
+            if broad_mode == "force":
+                # Choose most complex model that worked
+                if fit_2broad is not None and np.isfinite(BIC_2broad):
+                    broad_choice = "two"
+                elif fit_1broad is not None and np.isfinite(BIC_1broad):
+                    broad_choice = "one"
+                else:
+                    broad_choice = "none"
+            else:
+                # auto → pick lowest BIC, but require ΔBIC improvement
+                B_vals = [c[0] for c in candidates]
+                i_best = int(np.argmin(B_vals))
+                BIC_best, broad_choice = candidates[i_best]
+                if broad_choice != "none":
+                    if (not np.isfinite(BIC_narrow)) or (BIC_best + bic_delta_prefer >= BIC_narrow):
+                        if verbose:
+                            print("Broad Hβ models do not improve BIC enough → reverting to narrow-only.")
+                        broad_choice = "none"
+
+            finite_bics = [b for b in (BIC_1broad, BIC_2broad) if np.isfinite(b)]
+            BIC_broad = min(finite_bics) if finite_bics else np.nan
+
+        if verbose:
+            print("Local Hβ+[O III] BIC (Hβ window only):")
+            print(f"  narrow-only : BIC = {BIC_narrow:.2f}")
+            if np.isfinite(BIC_1broad):
+                print(f"  +1 broad Hβ: BIC = {BIC_1broad:.2f}")
+            else:
+                print("  +1 broad Hβ: (fit failed)")
+            if np.isfinite(BIC_2broad):
+                print(f"  +2 broad Hβ: BIC = {BIC_2broad:.2f}")
+            else:
+                print("  +2 broad Hβ: (fit failed)")
+            print(f"  → selected Hβ model: {broad_choice!r}")
+
+        return broad_choice, BIC_narrow, BIC_1broad, BIC_2broad, BIC_broad
+
 
     # ------------------------------------------------------------------
     # Branch A: force_lines → used by bootstrap to *freeze* the structure
@@ -1409,15 +1559,16 @@ def excels_fit_poly_broad(
         which_lines_out = fit_global["which_lines"]
         BIC_best        = fit_global["BIC"]
 
-        BIC_narrow = np.nan
-        BIC_1broad = np.nan
-        BIC_2broad = np.nan
-        BIC_broad  = np.nan
-        broad_choice = "forced"
+        # No local BIC selection was done in force_lines path
+        BIC_HA_narrow = BIC_HA_1broad = BIC_HA_2broad = BIC_HA_broad = np.nan
+        BIC_HB_narrow = BIC_HB_1broad = BIC_HB_2broad = BIC_HB_broad = np.nan
+        broad_choice_ha = "forced"
+        broad_choice_hb = "forced"
+
 
     else:
         # ------------------------------------------------------------------
-        # Branch B: "normal" call → choose Hα model, then global fit
+        # Branch B: "normal" call → choose Hα & Hβ models, then global fit
         # ------------------------------------------------------------------
         # 1) all *narrow* lines in coverage in the global window
         which_lines_all = _lines_in_range(z, lam_all, lines_to_use, margin_um=0.02)
@@ -1432,17 +1583,28 @@ def excels_fit_poly_broad(
         if not which_lines_all:
             raise ValueError("No emission lines with data in the global fit window.")
 
-        # 2) decide Hα model (none/one/two broad) using only the local Hα window
-        broad_choice, BIC_narrow, BIC_1broad, BIC_2broad, BIC_broad = _select_ha_model(which_lines_all)
+        # 2) decide Hα and Hβ models (none/one/two broad) using local windows
+        broad_choice_ha, BIC_HA_narrow, BIC_HA_1broad, BIC_HA_2broad, BIC_HA_broad = _select_ha_model(which_lines_all)
+        broad_choice_hb, BIC_HB_narrow, BIC_HB_1broad, BIC_HB_2broad, BIC_HB_broad = _select_hb_model(which_lines_all)
 
         # 3) build final global line list
         which_lines_global = list(which_lines_all)
-        if broad_choice in {"one", "two"}:
+
+        # Hα broad components
+        if broad_choice_ha in {"one", "two"}:
             if "H⍺_BROAD" not in which_lines_global:
                 which_lines_global.append("H⍺_BROAD")
-        if broad_choice == "two":
+        if broad_choice_ha == "two":
             if "H⍺_BROAD2" not in which_lines_global:
                 which_lines_global.append("H⍺_BROAD2")
+
+        # Hβ broad components
+        if broad_choice_hb in {"one", "two"}:
+            if "HBETA_BROAD" not in which_lines_global:
+                which_lines_global.append("HBETA_BROAD")
+        if broad_choice_hb == "two":
+            if "HBETA_BROAD2" not in which_lines_global:
+                which_lines_global.append("HBETA_BROAD2")
 
         which_lines_global, _ = _prune_lines_without_data(
             lam_all, resid_all, sig_all, which_lines_global,
@@ -1451,9 +1613,9 @@ def excels_fit_poly_broad(
             verbose=bool(verbose),
         )
         if not which_lines_global:
-            raise ValueError("After adding Hα broad components, no lines remain to fit.")
+            raise ValueError("After adding Balmer broad components, no lines remain to fit.")
 
-        # 4) one *global* fit with the chosen Hα parametrisation
+        # 4) one *global* fit with the chosen Balmer parametrisations
         fit_global = _fit_emission_system(
             lam_all, resid_all, sig_all, Fcont_all,
             z, grating, which_lines_global,
@@ -1468,6 +1630,15 @@ def excels_fit_poly_broad(
         per_line        = fit_global["per_line"]
         which_lines_out = fit_global["which_lines"]
         BIC_best        = fit_global["BIC"]
+
+        # Backwards-compatible aliases: keep old "Hα-only" names pointing to Hα BICs
+    BIC_narrow = BIC_HA_narrow
+    BIC_1broad = BIC_HA_1broad
+    BIC_2broad = BIC_HA_2broad
+    BIC_broad  = BIC_HA_broad
+    broad_choice = broad_choice_ha
+
+
 
     # For plotting we now interpret lam_fit as the *global* fit grid
     lam_fit   = lam_all
@@ -1637,14 +1808,31 @@ def excels_fit_poly_broad(
         continuum_flam=Fcont,
         lines=per_line,
         which_lines=which_lines_out,
-        BIC=BIC_best,
+        BIC=BIC_best,   # global model BIC on the chosen window
+
+        # Hα BIC summary + backward-compatible aliases
+        BIC_HA_narrow=BIC_HA_narrow,
+        BIC_HA_broad=BIC_HA_broad,
+        BIC_HA_1broad=BIC_HA_1broad,
+        BIC_HA_2broad=BIC_HA_2broad,
+        broad_choice_HA=broad_choice_ha,
+
         BIC_narrow=BIC_narrow,
         BIC_broad=BIC_broad,
         BIC_1broad=BIC_1broad,
         BIC_2broad=BIC_2broad,
         broad_choice=broad_choice,
+
+        # Hβ BIC summary
+        BIC_HB_narrow=BIC_HB_narrow,
+        BIC_HB_broad=BIC_HB_broad,
+        BIC_HB_1broad=BIC_HB_1broad,
+        BIC_HB_2broad=BIC_HB_2broad,
+        broad_choice_HB=broad_choice_hb,
+
         profiles_window_flam=profiles_win,
     )
+
 
 
 
