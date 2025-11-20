@@ -90,8 +90,8 @@ REST_LINES_A["H⍺_BROAD"] = REST_LINES_A["H⍺"]
 REST_LINES_A["H⍺_BROAD2"] = REST_LINES_A["H⍺"]
 
 
-# Max broad Balmer width: FWHM ≈ 0.05 µm  →  σ ≈ 0.021 µm ≈ 2.1×10² Å
-MAX_BROAD_FWHM_UM = 0.02
+
+MAX_BROAD_FWHM_UM = 0.0001
 MAX_BROAD_SIGMA_A = (MAX_BROAD_FWHM_UM / 2.355) * 1e4  # ≈ 2.1e2 Å
 
 
@@ -944,21 +944,102 @@ def _fit_emission_system(
         sigmaA_hi = np.maximum(0.70 * pix_A, 1.15 * sigmaA_inst)
         seed_factor = 0.85
 
-    # --- BROAD components: widen σ, but cap at MAX_BROAD_SIGMA_A ---
-    for j, nm in enumerate(which_lines):
-        if "BROAD" in nm:
-            # broader than narrow:
-            sigmaA_lo[j] = np.maximum(sigmaA_lo[j], 3.0 * sigmaA_inst[j])
-            # at most 20× instrumental, but capped physically
-            sigma_hi_candidate = np.maximum(sigmaA_hi[j], 20.0 * sigmaA_inst[j])
-            sigmaA_hi[j] = min(sigma_hi_candidate, MAX_BROAD_SIGMA_A)
-            if sigmaA_hi[j] <= sigmaA_lo[j]:
-                sigmaA_hi[j] = sigmaA_lo[j] * 1.5  # safety
+    # --- BROAD components: σ ranges relative to the narrow Balmer width ---
+    C_KMS = 299792.458
 
+    # Factors (in σ_v space) relative to the *narrow* component.
+    # i.e. σ_v(broad1) ≈ FACT_B1["seed"] × σ_v(narrow), etc.
+    FACT_B1 = dict(lo=1.5, seed=3.0, hi=5.0)   # “intermediate” broad
+    FACT_B2 = dict(lo=4.0, seed=7.0, hi=12.0)  # “very” broad
+
+    # Start with instrument-based bounds for everyone
+    sigmaA_lo   = np.array(sigmaA_lo,  float)
+    sigmaA_hi   = np.array(sigmaA_hi,  float)
     sigmaA_seed = np.clip(seed_factor * sigmaA_inst, sigmaA_lo, sigmaA_hi)
+
+    # Map each broad line to its narrow parent
+    parent_narrow = {
+        "H⍺_BROAD":     "H⍺",
+        "H⍺_BROAD2":    "H⍺",
+        "HBETA_BROAD":  "HBETA",
+        "HBETA_BROAD2": "HBETA",
+    }
+    name_to_idx = {nm: j for j, nm in enumerate(which_lines)}
+
+    # ------------------------------------------------------------------
+    # 1. Set priors for each broad component individually (as before)
+    # ------------------------------------------------------------------
     for j, nm in enumerate(which_lines):
-        if "BROAD" in nm:
-            sigmaA_seed[j] = np.clip(5.0 * sigmaA_inst[j], sigmaA_lo[j], sigmaA_hi[j])
+        if "BROAD" not in nm:
+            continue
+
+        # -------- find the corresponding narrow component --------
+        parent = parent_narrow.get(nm)
+        if parent is not None and parent in name_to_idx:
+            j_narrow = name_to_idx[parent]
+            # "narrow peak width": you can swap this for a fitted σ if you pass it in
+            sigma_narrow_A = sigmaA_inst[j_narrow]
+            muA_narrow     = muA_nom[j_narrow]
+        else:
+            # Fallback: use local instrumental width as "narrow"
+            sigma_narrow_A = sigmaA_inst[j]
+            muA_narrow     = muA_nom[j]
+
+        # Convert that narrow σ_λ → σ_v (km/s)
+        sigma_narrow_v = (sigma_narrow_A / muA_narrow) * C_KMS
+
+        # Choose factor set for BROAD vs BROAD2
+        if "BROAD2" in nm:
+            fcfg = FACT_B2
+        else:
+            fcfg = FACT_B1
+
+        # Desired σ_v for this broad component
+        sigma_lo_v   = fcfg["lo"]   * sigma_narrow_v
+        sigma_hi_v   = fcfg["hi"]   * sigma_narrow_v
+        sigma_seed_v = fcfg["seed"] * sigma_narrow_v
+
+        # Convert back to σ_λ at this line’s wavelength
+        mu_A = expected_um[j] * 1e4  # Å (broad component’s centre)
+        sigma_lo_A   = (sigma_lo_v   / C_KMS) * mu_A
+        sigma_hi_A   = (sigma_hi_v   / C_KMS) * mu_A
+        sigma_seed_A = (sigma_seed_v / C_KMS) * mu_A
+
+        # Enforce lower/upper bounds with instrumental and global limits
+        sigmaA_lo[j] = max(sigma_lo_A, 1.2 * sigmaA_inst[j])
+        sigmaA_hi[j] = min(sigma_hi_A, MAX_BROAD_SIGMA_A)
+
+        if sigmaA_hi[j] <= sigmaA_lo[j]:
+            # emergency widen if something pathological happens
+            sigmaA_hi[j] = sigmaA_lo[j] * 1.5
+
+        # Final σ seed for this broad component
+        sigmaA_seed[j] = np.clip(sigma_seed_A, sigmaA_lo[j], sigmaA_hi[j])
+
+    # ------------------------------------------------------------------
+    # 2. Explicitly force BROAD2 > BROAD1 (for each Balmer line)
+    # ------------------------------------------------------------------
+    def _force_broad2_broader(name_b1, name_b2, factor=1.5):
+        """
+        Ensure σ(BROAD2) >= factor * σ(BROAD1) at the level of
+        bounds AND seeds. Safe no-op if either line is absent.
+        """
+        i1 = name_to_idx.get(name_b1)
+        i2 = name_to_idx.get(name_b2)
+        if i1 is None or i2 is None:
+            return
+
+        # Lower bound: BROAD2 cannot be narrower than factor × BROAD1
+        sigmaA_lo[i2]   = max(sigmaA_lo[i2],   factor * sigmaA_lo[i1])
+        # Seed: push BROAD2 at least factor × BROAD1’s seed
+        sigmaA_seed[i2] = max(sigmaA_seed[i2], factor * sigmaA_seed[i1])
+        # Upper bound: allow BROAD2 to explore at least as wide a region
+        sigmaA_hi[i2]   = max(sigmaA_hi[i2],   factor * sigmaA_hi[i1])
+
+    _force_broad2_broader("H⍺_BROAD",   "H⍺_BROAD2",   factor=1.5)
+    _force_broad2_broader("HBETA_BROAD","HBETA_BROAD2",factor=1.5)
+
+    # sigmaA_lo, sigmaA_hi, sigmaA_seed then flow into the rest of the fitter
 
     # --- amplitude seeds: SAME as old code (emission-only) ---
     SQRT2PI = np.sqrt(2.0 * np.pi)
@@ -1192,8 +1273,9 @@ def excels_fit_poly_broad(
     skipped and the function just fits that fixed line list globally.
     """
 
-    if broad_mode not in {"auto", "off", "force", "1broad", "2broad"}:
-        raise ValueError(f"broad_mode must be 'auto', 'off', 'force', '1broad' or '2broad', got {broad_mode!r}")
+    valid_modes = {"auto", "off", "broad1", "broad2", "both"}
+    if broad_mode not in valid_modes:
+        raise ValueError(f"broad_mode must be one of {valid_modes}, got {broad_mode!r}")
 
     # --- Load spectrum (unchanged from your original) ---
     if isinstance(source, dict):
@@ -1343,9 +1425,17 @@ def excels_fit_poly_broad(
             which_2.append("H⍺_BROAD2")
         fit_2broad, BIC_2broad = _safe_fit(which_2, "2-broad Hα")
 
+        # BROAD2-only (without BROAD) for complete 4-way comparison
+        which_b2only = list(which_ha_narrow)
+        if "H⍺_BROAD2" not in which_b2only:
+            which_b2only.append("H⍺_BROAD2")
+        fit_b2only, BIC_b2only = _safe_fit(which_b2only, "BROAD2-only Hα")
+
         candidates = [(BIC_narrow, "none")]
         if fit_1broad is not None and np.isfinite(BIC_1broad):
             candidates.append((BIC_1broad, "one"))
+        if fit_b2only is not None and np.isfinite(BIC_b2only):
+            candidates.append((BIC_b2only, "broad2_only"))
         if fit_2broad is not None and np.isfinite(BIC_2broad):
             candidates.append((BIC_2broad, "two"))
 
@@ -1353,29 +1443,29 @@ def excels_fit_poly_broad(
             broad_choice = "none"
             BIC_broad = np.nan
         else:
-            if broad_mode == "force":
-                # Choose most complex model that worked
-                if fit_2broad is not None and np.isfinite(BIC_2broad):
-                    broad_choice = "two"
-                elif fit_1broad is not None and np.isfinite(BIC_1broad):
-                    broad_choice = "one"
-                else:
-                    broad_choice = "none"
-            elif broad_mode == "1broad":
-                # Strict 1-broad mode
+            if broad_mode == "broad1":
+                # Force BROAD only
                 if fit_1broad is not None and np.isfinite(BIC_1broad):
                     broad_choice = "one"
                 else:
                     if verbose:
-                        print("broad_mode='1broad' but fit failed → reverting to narrow-only.")
+                        print("broad_mode='broad1' but fit failed → reverting to narrow-only.")
                     broad_choice = "none"
-            elif broad_mode == "2broad":
-                # Strict 2-broad mode
+            elif broad_mode == "broad2":
+                # Force BROAD2 only (without BROAD)
+                if fit_b2only is not None and np.isfinite(BIC_b2only):
+                    broad_choice = "broad2_only"
+                else:
+                    if verbose:
+                        print("broad_mode='broad2' but fit failed → reverting to narrow-only.")
+                    broad_choice = "none"
+            elif broad_mode == "both":
+                # Force both BROAD and BROAD2
                 if fit_2broad is not None and np.isfinite(BIC_2broad):
                     broad_choice = "two"
                 else:
                     if verbose:
-                        print("broad_mode='2broad' but fit failed → reverting to narrow-only.")
+                        print("broad_mode='both' but fit failed → reverting to narrow-only.")
                     broad_choice = "none"
             else:
                 # auto → pick lowest BIC, but require ΔBIC improvement
@@ -1392,17 +1482,29 @@ def excels_fit_poly_broad(
             BIC_broad = min(finite_bics) if finite_bics else np.nan
 
         if verbose:
+            # Map internal choice to descriptive name
+            model_desc = {
+                "none": "narrow-only",
+                "one": "narrow + BROAD",
+                "broad2_only": "narrow + BROAD2",
+                "two": "narrow + BROAD + BROAD2"
+            }.get(broad_choice, broad_choice)
+            
             print("Local Hα+[N II] BIC (Hα window only):")
-            print(f"  narrow-only : BIC = {BIC_narrow:.2f}")
+            print(f"  narrow-only      : BIC = {BIC_narrow:.2f}")
             if np.isfinite(BIC_1broad):
-                print(f"  +1 broad Hα: BIC = {BIC_1broad:.2f}")
+                print(f"  +BROAD only      : BIC = {BIC_1broad:.2f}")
             else:
-                print("  +1 broad Hα: (fit failed)")
+                print("  +BROAD only      : (fit failed)")
+            if np.isfinite(BIC_b2only):
+                print(f"  +BROAD2 only     : BIC = {BIC_b2only:.2f}")
+            else:
+                print("  +BROAD2 only     : (fit failed)")
             if np.isfinite(BIC_2broad):
-                print(f"  +2 broad Hα: BIC = {BIC_2broad:.2f}")
+                print(f"  +both BROAD      : BIC = {BIC_2broad:.2f}")
             else:
-                print("  +2 broad Hα: (fit failed)")
-            print(f"  → selected Hα model: {broad_choice!r}")
+                print("  +both BROAD      : (fit failed)")
+            print(f"  → Selected model: {model_desc}")
 
         return broad_choice, BIC_narrow, BIC_1broad, BIC_2broad, BIC_broad
     
@@ -1498,9 +1600,17 @@ def excels_fit_poly_broad(
             which_2.append("HBETA_BROAD2")
         fit_2broad, BIC_2broad = _safe_fit(which_2, "2-broad Hβ")
 
+        # BROAD2-only (without BROAD) for complete 4-way comparison
+        which_b2only = list(which_hb_narrow)
+        if "HBETA_BROAD2" not in which_b2only:
+            which_b2only.append("HBETA_BROAD2")
+        fit_b2only, BIC_b2only = _safe_fit(which_b2only, "BROAD2-only Hβ")
+
         candidates = [(BIC_narrow, "none")]
         if fit_1broad is not None and np.isfinite(BIC_1broad):
             candidates.append((BIC_1broad, "one"))
+        if fit_b2only is not None and np.isfinite(BIC_b2only):
+            candidates.append((BIC_b2only, "broad2_only"))
         if fit_2broad is not None and np.isfinite(BIC_2broad):
             candidates.append((BIC_2broad, "two"))
 
@@ -1508,29 +1618,29 @@ def excels_fit_poly_broad(
             broad_choice = "none"
             BIC_broad = np.nan
         else:
-            if broad_mode == "force":
-                # Choose most complex model that worked
-                if fit_2broad is not None and np.isfinite(BIC_2broad):
-                    broad_choice = "two"
-                elif fit_1broad is not None and np.isfinite(BIC_1broad):
-                    broad_choice = "one"
-                else:
-                    broad_choice = "none"
-            elif broad_mode == "1broad":
-                # Strict 1-broad mode
+            if broad_mode == "broad1":
+                # Force BROAD only
                 if fit_1broad is not None and np.isfinite(BIC_1broad):
                     broad_choice = "one"
                 else:
                     if verbose:
-                        print("broad_mode='1broad' (Hβ) but fit failed → reverting to narrow-only.")
+                        print("broad_mode='broad1' (Hβ) but fit failed → reverting to narrow-only.")
                     broad_choice = "none"
-            elif broad_mode == "2broad":
-                # Strict 2-broad mode
+            elif broad_mode == "broad2":
+                # Force BROAD2 only (without BROAD)
+                if fit_b2only is not None and np.isfinite(BIC_b2only):
+                    broad_choice = "broad2_only"
+                else:
+                    if verbose:
+                        print("broad_mode='broad2' (Hβ) but fit failed → reverting to narrow-only.")
+                    broad_choice = "none"
+            elif broad_mode == "both":
+                # Force both BROAD and BROAD2
                 if fit_2broad is not None and np.isfinite(BIC_2broad):
                     broad_choice = "two"
                 else:
                     if verbose:
-                        print("broad_mode='2broad' (Hβ) but fit failed → reverting to narrow-only.")
+                        print("broad_mode='both' (Hβ) but fit failed → reverting to narrow-only.")
                     broad_choice = "none"
             else:
                 # auto → pick lowest BIC, but require ΔBIC improvement
@@ -1547,17 +1657,29 @@ def excels_fit_poly_broad(
             BIC_broad = min(finite_bics) if finite_bics else np.nan
 
         if verbose:
+            # Map internal choice to descriptive name
+            model_desc = {
+                "none": "narrow-only",
+                "one": "narrow + BROAD",
+                "broad2_only": "narrow + BROAD2",
+                "two": "narrow + BROAD + BROAD2"
+            }.get(broad_choice, broad_choice)
+            
             print("Local Hβ+[O III] BIC (Hβ window only):")
-            print(f"  narrow-only : BIC = {BIC_narrow:.2f}")
+            print(f"  narrow-only      : BIC = {BIC_narrow:.2f}")
             if np.isfinite(BIC_1broad):
-                print(f"  +1 broad Hβ: BIC = {BIC_1broad:.2f}")
+                print(f"  +BROAD only      : BIC = {BIC_1broad:.2f}")
             else:
-                print("  +1 broad Hβ: (fit failed)")
+                print("  +BROAD only      : (fit failed)")
+            if np.isfinite(BIC_b2only):
+                print(f"  +BROAD2 only     : BIC = {BIC_b2only:.2f}")
+            else:
+                print("  +BROAD2 only     : (fit failed)")
             if np.isfinite(BIC_2broad):
-                print(f"  +2 broad Hβ: BIC = {BIC_2broad:.2f}")
+                print(f"  +both BROAD      : BIC = {BIC_2broad:.2f}")
             else:
-                print("  +2 broad Hβ: (fit failed)")
-            print(f"  → selected Hβ model: {broad_choice!r}")
+                print("  +both BROAD      : (fit failed)")
+            print(f"  → Selected model: {model_desc}")
 
         return broad_choice, BIC_narrow, BIC_1broad, BIC_2broad, BIC_broad
 
@@ -1629,12 +1751,20 @@ def excels_fit_poly_broad(
         if broad_choice_ha == "two":
             if "H⍺_BROAD2" not in which_lines_global:
                 which_lines_global.append("H⍺_BROAD2")
+        if broad_choice_ha == "broad2_only":
+            # Only BROAD2, no BROAD
+            if "H⍺_BROAD2" not in which_lines_global:
+                which_lines_global.append("H⍺_BROAD2")
 
         # Hβ broad components
         if broad_choice_hb in {"one", "two"}:
             if "HBETA_BROAD" not in which_lines_global:
                 which_lines_global.append("HBETA_BROAD")
         if broad_choice_hb == "two":
+            if "HBETA_BROAD2" not in which_lines_global:
+                which_lines_global.append("HBETA_BROAD2")
+        if broad_choice_hb == "broad2_only":
+            # Only BROAD2, no BROAD
             if "HBETA_BROAD2" not in which_lines_global:
                 which_lines_global.append("HBETA_BROAD2")
 
@@ -2613,3 +2743,5 @@ def print_bootstrap_line_table_broad(boot, save_path: str | None = None):
         with open(save_path, "w") as f:
             f.write(table_text)
         print(f"\nSaved bootstrap summary → {save_path}")
+
+print("change2")
