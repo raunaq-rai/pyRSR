@@ -1930,6 +1930,39 @@ def bootstrap_excels_fit_broad(
         )
         cont_flam = np.asarray(base.get("continuum_flam", np.zeros_like(lam_um)))
 
+        # grid on which the base + all bootstrap fits are defined
+        lam_fit_base = np.asarray(base.get("lam_fit", lam_um), float)
+        lamA_base    = lam_fit_base * 1e4
+        leftA_base, rightA_base = _pixel_edges_A(lamA_base)
+
+        def _mean_profile_from_boot(line_name: str) -> np.ndarray:
+            """
+            Bootstrap-mean line *profile* (no continuum) in F_lambda
+            on the base fit grid lam_fit_base.
+            """
+            if line_name not in samples:
+                return np.zeros_like(lam_fit_base)
+
+            F   = samples[line_name]["F_line"][keep_mask]
+            muA = samples[line_name]["lam_obs_A"][keep_mask]
+            sA  = samples[line_name]["sigma_A"][keep_mask]
+
+            good = np.isfinite(F) & np.isfinite(muA) & np.isfinite(sA) & (sA > 0)
+            if not np.any(good):
+                return np.zeros_like(lam_fit_base)
+
+            F, muA, sA = F[good], muA[good], sA[good]
+
+            profs = []
+            for Fi, mui, si in zip(F, muA, sA):
+                # unit-area Gaussian in each pixel, then scale by flux
+                t = _gauss_binavg_area_normalized_A(leftA_base, rightA_base, mui, si)
+                profs.append(Fi * t)
+
+            profs = np.asarray(profs, float)
+            return np.nanmean(profs, axis=0)
+
+
         # also prepare µJy versions
         mu_uJy   = flam_to_fnu_uJy(mu_flam,  lam_um)
         sig_uJy  = flam_to_fnu_uJy(sig_flam, lam_um)
@@ -2021,10 +2054,7 @@ def bootstrap_excels_fit_broad(
             cont_disp = cont[disp_mask]
             mu_disp   = mu[disp_mask]
 
-            # --- precompute component curves on base-fit grid ---
-            profiles_base = base.get("profiles_window_flam", {})
-            lam_fit_base  = base.get("lam_fit", lam_um)
-
+            # --- precompute component curves on base-fit grid, using bootstrap means ---
             # Continuum on base-fit grid, then in correct unit
             cont_fit_base = np.interp(lam_fit_base, lam_um, cont_flam)
             if unit == "flam":
@@ -2036,11 +2066,15 @@ def bootstrap_excels_fit_broad(
             narrow_color = "tab:blue"
             broad_color  = "tab:orange"
 
-            # Build dicts of continuum+line in plotting units
+            # Build dicts of continuum+line in plotting units from bootstrap samples
             narrow_comp = {}
             broad_comp  = {}
-            for nm, prof_flam in profiles_base.items():
-                comp_flam = cont_fit_base + prof_flam
+            for nm in which_lines:
+                # line-only profile in F_lambda on lam_fit_base
+                prof_flam_mean = _mean_profile_from_boot(nm)
+
+                # add continuum for plotting
+                comp_flam = cont_fit_base + prof_flam_mean
                 if unit == "flam":
                     y = comp_flam
                 else:
@@ -2050,6 +2084,7 @@ def bootstrap_excels_fit_broad(
                     broad_comp[nm] = y
                 else:
                     narrow_comp[nm] = y
+
 
             # --- FULL PANEL ---
             edges = _edges_median_spacing(lam_disp)
@@ -2061,7 +2096,7 @@ def bootstrap_excels_fit_broad(
             )
 
             ax_full.stairs(
-                flux_disp, edges, color="#6a0dad", lw=0.5, alpha=0.9,
+                flux_disp, edges, color="black", lw=0.5, alpha=0.7,
                 label="Data"
             )
             ax_full.stairs(
@@ -2069,7 +2104,7 @@ def bootstrap_excels_fit_broad(
                 label="Continuum"
             )
             ax_full.stairs(
-                mu_disp, edges, color="r", lw=0.5,
+                mu_disp, edges, color="#ff0000a6", lw=0.5,
                 label="Mean model"
             )
 
@@ -2099,7 +2134,7 @@ def bootstrap_excels_fit_broad(
                     cont_fine_full,
                     comp_fine,
                     color=narrow_color,
-                    alpha=0.25,
+                    alpha=0.7,
                     linewidth=0.0,
                     label=label,
                 )
@@ -2119,7 +2154,7 @@ def bootstrap_excels_fit_broad(
                         cont_fine_full,
                         comp_fine,
                         color=broad_color,
-                        alpha=0.25,
+                        alpha=0.3,
                         linewidth=0.0,
                         label=label,
                     )
@@ -2165,15 +2200,15 @@ def bootstrap_excels_fit_broad(
                         step="mid", color="grey", alpha=0.25, linewidth=0
                     )
                     ax.stairs(
-                        flux_z, edges_z, color="#6a0dad",
-                        lw=0.5, alpha=0.9, label="Data"
+                        flux_z, edges_z, color="black",
+                        lw=0.5, alpha=0.7, label="Data"
                     )
                     ax.stairs(
                         cont_z, edges_z, color="b",
                         ls="--", lw=0.5, label="Continuum"
                     )
                     ax.stairs(
-                        mu_z, edges_z, color="r",
+                        mu_z, edges_z, color="#ff0000a6",
                         lw=0.5, label="Mean model"
                     )
 
@@ -2199,7 +2234,7 @@ def bootstrap_excels_fit_broad(
                                 cont_fine,
                                 comp_fine,
                                 color=narrow_color,
-                                alpha=0.25,
+                                alpha=0.7,
                                 linewidth=0.0,
                             )
 
@@ -2212,7 +2247,7 @@ def bootstrap_excels_fit_broad(
                                 cont_fine,
                                 comp_fine,
                                 color=broad_color,
-                                alpha=0.25,
+                                alpha=0.3,
                                 linewidth=0.0,
                             )
 
