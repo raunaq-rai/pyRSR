@@ -1,27 +1,14 @@
 """
-Broad+Narrow Balmer Gaussian line fitting with BIC selection
-===========================================================
+Broad-line emission fitting with BIC-based model selection.
 
-This module implements a variant of the PyRSR 1D line fitter which:
+Fits emission lines using area-normalized Gaussians with optional broad
+Balmer components (H-delta, H-beta, H-alpha). Uses Bayesian Information
+Criterion to select between narrow-only and broad+narrow models.
 
-* Fits emission lines in F_lambda with area-normalised Gaussians.
-* Optionally adds *broad* Balmer components (HDELTA_BROAD, HBETA_BROAD, HALPHA_BROAD).
-* Uses the Bayesian Information Criterion (BIC) to decide whether broad
-  components are warranted (vs narrow-only).
-* Keeps the original bootstrap functionality, but forces all bootstrap
-  realisations to use the *same* line list (including broad components
-  if selected by the base fit).
-* Overplots the narrow vs broad Balmer components in F_lambda space
-  when broad lines are present.
-
-Public API
-----------
-- excels_fit_poly_broad(...)
-- bootstrap_excels_fit_broad(...)
-- print_bootstrap_line_table_broad(...)
-
-These functions are explicitly separate from the original PyRSR line_fit
-module and do not modify it.
+Functions
+---------
+single_broad_fit : Fit a single spectrum with optional broad components
+broad_fit : Fit with bootstrap uncertainty estimation
 """
 
 from __future__ import annotations
@@ -55,6 +42,13 @@ from PyRSR.ma_line_fit import (
     rescale_uncertainties,
     apply_balmer_absorption_correction,
 )
+
+__all__ = [
+    "single_broad_fit",
+    "broad_fit",
+    "print_bootstrap_line_table_broad",
+]
+
 
 # --------------------------------------------------------------------
 # Constants + rest wavelengths
@@ -905,10 +899,10 @@ def _fit_emission_system(
 
     nL = len(which_lines)
 
-    # --- pixel scale in Å ---
+    # Pixel scale in Angstroms
     pix_A = float(np.median(np.diff(lamA_fit))) if lamA_fit.size > 1 else 1.0
 
-    # --- local S/N per line (same heuristic as before) ---
+    # Local S/N per line
     snr_loc = []
     for j, mu_um in enumerate(expected_um):
         w = np.abs(lam_fit - mu_um) < 5.0 * (sigmaA_inst[j] / 1e4)
@@ -1045,9 +1039,8 @@ def _fit_emission_system(
     _force_broad2_broader("HBETA_BROAD","HBETA_BROAD2",factor=2)
     _force_broad2_broader("HDELTA_BROAD","HDELTA_BROAD2",factor=2)
 
-    # sigmaA_lo, sigmaA_hi, sigmaA_seed then flow into the rest of the fitter
 
-    # --- amplitude seeds: SAME as old code (emission-only) ---
+    # Amplitude seeds for area-normalized Gaussians
     SQRT2PI = np.sqrt(2.0 * np.pi)
     A0, A_hi = [], []
     rms_flam = float(_safe_median(np.abs(resid_fit), 0.0))
@@ -1293,10 +1286,10 @@ def _fit_emission_system(
 
 
 # --------------------------------------------------------------------
-# Main public fit: excels_fit_poly_broad
+# Main public fit: single_broad_fit
 # --------------------------------------------------------------------
 
-def excels_fit_poly_broad(
+def single_broad_fit(
     source,
     z,
     grating: str = "PRISM",
@@ -1314,38 +1307,58 @@ def excels_fit_poly_broad(
     broad_mode: str = "auto",
 ):
     """
-    Fit *all* narrow lines in the chosen fit window, but decide how to
-    model both the Hα+[N II] and Hβ+[O III] complexes using *local* BIC
-    comparisons, independently for each Balmer line.
+    Fit emission lines with optional broad Balmer components using BIC selection.
 
-    Logic:
-      1. Fit continuum on the full spectrum.
-      2. Define a *global* fit window (fit_window_um or full coverage).
-      3. Build a list of all narrow lines in coverage in that window.
-      4. In a local Hα window only, compare:
-           - M0: NII_2 + H⍺ + NII_3  (narrow)
-           - M1: M0 + H⍺_BROAD
-           - M2: M1 + H⍺_BROAD2
-         using BIC.
-      5. In a local Hβ window only, compare:
-           - NARROW : HBETA + [O III] (all narrow)
-           - +1 BROAD: + HBETA_BROAD
-           - +2 BROAD: + HBETA_BROAD2
-         using BIC.
-      6. Append whichever broad Hα / Hβ components are favoured by BIC
-         to the *global* line list.
-      7. Do a single global fit with that final line list.
-      8. Plot and return results.
+    Fits all narrow emission lines in the specified window, then uses local BIC
+    comparisons to determine whether to add broad components to H-alpha, H-beta,
+    and H-delta independently.
 
-    If `force_lines` is provided (bootstrap path), all BIC logic is
-    skipped and the function just fits that fixed line list globally.
+    Parameters
+    ----------
+    source : dict or HDUList
+        Spectrum data with 'lam'/'wave', 'flux', and 'err' keys (dict) or
+        FITS HDUList with SPEC1D extension.
+    z : float
+        Redshift of the source.
+    grating : str, default='PRISM'
+        Grating name for line list selection.
+    lines_to_use : list of str, optional
+        Subset of emission lines to fit. If None, uses all available lines.
+    deg : int, default=2
+        Polynomial degree for continuum fitting.
+    continuum_windows : list of tuples or str, optional
+        Wavelength windows for continuum fitting, or 'two_sided_lya' for automatic.
+    lyman_cut : str, default='lya'
+        Lyman-alpha cutoff mode.
+    fit_window_um : tuple of float, optional
+        (low, high) wavelength range in microns for fitting. If None, uses full coverage.
+    plot : bool, default=True
+        Whether to generate diagnostic plots.
+    verbose : bool, default=True
+        Whether to print diagnostic information.
+    absorption_corrections : dict, optional
+        Absorption corrections to apply.
+    force_lines : list of str, optional
+        If provided, skips BIC selection and fits this exact line list.
+    bic_delta_prefer : float, default=0.0
+        BIC improvement threshold for preferring broad components.
+    snr_broad_threshold : float, default=5.0
+        Minimum SNR required to consider adding broad components in auto mode.
+    broad_mode : str, default='auto'
+        Broad component selection mode: 'auto' (BIC-based), 'off' (narrow only),
+        'broad1' (force BROAD), 'broad2' (force BROAD2), 'both' (force both).
+
+    Returns
+    -------
+    dict
+        Fit results including continuum, model, line parameters, and BIC values.
     """
 
     valid_modes = {"auto", "off", "broad1", "broad2", "both"}
     if broad_mode not in valid_modes:
         raise ValueError(f"broad_mode must be one of {valid_modes}, got {broad_mode!r}")
 
-    # --- Load spectrum (unchanged from your original) ---
+    # Load spectrum
     if isinstance(source, dict):
         lam_um = np.asarray(source.get("lam", source.get("wave")), float)
         flux_uJy = np.asarray(source["flux"], float)
@@ -1360,7 +1373,7 @@ def excels_fit_poly_broad(
     ok = np.isfinite(lam_um) & np.isfinite(flux_uJy) & np.isfinite(err_uJy) & (err_uJy > 0)
     lam_um, flux_uJy, err_uJy = lam_um[ok], flux_uJy[ok], err_uJy[ok]
 
-    # --- Continuum windows around Lyα if requested (unchanged) ---
+    # Continuum windows around Lyman-alpha if requested
     auto_windows = None
     if isinstance(continuum_windows, str) and continuum_windows.lower() == "two_sided_lya":
         auto_windows = continuum_windows_two_sides_of_lya(
@@ -1377,7 +1390,7 @@ def excels_fit_poly_broad(
         continuum_windows = auto_windows
         lyman_cut = None
 
-    # --- Convert to F_lambda and fit continuum (unchanged) ---
+    # Convert to F_lambda and fit continuum
     flam     = fnu_uJy_to_flam(flux_uJy, lam_um)
     sig_flam = fnu_uJy_to_flam(err_uJy,  lam_um)
 
@@ -1388,9 +1401,7 @@ def excels_fit_poly_broad(
     resid_full   = flam - Fcont
     sig_flam_fit = rescale_uncertainties(resid_full, sig_flam)
 
-    # ------------------------------------------------------------
-    # GLOBAL FIT WINDOW for *all* lines (no more special Hα-only)
-    # ------------------------------------------------------------
+    # Global fit window for all lines
     if fit_window_um is not None:
         lo_all, hi_all = fit_window_um
         w_all = (lam_um >= lo_all) & (lam_um <= hi_all)
@@ -2271,7 +2282,7 @@ def excels_fit_poly_broad(
 
 
 # --------------------------------------------------------------------
-# Bootstrap variant that uses excels_fit_poly_broad
+# Bootstrap variant that uses single_broad_fit
 # --------------------------------------------------------------------
 
 def _edges_median_spacing(lam_um: np.ndarray) -> np.ndarray:
@@ -2297,7 +2308,7 @@ def _sigma_clip_mean_std(a, axis=0, sigma=3.0, min_keep=5):
     return np.nanmean(a, axis=axis), np.nanstd(a, axis=axis)
 
 
-def bootstrap_excels_fit_broad(
+def broad_fit(
     source,
     z,
     grating: str = "PRISM",
@@ -2321,12 +2332,64 @@ def bootstrap_excels_fit_broad(
     plot_unit: str = "fnu",       
 ):
 
-    """
-    Bootstrap wrapper around excels_fit_poly_broad, preserving its line list.
 
-    Uses the base (non-bootstrapped) run to determine the preferred model
-    (narrow-only vs broad+Balmer) and then forces all bootstrap realisations
-    to use the same `which_lines`.
+    """
+    Fit emission lines with bootstrap uncertainty estimation.
+
+    Performs a base fit to determine the optimal line list (including broad
+    components if warranted by BIC), then runs bootstrap iterations using the
+    same line list to estimate uncertainties.
+
+    Parameters
+    ----------
+    source : dict or HDUList
+        Spectrum data with 'lam'/'wave', 'flux', and 'err' keys (dict) or
+        FITS HDUList with SPEC1D extension.
+    z : float
+        Redshift of the source.
+    grating : str, default='PRISM'
+        Grating name for line list selection.
+    n_boot : int, default=200
+        Number of bootstrap iterations.
+    source_id : str, optional
+        Source identifier for plot titles.
+    deg : int, default=2
+        Polynomial degree for continuum fitting.
+    continuum_windows : list of tuples or str, optional
+        Wavelength windows for continuum fitting, or 'two_sided_lya' for automatic.
+    lyman_cut : str, default='lya'
+        Lyman-alpha cutoff mode.
+    fit_window_um : tuple of float, optional
+        (low, high) wavelength range in microns for fitting.
+    absorption_corrections : dict, optional
+        Absorption corrections to apply.
+    random_state : int or RandomState, optional
+        Random seed for reproducibility.
+    verbose : bool, default=False
+        Whether to print diagnostic information.
+    plot : bool, default=True
+        Whether to generate diagnostic plots.
+    show_progress : bool, default=True
+        Whether to show progress bar during bootstrap.
+    save_path : str, optional
+        Path to save the output plot.
+    save_dpi : int, default=500
+        DPI for saved plot.
+    save_format : str, default='png'
+        Format for saved plot.
+    save_transparent : bool, default=False
+        Whether to use transparent background in saved plot.
+    lines_to_use : list of str, optional
+        Subset of emission lines to fit.
+    broad_mode : str, default='auto'
+        Broad component selection mode: 'auto', 'off', 'broad1', 'broad2', 'both'.
+    plot_unit : str, default='fnu'
+        Plotting unit: 'fnu' (µJy) or 'flam' (F_lambda).
+
+    Returns
+    -------
+    dict
+        Bootstrap results including mean line parameters, uncertainties, and plots.
     """
     # -------- load once --------
     if isinstance(source, dict):
@@ -2344,7 +2407,7 @@ def bootstrap_excels_fit_broad(
     lam_um, flux_uJy, err_uJy = lam_um[ok], flux_uJy[ok], err_uJy[ok]
 
     # -------- base run (chooses model structure) --------
-    base = excels_fit_poly_broad(
+    base = single_broad_fit(
         source=dict(lam=lam_um, flux=flux_uJy, err=err_uJy),
         z=z, grating=grating, deg=deg,
         continuum_windows=continuum_windows,
@@ -2427,7 +2490,7 @@ def bootstrap_excels_fit_broad(
         flux_uJy_b = flux_uJy + rng.normal(0.0, err_uJy)
 
         try:
-            fb = excels_fit_poly_broad(
+            fb = single_broad_fit(
                 source=dict(lam=lam_um, flux=flux_uJy_b, err=err_uJy),
                 z=z, grating=grating, deg=deg,
                 continuum_windows=continuum_windows,
@@ -3084,5 +3147,3 @@ def print_bootstrap_line_table_broad(boot, save_path: str | None = None):
         with open(save_path, "w") as f:
             f.write(table_text)
         print(f"\nSaved bootstrap summary → {save_path}")
-
-print("change8")
