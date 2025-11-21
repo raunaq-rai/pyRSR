@@ -2743,7 +2743,7 @@ def broad_fit(
         for zd in zoom_defs:
             restA = [REST_LINES_A[n] for n in zd["names"] if n in REST_LINES_A]
             if restA:
-                zd["lo"], zd["hi"] = _window_from_lines_um(restA, z, pad_A=100.0)
+                zd["lo"], zd["hi"] = _window_from_lines_um(restA, z, pad_A=10.0)
             else:
                 zd["lo"], zd["hi"] = np.nan, np.nan
 
