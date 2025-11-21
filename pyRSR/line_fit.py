@@ -1,32 +1,16 @@
 """
-PyRSR line_fit — Gaussian line-fitting in linear wavelength (F_λ)
-=================================================================
+Gaussian emission-line fitting for JWST/NIRSpec spectra.
 
-This module implements a *linear-wavelength, pure-Gaussian* emission–line fitter
-for JWST/NIRSpec 1D spectra. It provides:
+Fits emission lines using area-normalized Gaussians in F_λ space with
+polynomial continuum subtraction. Provides integrated fluxes, line widths,
+centroids, and SNR measurements with bootstrap uncertainty estimation.
 
-* A σ–weighted polynomial continuum fitter with robust masking of emission lines.
-* Independent Gaussian fits for each emission line:
-   - integrated flux A  [erg s⁻¹ cm⁻²]
-   - Gaussian width σ_A [Å]
-   - centroid μ_A       [Å] - check this
-   - Integrated SNR
-   - Peak SNR
-* Automatic centroid seeding from local observed peaks near catalog positions.
-* Flux density plots in both µJy and F_λ using bin-aware “stairs” rendering,
-   plus zoom windows around Hβ+[O III] for high-z galaxies (in µJy and F_λ).
-   Data points with ±1σ uncertainties are overplotted in grey on all panels.
-* A parametric bootstrap utility to propagate uncertainties by repeatedly
-   re-fitting spectra with noise realizations.
-
-Units & conventions
--------------------
-- Wavelength arrays in **µm**; all line centers/widths reported in **Å**.
-- Flux density in **µJy** and in **F_λ** [erg s⁻¹ cm⁻² Å⁻¹].
-- Integrated line fluxes in **erg s⁻¹ cm⁻²**.
-- All model profiles are *area-normalized* in F_λ; the amplitude A is the
-  integrated line flux.
+Functions
+---------
+excels_fit_poly : Fit emission lines with polynomial continuum
+bootstrap_excels_fit : Fit with bootstrap uncertainty estimation
 """
+
 
 from __future__ import annotations
 import os
@@ -39,7 +23,8 @@ from astropy.io import fits
 from numpy.polynomial import Polynomial
 from scipy.optimize import least_squares
 from scipy.special import erf
-from astropy.io import fits
+
+__all__ = ["excels_fit_poly", "bootstrap_excels_fit"]
 
 # tqdm (auto if available; no-op fallback)
 try:
@@ -48,47 +33,19 @@ except Exception:  # fallback if tqdm isn't installed
     def tqdm(x, *args, **kwargs):
         return x
 
-# --------------------------------------------------------------------
-# Imports from line.py (do not modify that file)
-# --------------------------------------------------------------------
-from PyRSR.ma_line_fit import (
+from PyRSR.fitting_helpers import (
     fnu_uJy_to_flam, flam_to_fnu_uJy,
     sigma_grating_logA,             # σ_gr in log10(λ), λ in µm
-    line_centers_obs_A,             # nominal observed centers in Å
     measure_fluxes_profile_weighted,
     equivalent_widths_A,
     rescale_uncertainties,
     apply_balmer_absorption_correction,
+    REST_LINES_A,
 )
 
 C_AA = 2.99792458e18  #: Speed of light [Å·Hz·s⁻¹]
 LN10 = np.log(10.0)    #: Natural log of 10
 
-#: Rest wavelengths of commonly fitted nebular and recombination lines [Å]
-REST_LINES_A = {
-    "NIII_1": 989.790, "NIII_2": 991.514,"NIII_3": 991.579,
-
-    "NV_1": 1238.821, "NV_2": 1242.804, "NIV_1": 1486.496,
-
-    "HEII_1": 1640.420,  "OIII_05": 1663.4795, "CIII": 1908.734,
-
-    "OII_UV_1": 3727.092, "OII_UV_2": 3729.875,
-    "NEIII_UV_1": 3869.86,"HEI_1": 3889.749, "NEIII_UV_2": 3968.59, "HEPSILON": 3971.1951,
-    "HDELTA": 4102.8922, "HGAMMA": 4341.6837, "OIII_1": 4364.436,
-    "HEI_2": 4471.479, 
-    
-    
-    "HEII_2": 4685.710, "HBETA": 4862.6830,
-    "OIII_2": 4960.295, "OIII_3": 5008.240, 
-    
-    "NII_1":5756.19,"HEI_3": 5877.252,
-    
-    "NII_2":6549.86,"HALPHA": 6564.608,"NII_3":6585.27,"HEI_4": 6679.9956, "SII_1": 6718.295, "SII_2": 6732.674,
-}
-
-# ============================================================
-# Helpers
-# ============================================================
 
 def _lyman_cut_um(z: float, which: str | None = "lya") -> float:
     if which is None:
@@ -238,10 +195,6 @@ def _annotate_lines(ax, which_lines, z, per_line=None,
             bbox=dict(facecolor='white', edgecolor='none', alpha=0.5, pad=0.5)
         )
 
-# ============================================================
-# NEW: Two-window continuum selection around observed Lyα
-# ============================================================
-
 def continuum_windows_two_sides_of_lya(
     lam_source_or_dict,
     z: float,
@@ -305,10 +258,6 @@ def continuum_windows_two_sides_of_lya(
         print(f"Continuum windows (blue/red): {windows if windows else '(none)'}")
 
     return windows
-
-# ============================================================
-# Continuum (σ-weighted polynomial, with line masking)
-# ============================================================
 
 def fit_continuum_polynomial(lam_um, flam, z, deg=2, windows=None,
                              lyman_cut="lya", sigma_flam=None,
@@ -442,11 +391,6 @@ def _prune_lines_without_data(
     return [ln for ln, k in zip(which_lines, keep) if k], keep
 
 
-# ============================================================
-# Seeds: local peaks for μ
-# ============================================================
-
-
 def _find_local_peaks(lam_um, resid_flam, expected_um,
                       sigma_gr_um=None,                 # kept for backward compatibility
                       min_window_um=0.001,
@@ -480,11 +424,6 @@ def _find_local_peaks(lam_um, resid_flam, expected_um,
             peaks.append(mu0)
     return np.array(peaks, float)
 
-
-# ============================================================
-# Model: sum of area-normalized Gaussians in Fλ
-# ============================================================
-
 def build_model_flam_linear(params, lam_um, z, grating, which_lines, mu_seed_um):
     nL = len(which_lines)
     A = np.array(params[0:nL], float)
@@ -512,10 +451,6 @@ def build_model_flam_linear(params, lam_um, z, grating, which_lines, mu_seed_um)
 
     return model, profiles, centers
 
-# ============================================================
-# Robust seeds/bounds finalization
-# ============================================================
-
 def _finalize_seeds_and_bounds(p0, lb, ub):
     p0 = np.array(p0, float); lb = np.array(lb, float); ub = np.array(ub, float)
     bad = ~np.isfinite(lb) | ~np.isfinite(ub) | (ub <= lb)
@@ -535,14 +470,52 @@ def _finalize_seeds_and_bounds(p0, lb, ub):
         p0[outside] = np.minimum(np.maximum(p0[outside], lb[outside] + eps), ub[outside] - eps)
     return p0, lb, ub
 
-# ============================================================
-# Main fit
-# ============================================================
+
 def excels_fit_poly(source, z, grating="PRISM", lines_to_use=None,
                     deg=2, continuum_windows=None, lyman_cut="lya",
                     fit_window_um=None, plot=True, verbose=True,
                     absorption_corrections=None):
-    # --- Load spectrum ---
+    """
+    Fit emission lines with polynomial continuum subtraction.
+
+    Parameters
+    ----------
+    source : str, HDUList, or dict
+        FITS file path, opened HDUList, or dict with 'lam'/'wave', 'flux', 'err' (µJy).
+    z : float
+        Redshift.
+    grating : str, default='PRISM'
+        Grating name for instrumental resolution.
+    lines_to_use : list of str, optional
+        Line names to fit. If None, fits all lines in spectral coverage.
+    deg : int, default=2
+        Polynomial degree for continuum.
+    continuum_windows : list of tuple or str, optional
+        Wavelength windows (µm) for continuum fitting. Use 'two_sided_lya' for
+        automatic windows around Lyman-α.
+    lyman_cut : str or None, default='lya'
+        Exclude data blueward of Lyman-α ('lya') or Lyman limit ('lyman_limit').
+    fit_window_um : tuple of float, optional
+        (lo, hi) wavelength range (µm) for fitting. If None, uses full spectrum.
+    plot : bool, default=True
+        Generate diagnostic plots.
+    verbose : bool, default=True
+        Print fitting progress.
+    absorption_corrections : dict, optional
+        Balmer absorption corrections to apply.
+
+    Returns
+    -------
+    dict
+        Fit results with keys:
+        - 'per_line': dict of per-line measurements (flux, width, centroid, SNR, EW)
+        - 'lam_um', 'flux_uJy', 'err_uJy': input spectrum
+        - 'Fcont': continuum model (F_λ)
+        - 'model_flam': emission line model (F_λ)
+        - 'which_lines': fitted line names
+        - 'z', 'grating': input parameters
+    """
+
     if isinstance(source, dict):
         lam_um = np.asarray(source.get("lam", source.get("wave")), float)
         flux_uJy = np.asarray(source["flux"], float)
@@ -557,7 +530,7 @@ def excels_fit_poly(source, z, grating="PRISM", lines_to_use=None,
     ok = np.isfinite(lam_um) & np.isfinite(flux_uJy) & np.isfinite(err_uJy) & (err_uJy > 0)
     lam_um, flux_uJy, err_uJy = lam_um[ok], flux_uJy[ok], err_uJy[ok]
 
-    # --- AUTO continuum windows around Lyα if requested ---
+    # Auto continuum windows around Lyman-α if requested
     auto_windows = None
     if isinstance(continuum_windows, str) and continuum_windows.lower() == "two_sided_lya":
         auto_windows = continuum_windows_two_sides_of_lya(lam_um, z, buffer_rest_A=200.0, min_pts=12, verbose=verbose)
@@ -568,21 +541,21 @@ def excels_fit_poly(source, z, grating="PRISM", lines_to_use=None,
 
     if auto_windows is not None:
         continuum_windows = auto_windows
-        lyman_cut = None  # we already gapped Lyα with explicit windows
+        lyman_cut = None
 
-    # --- Convert to F_lambda ---
-    flam     = fnu_uJy_to_flam(flux_uJy, lam_um)     # data in Fλ
-    sig_flam = fnu_uJy_to_flam(err_uJy,  lam_um)     # 1σ in Fλ
+    # Convert to F_λ
+    flam     = fnu_uJy_to_flam(flux_uJy, lam_um)
+    sig_flam = fnu_uJy_to_flam(err_uJy,  lam_um)
 
-    # --- Continuum ---
+    # Fit continuum
     Fcont, _ = fit_continuum_polynomial(
         lam_um, flam, z, deg=deg, windows=continuum_windows,
         lyman_cut=lyman_cut, sigma_flam=sig_flam, grating=grating
     )
     resid_full   = flam - Fcont
-    sig_flam_fit = rescale_uncertainties(resid_full, sig_flam)  # used in fitting
+    sig_flam_fit = rescale_uncertainties(resid_full, sig_flam)
 
-    # --- Fit window ---
+    # Fit window
     if fit_window_um:
         lo, hi = fit_window_um
         w = (lam_um >= lo) & (lam_um <= hi)
@@ -590,10 +563,10 @@ def excels_fit_poly(source, z, grating="PRISM", lines_to_use=None,
     else:
         lam_fit, resid_fit, sig_fit, Fcont_fit = lam_um, resid_full, sig_flam_fit, Fcont
 
-    # --- Lines in coverage ---
+    # Lines in spectral coverage
     which_lines = _lines_in_range(z, lam_fit, lines_to_use, margin_um=0.02)
 
-    # NEW: drop lines that have no finite data locally
+    # Drop lines without local data
     which_lines, _keep_mask = _prune_lines_without_data(
         lam_fit, resid_fit, sig_fit, which_lines, z, grating,   # <--- was sig_flam_fit
         min_pts_per_line=3,
@@ -606,15 +579,14 @@ def excels_fit_poly(source, z, grating="PRISM", lines_to_use=None,
     if not which_lines:
         raise ValueError("No emission lines with local data in the fit window.")
 
-
-    # --- Instrument σ and centroid seeds ---
+    # Instrumental widths and centroid seeds
     expected_um  = np.array([REST_LINES_A[nm]*(1+z)/1e4 for nm in which_lines])
-    sigma_gr_log = np.array([sigma_grating_logA(grating, mu_um) for mu_um in expected_um])  # log10
-    muA_nom      = expected_um * 1e4                          # Å
-    sigmaA_inst  = muA_nom * LN10 * sigma_gr_log              # Å (instrumental σ)
-    sigma_um_inst = sigmaA_inst / 1e4                         # µm (for peak search)
+    sigma_gr_log = np.array([sigma_grating_logA(grating, mu_um) for mu_um in expected_um])
+    muA_nom      = expected_um * 1e4
+    sigmaA_inst  = muA_nom * LN10 * sigma_gr_log
+    sigma_um_inst = sigmaA_inst / 1e4
 
-    # NEW: per-line local pixel size in Å/µm (needed for tight peak search)
+    # Per-line local pixel size for peak search
     lamA_fit = lam_fit * 1e4
     pix_A_global = float(np.median(np.diff(lamA_fit))) if lamA_fit.size > 1 else 1.0
 
@@ -624,19 +596,16 @@ def excels_fit_poly(source, z, grating="PRISM", lines_to_use=None,
             return float(np.median(np.diff((lam_fit[mloc] * 1e4))))
         return pix_A_global
 
-    pixA_local   = np.array([_local_pix_A_for(mu) for mu in expected_um], float)  # Å
-    pix_um_local = pixA_local / 1e4                                              # µm
+    pixA_local   = np.array([_local_pix_A_for(mu) for mu in expected_um], float)
+    pix_um_local = pixA_local / 1e4
 
-    # NEW: pixel-sized peak search windows
+    # Pixel-sized peak search windows
     g = str(grating).lower()
     if "prism" in g:
-        # PRISM: tolerant (as before) but never smaller than ±2 pixels
         peak_half_um = np.maximum(5.0 * sigma_um_inst, 2.0 * pix_um_local)
     else:
-        # MED/HIGH: search only within ±2 pixels of the expected position
         peak_half_um = 2.0 * pix_um_local
 
-    # REPLACE your old _find_local_peaks call with this one:
     mu_seed_um = _find_local_peaks(
         lam_fit, resid_fit, expected_um,
         sigma_gr_um=sigma_um_inst,
@@ -1099,7 +1068,62 @@ def bootstrap_excels_fit(
     lines_to_use=None,
     plot_unit='both'
 ):
-    # -------- load once --------
+    """
+    Fit emission lines with bootstrap uncertainty estimation.
+
+    Parameters
+    ----------
+    source : str, HDUList, or dict
+        Spectrum source (see `excels_fit_poly`).
+    z : float
+        Redshift.
+    grating : str, default='PRISM'
+        Grating name.
+    n_boot : int, default=200
+        Number of bootstrap iterations.
+    source_id : str, optional
+        Source identifier for plot titles.
+    deg : int, default=2
+        Polynomial degree for continuum.
+    continuum_windows : list of tuple or str, optional
+        Continuum fitting windows.
+    lyman_cut : str or None, default='lya'
+        Lyman cutoff mode.
+    fit_window_um : tuple of float, optional
+        Fitting wavelength range (µm).
+    absorption_corrections : dict, optional
+        Balmer absorption corrections.
+    random_state : int or RandomState, optional
+        Random seed for reproducibility.
+    verbose : bool, default=False
+        Print bootstrap progress.
+    plot : bool, default=True
+        Generate diagnostic plots.
+    show_progress : bool, default=True
+        Show progress bar.
+    save_path : str, optional
+        Path to save plots.
+    save_dpi : int, default=500
+        Plot DPI.
+    save_format : str, default='png'
+        Plot format.
+    save_transparent : bool, default=False
+        Transparent background.
+    lines_to_use : list of str, optional
+        Line names to fit.
+    plot_unit : str, default='both'
+        Plot units ('fnu', 'flam', or 'both').
+
+    Returns
+    -------
+    dict
+        Bootstrap results with keys:
+        - 'per_line': dict of per-line measurements with bootstrap uncertainties
+        - 'base_fit': nominal fit results
+        - 'bootstrap_samples': list of bootstrap fit results
+        - 'n_boot': number of bootstrap iterations
+    """
+
     if isinstance(source, dict):
         lam_um = np.asarray(source.get("lam", source.get("wave")), float)
         flux_uJy = np.asarray(source["flux"], float)

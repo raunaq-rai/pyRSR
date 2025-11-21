@@ -34,13 +34,14 @@ except Exception:  # pragma: no cover
 # --------------------------------------------------------------------
 # Imports from PyRSR.ma_line_fit (unchanged; this module wraps them)
 # --------------------------------------------------------------------
-from PyRSR.ma_line_fit import (
+from PyRSR.fitting_helpers import (
     fnu_uJy_to_flam, flam_to_fnu_uJy,
     sigma_grating_logA,             # σ_gr in log10(λ), λ in µm
     measure_fluxes_profile_weighted,
     equivalent_widths_A,
     rescale_uncertainties,
     apply_balmer_absorption_correction,
+    REST_LINES_A,
 )
 
 __all__ = [
@@ -57,22 +58,7 @@ __all__ = [
 C_AA = 2.99792458e18  # Speed of light [Å·Hz·s⁻¹]
 LN10 = np.log(10.0)   # ln(10)
 
-# Rest wavelengths of nebular / recombination lines [Å]
-REST_LINES_A: Dict[str, float] = {
-    "NIII_1": 989.790, "NIII_2": 991.514, "NIII_3": 991.579,
-    "NV_1": 1238.821, "NV_2": 1242.804, "NIV_1": 1486.496,
-    "HEII_1": 1640.420, "OIII_05": 1663.4795, "CIII": 1908.734,
-    "OII_UV_1": 3727.092, "OII_UV_2": 3729.875,
-    "NEIII_UV_1": 3869.86, "HEI_1": 3889.749,
-    "NEIII_UV_2": 3968.59, "HEPSILON": 3971.1951,
-    "HDELTA": 4102.8922, "HGAMMA": 4341.6837, "OIII_1": 4364.436,
-    "HEI_2": 4471.479,
-    "HEII_2": 4685.710, "HBETA": 4862.6830,
-    "OIII_2": 4960.295, "OIII_3": 5008.240,
-    "NII_1": 5756.19, "HEI_3": 5877.252,
-    "NII_2": 6549.86, "H⍺": 6564.608, "NII_3": 6585.27,"HEI_4": 6679.9956,
-    "SII_1": 6718.295, "SII_2": 6732.674,
-}
+
 
 # Broad Balmer aliases (same rest λ, but allowed much larger σ)
 REST_LINES_A["HBETA_BROAD"] = REST_LINES_A["HBETA"]
@@ -2144,32 +2130,44 @@ def single_broad_fit(
             top_narrow_b1  = top_narrow + em_b1
             top_narrow_b12 = top_narrow_b1 + em_b2  # full Hα model
 
-            # convert each layer to µJy
-            base_uJy      = flam_to_fnu_uJy(base_flam,      lam_ha)
-            top_narrow_uJy = flam_to_fnu_uJy(top_narrow,    lam_ha)
-            top_b1_uJy     = flam_to_fnu_uJy(top_narrow_b1, lam_ha)
-            top_b2_uJy     = flam_to_fnu_uJy(top_narrow_b12, lam_ha)
+            # Create fine grid for smooth fills
+            oversample = 6
+            lam_ha_fine = np.linspace(lam_ha.min(), lam_ha.max(), 
+                                      max(lam_ha.size * oversample, 200))
+            
+            # Interpolate each layer onto fine grid
+            base_flam_fine = np.interp(lam_ha_fine, lam_ha, base_flam)
+            top_narrow_fine = np.interp(lam_ha_fine, lam_ha, top_narrow)
+            top_narrow_b1_fine = np.interp(lam_ha_fine, lam_ha, top_narrow_b1)
+            top_narrow_b12_fine = np.interp(lam_ha_fine, lam_ha, top_narrow_b12)
+            
+            # Convert to µJy
+            base_uJy_fine = flam_to_fnu_uJy(base_flam_fine, lam_ha_fine)
+            top_narrow_uJy_fine = flam_to_fnu_uJy(top_narrow_fine, lam_ha_fine)
+            top_b1_uJy_fine = flam_to_fnu_uJy(top_narrow_b1_fine, lam_ha_fine)
+            top_b2_uJy_fine = flam_to_fnu_uJy(top_narrow_b12_fine, lam_ha_fine)
 
-            # stacked areas: each layer *adds* to the previous one
+            # Smooth stacked areas
             ax1.fill_between(
-                lam_ha, base_uJy, top_narrow_uJy,
-                step="mid", color=narrow_color, alpha=0.35,
-                label="Hα+[N II] narrow",
+                lam_ha_fine, base_uJy_fine, top_narrow_uJy_fine,
+                color=narrow_color, alpha=0.35,
+                label="Hα+[N II] narrow", linewidth=0,
             )
 
             if np.any(np.isfinite(em_b1)) and np.nanmax(np.abs(em_b1)) > 0:
                 ax1.fill_between(
-                    lam_ha, top_narrow_uJy, top_b1_uJy,
-                    step="mid", color=broad_color, alpha=0.25,
-                    label="Hα broad 1",
+                    lam_ha_fine, top_narrow_uJy_fine, top_b1_uJy_fine,
+                    color=broad_color, alpha=0.25,
+                    label="Hα broad 1", linewidth=0,
                 )
 
             if np.any(np.isfinite(em_b2)) and np.nanmax(np.abs(em_b2)) > 0:
                 ax1.fill_between(
-                    lam_ha, top_b1_uJy, top_b2_uJy,
-                    step="mid", color=broad_color2, alpha=0.20,
-                    label="Hα broad 2",
+                    lam_ha_fine, top_b1_uJy_fine, top_b2_uJy_fine,
+                    color=broad_color2, alpha=0.20,
+                    label="Hα broad 2", linewidth=0,
                 )
+
 
 
         ax1.set_ylabel('Flux density [µJy]')
@@ -2215,24 +2213,36 @@ def single_broad_fit(
             top_narrow_b1  = top_narrow + em_b1
             top_narrow_b12 = top_narrow_b1 + em_b2
 
+            # Create fine grid for smooth fills
+            oversample = 6
+            lam_ha_fine = np.linspace(lam_ha.min(), lam_ha.max(),
+                                      max(lam_ha.size * oversample, 200))
+            
+            # Interpolate onto fine grid
+            base_flam_fine = np.interp(lam_ha_fine, lam_ha, base_flam)
+            top_narrow_fine = np.interp(lam_ha_fine, lam_ha, top_narrow)
+            top_narrow_b1_fine = np.interp(lam_ha_fine, lam_ha, top_narrow_b1)
+            top_narrow_b12_fine = np.interp(lam_ha_fine, lam_ha, top_narrow_b12)
+
+            # Smooth stacked areas
             ax2.fill_between(
-                lam_ha, base_flam, top_narrow,
-                step="mid", color=narrow_color, alpha=0.35,
-                label="Hα+[N II] narrow",
+                lam_ha_fine, base_flam_fine, top_narrow_fine,
+                color=narrow_color, alpha=0.35,
+                label="Hα+[N II] narrow", linewidth=0,
             )
 
             if np.any(np.isfinite(em_b1)) and np.nanmax(np.abs(em_b1)) > 0:
                 ax2.fill_between(
-                    lam_ha, top_narrow, top_narrow_b1,
-                    step="mid", color=broad_color, alpha=0.25,
-                    label="Hα broad 1",
+                    lam_ha_fine, top_narrow_fine, top_narrow_b1_fine,
+                    color=broad_color, alpha=0.25,
+                    label="Hα broad 1", linewidth=0,
                 )
 
             if np.any(np.isfinite(em_b2)) and np.nanmax(np.abs(em_b2)) > 0:
                 ax2.fill_between(
-                    lam_ha, top_narrow_b1, top_narrow_b12,
-                    step="mid", color=broad_color2, alpha=0.20,
-                    label="Hα broad 2",
+                    lam_ha_fine, top_narrow_b1_fine, top_narrow_b12_fine,
+                    color=broad_color2, alpha=0.20,
+                    label="Hα broad 2", linewidth=0,
                 )
 
 
