@@ -39,6 +39,7 @@ from astropy.io import fits
 from numpy.polynomial import Polynomial
 from scipy.optimize import least_squares
 from scipy.special import erf
+from astropy.io import fits
 
 # tqdm (auto if available; no-op fallback)
 try:
@@ -1059,12 +1060,6 @@ def _has_fit_in_window(base_lines, candidate_names, snr_min=1.0):
         if np.isfinite(snr) and (snr >= snr_min) and np.isfinite(f) and np.isfinite(mu):
             return True
     return False
-
-import os
-import numpy as np
-import matplotlib.pyplot as plt
-from astropy.io import fits
-from tqdm.auto import tqdm
 
 
 def _edges_median_spacing(lam_um: np.ndarray) -> np.ndarray:
