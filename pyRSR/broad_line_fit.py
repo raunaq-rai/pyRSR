@@ -1,5 +1,5 @@
 """
-Broad-line emission fitting with BIC-based model selection.
+Broad-line emission fitting with BIC-based model selection. new
 
 Fits emission lines using area-normalized Gaussians with optional broad
 Balmer components (H-delta, H-beta, H-alpha). Uses Bayesian Information
@@ -1403,7 +1403,7 @@ def single_broad_fit(
         raise ValueError("No data in the chosen fit_window_um / global window.")
 
     # ----------------------------------------------------------------
-    # Helper: decide Hα model (none / one / two broad) in *local* window
+    # Helper: decide Hα model (none / one / two broad) in *local* window new!
     # ----------------------------------------------------------------
     def _select_ha_model(which_lines_all):
         """
@@ -1416,17 +1416,18 @@ def single_broad_fit(
         BIC_narrow = np.nan
         BIC_1broad = np.nan
         BIC_2broad = np.nan
+        BIC_b2only = np.nan
         BIC_broad  = np.nan
         broad_choice = "none"
 
         # If Hα isn't even in the global narrow list, nothing to do
         if "H⍺" not in which_lines_all:
-            return broad_choice, BIC_narrow, BIC_1broad, BIC_2broad, BIC_broad
+            return broad_choice, BIC_narrow, BIC_1broad, BIC_2broad, BIC_b2only, BIC_broad
 
         ha_triplet = ["NII_2", "H⍺", "NII_3"]
         which_ha_narrow = [ln for ln in ha_triplet if ln in which_lines_all]
         if "H⍺" not in which_ha_narrow:
-            return broad_choice, BIC_narrow, BIC_1broad, BIC_2broad, BIC_broad
+            return broad_choice, BIC_narrow, BIC_1broad, BIC_2broad, BIC_b2only, BIC_broad
 
         # Local Hα window: NII_2–NII_3 ± padding
         rest_list = [REST_LINES_A["NII_2"], REST_LINES_A["H⍺"], REST_LINES_A["NII_3"]]
@@ -1434,7 +1435,7 @@ def single_broad_fit(
         m_ha = (lam_all >= lo_ha) & (lam_all <= hi_ha)
         if np.count_nonzero(m_ha) < 5:
             # basically no Hα coverage
-            return broad_choice, BIC_narrow, BIC_1broad, BIC_2broad, BIC_broad
+            return broad_choice, BIC_narrow, BIC_1broad, BIC_2broad, BIC_b2only, BIC_broad
 
         lam_ha   = lam_all[m_ha]
         resid_ha = resid_all[m_ha]
@@ -1453,7 +1454,7 @@ def single_broad_fit(
         if broad_mode == "off":
             if verbose:
                 print("broad_mode='off' → using narrow-only Hα+[N II] model.")
-            return "none", BIC_narrow, BIC_1broad, BIC_2broad, BIC_broad
+            return "none", BIC_narrow, BIC_1broad, BIC_2broad, BIC_b2only, BIC_broad
 
         # Check Hα SNR for eligibility (auto mode)
         ha_info = fit_narrow["per_line"].get("H⍺", None)
@@ -1463,7 +1464,7 @@ def single_broad_fit(
         if (broad_mode == "auto") and (not eligible or ha_snr < snr_broad_threshold):
             if verbose:
                 print(f"No strong Hα line (SNR={ha_snr:.1f}) → staying narrow-only.")
-            return "none", BIC_narrow, BIC_1broad, BIC_2broad, BIC_broad
+            return "none", BIC_narrow, BIC_1broad, BIC_2broad, BIC_b2only, BIC_broad
 
         # Try adding 1 and 2 broad Hα components on the local window
         def _safe_fit(which, label):
@@ -1571,7 +1572,7 @@ def single_broad_fit(
                 print("  +both BROAD      : (fit failed)")
             print(f"  → Selected model: {model_desc}")
 
-        return broad_choice, BIC_narrow, BIC_1broad, BIC_2broad, BIC_broad
+        return broad_choice, BIC_narrow, BIC_1broad, BIC_2broad, BIC_b2only, BIC_broad
 
     # ----------------------------------------------------------------
     # Helper: decide Hδ model (none / one / two broad) in *local* window
@@ -1582,22 +1583,23 @@ def single_broad_fit(
         change the global continuum or residuals. Returns:
 
           broad_choice ∈ {"none","one","two"}
-          BIC_narrow, BIC_1broad, BIC_2broad, BIC_broad
+          BIC_narrow, BIC_1broad, BIC_2broad, BIC_b2only, BIC_broad
         """
         BIC_narrow = np.nan
         BIC_1broad = np.nan
         BIC_2broad = np.nan
+        BIC_b2only = np.nan
         BIC_broad  = np.nan
         broad_choice = "none"
 
         # If Hδ isn't even in the global narrow list, nothing to do
         if "HDELTA" not in which_lines_all:
-            return broad_choice, BIC_narrow, BIC_1broad, BIC_2broad, BIC_broad
+            return broad_choice, BIC_narrow, BIC_1broad, BIC_2broad, BIC_b2only, BIC_broad
 
         hd_doublet = ["HDELTA", "OIII_1"]
         which_hd_narrow = [ln for ln in hd_doublet if ln in which_lines_all]
         if "HDELTA" not in which_hd_narrow:
-            return broad_choice, BIC_narrow, BIC_1broad, BIC_2broad, BIC_broad
+            return broad_choice, BIC_narrow, BIC_1broad, BIC_2broad, BIC_b2only, BIC_broad
 
         # Local Hδ window: HDELTA–[O III]4363 ± padding
         rest_list = [
@@ -1608,7 +1610,7 @@ def single_broad_fit(
         m_hd = (lam_all >= lo_hd) & (lam_all <= hi_hd)
         if np.count_nonzero(m_hd) < 5:
             # basically no Hδ coverage
-            return broad_choice, BIC_narrow, BIC_1broad, BIC_2broad, BIC_broad
+            return broad_choice, BIC_narrow, BIC_1broad, BIC_2broad, BIC_b2only, BIC_broad
 
         lam_hd   = lam_all[m_hd]
         resid_hd = resid_all[m_hd]
@@ -1627,7 +1629,7 @@ def single_broad_fit(
         if broad_mode == "off":
             if verbose:
                 print("broad_mode='off' → using narrow-only Hδ+[O III]4363 model.")
-            return "none", BIC_narrow, BIC_1broad, BIC_2broad, BIC_broad
+            return "none", BIC_narrow, BIC_1broad, BIC_2broad, BIC_b2only, BIC_broad
 
         # Check Hδ SNR for eligibility (auto mode)
         hd_info = fit_narrow["per_line"].get("HDELTA", None)
@@ -1637,7 +1639,7 @@ def single_broad_fit(
         if (broad_mode == "auto") and (not eligible or hd_snr < snr_broad_threshold):
             if verbose:
                 print(f"No strong Hδ line (SNR={hd_snr:.1f}) → staying narrow-only.")
-            return "none", BIC_narrow, BIC_1broad, BIC_2broad, BIC_broad
+            return "none", BIC_narrow, BIC_1broad, BIC_2broad, BIC_b2only, BIC_broad
 
         # Try adding 1 and 2 broad Hδ components on the local window
         def _safe_fit(which, label):
@@ -1745,7 +1747,7 @@ def single_broad_fit(
                 print("  +both BROAD      : (fit failed)")
             print(f"  → Selected model: {model_desc}")
 
-        return broad_choice, BIC_narrow, BIC_1broad, BIC_2broad, BIC_broad
+        return broad_choice, BIC_narrow, BIC_1broad, BIC_2broad, BIC_b2only, BIC_broad
 
         # ----------------------------------------------------------------
     # Helper: decide Hβ model (none / one / two broad) in *local* window
@@ -1756,22 +1758,23 @@ def single_broad_fit(
         change the global continuum or residuals. Returns:
 
           broad_choice ∈ {"none","one","two"}
-          BIC_narrow, BIC_1broad, BIC_2broad, BIC_broad
+          BIC_narrow, BIC_1broad, BIC_2broad, BIC_b2only, BIC_broad
         """
         BIC_narrow = np.nan
         BIC_1broad = np.nan
         BIC_2broad = np.nan
+        BIC_b2only = np.nan
         BIC_broad  = np.nan
         broad_choice = "none"
 
         # If Hβ isn't even in the global narrow list, nothing to do
         if "HBETA" not in which_lines_all:
-            return broad_choice, BIC_narrow, BIC_1broad, BIC_2broad, BIC_broad
+            return broad_choice, BIC_narrow, BIC_1broad, BIC_2broad, BIC_b2only, BIC_broad
 
         hb_triplet = ["HBETA", "OIII_2", "OIII_3"]
         which_hb_narrow = [ln for ln in hb_triplet if ln in which_lines_all]
         if "HBETA" not in which_hb_narrow:
-            return broad_choice, BIC_narrow, BIC_1broad, BIC_2broad, BIC_broad
+            return broad_choice, BIC_narrow, BIC_1broad, BIC_2broad, BIC_b2only, BIC_broad
 
         # Local Hβ window: HBETA–[O III] ± padding
         rest_list = [
@@ -1783,7 +1786,7 @@ def single_broad_fit(
         m_hb = (lam_all >= lo_hb) & (lam_all <= hi_hb)
         if np.count_nonzero(m_hb) < 5:
             # basically no Hβ coverage
-            return broad_choice, BIC_narrow, BIC_1broad, BIC_2broad, BIC_broad
+            return broad_choice, BIC_narrow, BIC_1broad, BIC_2broad, BIC_b2only, BIC_broad
 
         lam_hb   = lam_all[m_hb]
         resid_hb = resid_all[m_hb]
@@ -1802,7 +1805,7 @@ def single_broad_fit(
         if broad_mode == "off":
             if verbose:
                 print("broad_mode='off' → using narrow-only Hβ+[O III] model.")
-            return "none", BIC_narrow, BIC_1broad, BIC_2broad, BIC_broad
+            return "none", BIC_narrow, BIC_1broad, BIC_2broad, BIC_b2only, BIC_broad
 
         # Check Hβ SNR for eligibility (auto mode)
         hb_info = fit_narrow["per_line"].get("HBETA", None)
@@ -1812,7 +1815,7 @@ def single_broad_fit(
         if (broad_mode == "auto") and (not eligible or hb_snr < snr_broad_threshold):
             if verbose:
                 print(f"No strong Hβ line (SNR={hb_snr:.1f}) → staying narrow-only.")
-            return "none", BIC_narrow, BIC_1broad, BIC_2broad, BIC_broad
+            return "none", BIC_narrow, BIC_1broad, BIC_2broad, BIC_b2only, BIC_broad
 
         # Try adding 1 and 2 broad Hβ components on the local window
         def _safe_fit(which, label):
@@ -1920,7 +1923,7 @@ def single_broad_fit(
                 print("  +both BROAD      : (fit failed)")
             print(f"  → Selected model: {model_desc}")
 
-        return broad_choice, BIC_narrow, BIC_1broad, BIC_2broad, BIC_broad
+        return broad_choice, BIC_narrow, BIC_1broad, BIC_2broad, BIC_b2only, BIC_broad
 
 
     # ------------------------------------------------------------------
@@ -1953,10 +1956,12 @@ def single_broad_fit(
         BIC_best        = fit_global["BIC"]
 
         # No local BIC selection was done in force_lines path
-        BIC_HA_narrow = BIC_HA_1broad = BIC_HA_2broad = BIC_HA_broad = np.nan
-        BIC_HB_narrow = BIC_HB_1broad = BIC_HB_2broad = BIC_HB_broad = np.nan
+        BIC_HA_narrow = BIC_HA_1broad = BIC_HA_2broad = BIC_HA_b2only = BIC_HA_broad = np.nan
+        BIC_HB_narrow = BIC_HB_1broad = BIC_HB_2broad = BIC_HB_b2only = BIC_HB_broad = np.nan
+        BIC_HD_narrow = BIC_HD_1broad = BIC_HD_2broad = BIC_HD_b2only = BIC_HD_broad = np.nan
         broad_choice_ha = "forced"
         broad_choice_hb = "forced"
+        broad_choice_hd = "forced"
 
 
     else:
@@ -1977,9 +1982,9 @@ def single_broad_fit(
             raise ValueError("No emission lines with data in the global fit window.")
 
         # 2) decide Hα, Hβ, and Hδ models (none/one/two broad) using local windows
-        broad_choice_ha, BIC_HA_narrow, BIC_HA_1broad, BIC_HA_2broad, BIC_HA_broad = _select_ha_model(which_lines_all)
-        broad_choice_hb, BIC_HB_narrow, BIC_HB_1broad, BIC_HB_2broad, BIC_HB_broad = _select_hb_model(which_lines_all)
-        broad_choice_hd, BIC_HD_narrow, BIC_HD_1broad, BIC_HD_2broad, BIC_HD_broad = _select_hd_model(which_lines_all)
+        broad_choice_ha, BIC_HA_narrow, BIC_HA_1broad, BIC_HA_2broad, BIC_HA_b2only, BIC_HA_broad = _select_ha_model(which_lines_all)
+        broad_choice_hb, BIC_HB_narrow, BIC_HB_1broad, BIC_HB_2broad, BIC_HB_b2only, BIC_HB_broad = _select_hb_model(which_lines_all)
+        broad_choice_hd, BIC_HD_narrow, BIC_HD_1broad, BIC_HD_2broad, BIC_HD_b2only, BIC_HD_broad = _select_hd_model(which_lines_all)
 
         # 3) build final global line list
         which_lines_global = list(which_lines_all)
@@ -2269,6 +2274,7 @@ def single_broad_fit(
         BIC_HA_broad=BIC_HA_broad,
         BIC_HA_1broad=BIC_HA_1broad,
         BIC_HA_2broad=BIC_HA_2broad,
+        BIC_HA_b2only=BIC_HA_b2only,
         broad_choice_HA=broad_choice_ha,
 
         BIC_narrow=BIC_narrow,
@@ -2282,7 +2288,16 @@ def single_broad_fit(
         BIC_HB_broad=BIC_HB_broad,
         BIC_HB_1broad=BIC_HB_1broad,
         BIC_HB_2broad=BIC_HB_2broad,
+        BIC_HB_b2only=BIC_HB_b2only,
         broad_choice_HB=broad_choice_hb,
+
+        # Hδ BIC summary
+        BIC_HD_narrow=BIC_HD_narrow,
+        BIC_HD_broad=BIC_HD_broad,
+        BIC_HD_1broad=BIC_HD_1broad,
+        BIC_HD_2broad=BIC_HD_2broad,
+        BIC_HD_b2only=BIC_HD_b2only,
+        broad_choice_HD=broad_choice_hd,
 
         profiles_window_flam=profiles_win,
     )
@@ -3071,7 +3086,7 @@ def broad_fit(
                         fontsize=8, color="0.6", alpha=0.8,
                     )
 
-            # --- save ---
+            # --- save --- yes?
             if save_path:
                 root, ext = os.path.splitext(save_path)
                 fname = f"{root}_{tag}.{save_format}" if ext == "" else f"{root}_{tag}{ext}"
@@ -3081,10 +3096,28 @@ def broad_fit(
                     transparent=save_transparent,
                 )
 
-                if tag == "fnu":
+                if tag == "fnu" or (tag == "flam" and plot_unit.lower() == "flam"):
                     summary_txt = f"{root}_summary.txt"
                     print_bootstrap_line_table_broad(
-                        dict(which_lines=which_lines, summary=summary),
+                        dict(
+                            which_lines=which_lines, 
+                            summary=summary,
+                            BIC_HA_narrow=base.get("BIC_HA_narrow", np.nan),
+                            BIC_HA_1broad=base.get("BIC_HA_1broad", np.nan),
+                            BIC_HA_2broad=base.get("BIC_HA_2broad", np.nan),
+                            BIC_HA_b2only=base.get("BIC_HA_b2only", np.nan),
+                            broad_choice_HA=base.get("broad_choice_HA", "unknown"),
+                            BIC_HB_narrow=base.get("BIC_HB_narrow", np.nan),
+                            BIC_HB_1broad=base.get("BIC_HB_1broad", np.nan),
+                            BIC_HB_2broad=base.get("BIC_HB_2broad", np.nan),
+                            BIC_HB_b2only=base.get("BIC_HB_b2only", np.nan),
+                            broad_choice_HB=base.get("broad_choice_HB", "unknown"),
+                            BIC_HD_narrow=base.get("BIC_HD_narrow", np.nan),
+                            BIC_HD_1broad=base.get("BIC_HD_1broad", np.nan),
+                            BIC_HD_2broad=base.get("BIC_HD_2broad", np.nan),
+                            BIC_HD_b2only=base.get("BIC_HD_b2only", np.nan),
+                            broad_choice_HD=base.get("broad_choice_HD", "unknown"),
+                        ),
                         save_path=summary_txt,
                     )
 
@@ -3108,22 +3141,104 @@ def broad_fit(
         "keep_mask": keep_mask,
         "lam_um": lam_um,
         "data_flux_uJy": flux_uJy,
+        # BIC scores from base fit
+        "BIC_HA_narrow": base.get("BIC_HA_narrow", np.nan),
+        "BIC_HA_1broad": base.get("BIC_HA_1broad", np.nan),
+        "BIC_HA_2broad": base.get("BIC_HA_2broad", np.nan),
+        "BIC_HA_b2only": base.get("BIC_HA_b2only", np.nan),
+        "broad_choice_HA": base.get("broad_choice_HA", "unknown"),
+        "BIC_HB_narrow": base.get("BIC_HB_narrow", np.nan),
+        "BIC_HB_1broad": base.get("BIC_HB_1broad", np.nan),
+        "BIC_HB_2broad": base.get("BIC_HB_2broad", np.nan),
+        "BIC_HB_b2only": base.get("BIC_HB_b2only", np.nan),
+        "broad_choice_HB": base.get("broad_choice_HB", "unknown"),
+        "BIC_HD_narrow": base.get("BIC_HD_narrow", np.nan),
+        "BIC_HD_1broad": base.get("BIC_HD_1broad", np.nan),
+        "BIC_HD_2broad": base.get("BIC_HD_2broad", np.nan),
+        "BIC_HD_b2only": base.get("BIC_HD_b2only", np.nan),
+        "broad_choice_HD": base.get("broad_choice_HD", "unknown"),
     }
-
-
-# --------------------------------------------------------------------
-# Pretty-print bootstrap summary
-# --------------------------------------------------------------------
-
 def print_bootstrap_line_table_broad(boot, save_path: str | None = None):
     """
-    Print a formatted bootstrap summary to console, including peak SNRs.
+    Print a formatted bootstrap summary to console, including peak SNRs and BIC scores.
     Optionally save the same output to a text file.
     """
-    # NOTE: The printed F_line values come directly from the fitter's
-    # integrated-area measurement (A in the area-normalised Gaussian model)
-    # and are in units of F_lambda (erg s^-1 cm^-2). These are not affected
-    # by any plotting/display scaling — the function prints the true measured fluxes.
+
+    def _describe_broad_choice(choice: str, line_label: str) -> str:
+        """
+        Turn internal broad_choice flags into a clear human-readable description.
+        BROAD  → medium broad
+        BROAD2 → very broad
+        """
+        mapping = {
+            "none":        f"{line_label}: narrow only",
+            "one":         f"{line_label}: narrow + medium broad",
+            "broad2_only": f"{line_label}: narrow + very broad",
+            "two":         f"{line_label}: narrow + medium + very broad",
+            "forced":      f"{line_label}: components forced (see which_lines)",
+            "unknown":     f"{line_label}: model unknown",
+        }
+        return mapping.get(choice, f"{line_label}: model = {choice}")
+
+    # BIC scores section
+    bic_section = "\n=== MODEL SELECTION (BIC Scores) ===\n"
+    
+    # H-alpha BIC scores
+    bic_ha_narrow = boot.get("BIC_HA_narrow", np.nan)
+    bic_ha_1broad = boot.get("BIC_HA_1broad", np.nan)   # narrow + BROAD (medium)
+    bic_ha_2broad = boot.get("BIC_HA_2broad", np.nan)   # narrow + BROAD + BROAD2
+    bic_ha_b2only = boot.get("BIC_HA_b2only", np.nan)   # narrow + BROAD2 only
+    choice_ha = boot.get("broad_choice_HA", "unknown")
+    
+    if np.isfinite(bic_ha_narrow):
+        bic_section += f"\nH-alpha:\n"
+        bic_section += f"  Narrow only                      : BIC = {bic_ha_narrow:.2f}\n"
+        if np.isfinite(bic_ha_1broad):
+            bic_section += f"  Narrow + medium broad            : BIC = {bic_ha_1broad:.2f}\n"
+        if np.isfinite(bic_ha_2broad):
+            bic_section += f"  Narrow + medium + very broad     : BIC = {bic_ha_2broad:.2f}\n"
+        if np.isfinite(bic_ha_b2only):
+            bic_section += f"  Narrow + very broad only         : BIC = {bic_ha_b2only:.2f}\n"
+        bic_section += f"  → Selected: {_describe_broad_choice(choice_ha, 'Hα')}\n"
+    
+    # H-beta BIC scores
+    bic_hb_narrow = boot.get("BIC_HB_narrow", np.nan)
+    bic_hb_1broad = boot.get("BIC_HB_1broad", np.nan)
+    bic_hb_2broad = boot.get("BIC_HB_2broad", np.nan)
+    bic_hb_b2only = boot.get("BIC_HB_b2only", np.nan)
+    choice_hb = boot.get("broad_choice_HB", "unknown")
+    
+    if np.isfinite(bic_hb_narrow):
+        bic_section += f"\nH-beta:\n"
+        bic_section += f"  Narrow only                      : BIC = {bic_hb_narrow:.2f}\n"
+        if np.isfinite(bic_hb_1broad):
+            bic_section += f"  Narrow + medium broad            : BIC = {bic_hb_1broad:.2f}\n"
+        if np.isfinite(bic_hb_2broad):
+            bic_section += f"  Narrow + medium + very broad     : BIC = {bic_hb_2broad:.2f}\n"
+        if np.isfinite(bic_hb_b2only):
+            bic_section += f"  Narrow + very broad only         : BIC = {bic_hb_b2only:.2f}\n"
+        bic_section += f"  → Selected: {_describe_broad_choice(choice_hb, 'Hβ')}\n"
+    
+    # H-delta BIC scores (if available)
+    bic_hd_narrow = boot.get("BIC_HD_narrow", np.nan)
+    bic_hd_1broad = boot.get("BIC_HD_1broad", np.nan)
+    bic_hd_2broad = boot.get("BIC_HD_2broad", np.nan)
+    bic_hd_b2only = boot.get("BIC_HD_b2only", np.nan)
+    choice_hd = boot.get("broad_choice_HD", "unknown")
+    
+    if np.isfinite(bic_hd_narrow):
+        bic_section += f"\nH-delta:\n"
+        bic_section += f"  Narrow only                      : BIC = {bic_hd_narrow:.2f}\n"
+        if np.isfinite(bic_hd_1broad):
+            bic_section += f"  Narrow + medium broad            : BIC = {bic_hd_1broad:.2f}\n"
+        if np.isfinite(bic_hd_2broad):
+            bic_section += f"  Narrow + medium + very broad     : BIC = {bic_hd_2broad:.2f}\n"
+        if np.isfinite(bic_hd_b2only):
+            bic_section += f"  Narrow + very broad only         : BIC = {bic_hd_b2only:.2f}\n"
+        bic_section += f"  → Selected: {_describe_broad_choice(choice_hd, 'Hδ')}\n"
+    
+    bic_section += "\n" + "=" * 50 + "\n"
+    
     header = (
         "\n=== BOOTSTRAP SUMMARY (value ± error) ===\n"
         f"{'Line':10s} {'F_line [erg/s/cm²]':>26s} "
@@ -3150,7 +3265,7 @@ def print_bootstrap_line_table_broad(boot, save_path: str | None = None):
             f"{snr_pmod:>18s}"
         )
 
-    table_text = header + "\n".join(lines)
+    table_text = bic_section + header + "\n".join(lines)
     print(table_text)
 
     if save_path is not None:
