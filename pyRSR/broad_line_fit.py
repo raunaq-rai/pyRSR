@@ -1485,17 +1485,39 @@ def single_broad_fit(
         if "H⍺_BROAD" not in which_1:
             which_1.append("H⍺_BROAD")
         fit_1broad, BIC_1broad = _safe_fit(which_1, "1-broad Hα")
+        if fit_1broad is not None:
+            # Reject if any broad component is negative
+            for ln, info in fit_1broad["per_line"].items():
+                if "BROAD" in ln and info["A_gauss"] < 0:
+                    if verbose:
+                        print(f"  -> 1-broad Hα rejected (negative {ln}: {info['A_gauss']:.2e})")
+                    BIC_1broad = np.nan
+                    break
 
         which_2 = list(which_1)
         if "H⍺_BROAD2" not in which_2:
             which_2.append("H⍺_BROAD2")
         fit_2broad, BIC_2broad = _safe_fit(which_2, "2-broad Hα")
+        if fit_2broad is not None:
+            for ln, info in fit_2broad["per_line"].items():
+                if "BROAD" in ln and info["A_gauss"] < 0:
+                    if verbose:
+                        print(f"  -> 2-broad Hα rejected (negative {ln}: {info['A_gauss']:.2e})")
+                    BIC_2broad = np.nan
+                    break
 
         # BROAD2-only (without BROAD) for complete 4-way comparison
         which_b2only = list(which_ha_narrow)
         if "H⍺_BROAD2" not in which_b2only:
             which_b2only.append("H⍺_BROAD2")
         fit_b2only, BIC_b2only = _safe_fit(which_b2only, "BROAD2-only Hα")
+        if fit_b2only is not None:
+            for ln, info in fit_b2only["per_line"].items():
+                if "BROAD" in ln and info["A_gauss"] < 0:
+                    if verbose:
+                        print(f"  -> BROAD2-only Hα rejected (negative {ln}: {info['A_gauss']:.2e})")
+                    BIC_b2only = np.nan
+                    break
 
         candidates = [(BIC_narrow, "none")]
         if fit_1broad is not None and np.isfinite(BIC_1broad):
@@ -1660,17 +1682,38 @@ def single_broad_fit(
         if "HDELTA_BROAD" not in which_1:
             which_1.append("HDELTA_BROAD")
         fit_1broad, BIC_1broad = _safe_fit(which_1, "1-broad Hδ")
+        if fit_1broad is not None:
+            for ln, info in fit_1broad["per_line"].items():
+                if "BROAD" in ln and info["A_gauss"] < 0:
+                    if verbose:
+                        print(f"  -> 1-broad Hδ rejected (negative {ln}: {info['A_gauss']:.2e})")
+                    BIC_1broad = np.nan
+                    break
 
         which_2 = list(which_1)
         if "HDELTA_BROAD2" not in which_2:
             which_2.append("HDELTA_BROAD2")
         fit_2broad, BIC_2broad = _safe_fit(which_2, "2-broad Hδ")
+        if fit_2broad is not None:
+            for ln, info in fit_2broad["per_line"].items():
+                if "BROAD" in ln and info["A_gauss"] < 0:
+                    if verbose:
+                        print(f"  -> 2-broad Hδ rejected (negative {ln}: {info['A_gauss']:.2e})")
+                    BIC_2broad = np.nan
+                    break
 
         # BROAD2-only (without BROAD) for complete 4-way comparison
         which_b2only = list(which_hd_narrow)
         if "HDELTA_BROAD2" not in which_b2only:
             which_b2only.append("HDELTA_BROAD2")
         fit_b2only, BIC_b2only = _safe_fit(which_b2only, "BROAD2-only Hδ")
+        if fit_b2only is not None:
+            for ln, info in fit_b2only["per_line"].items():
+                if "BROAD" in ln and info["A_gauss"] < 0:
+                    if verbose:
+                        print(f"  -> BROAD2-only Hδ rejected (negative {ln}: {info['A_gauss']:.2e})")
+                    BIC_b2only = np.nan
+                    break
 
         candidates = [(BIC_narrow, "none")]
         if fit_1broad is not None and np.isfinite(BIC_1broad):
@@ -1836,17 +1879,38 @@ def single_broad_fit(
         if "HBETA_BROAD" not in which_1:
             which_1.append("HBETA_BROAD")
         fit_1broad, BIC_1broad = _safe_fit(which_1, "1-broad Hβ")
+        if fit_1broad is not None:
+            for ln, info in fit_1broad["per_line"].items():
+                if "BROAD" in ln and info["A_gauss"] < 0:
+                    if verbose:
+                        print(f"  -> 1-broad Hβ rejected (negative {ln}: {info['A_gauss']:.2e})")
+                    BIC_1broad = np.nan
+                    break
 
         which_2 = list(which_1)
         if "HBETA_BROAD2" not in which_2:
             which_2.append("HBETA_BROAD2")
         fit_2broad, BIC_2broad = _safe_fit(which_2, "2-broad Hβ")
+        if fit_2broad is not None:
+            for ln, info in fit_2broad["per_line"].items():
+                if "BROAD" in ln and info["A_gauss"] < 0:
+                    if verbose:
+                        print(f"  -> 2-broad Hβ rejected (negative {ln}: {info['A_gauss']:.2e})")
+                    BIC_2broad = np.nan
+                    break
 
         # BROAD2-only (without BROAD) for complete 4-way comparison
         which_b2only = list(which_hb_narrow)
         if "HBETA_BROAD2" not in which_b2only:
             which_b2only.append("HBETA_BROAD2")
         fit_b2only, BIC_b2only = _safe_fit(which_b2only, "BROAD2-only Hβ")
+        if fit_b2only is not None:
+            for ln, info in fit_b2only["per_line"].items():
+                if "BROAD" in ln and info["A_gauss"] < 0:
+                    if verbose:
+                        print(f"  -> BROAD2-only Hβ rejected (negative {ln}: {info['A_gauss']:.2e})")
+                    BIC_b2only = np.nan
+                    break
 
         candidates = [(BIC_narrow, "none")]
         if fit_1broad is not None and np.isfinite(BIC_1broad):
@@ -3272,3 +3336,5 @@ def print_bootstrap_line_table_broad(boot, save_path: str | None = None):
         with open(save_path, "w") as f:
             f.write(table_text)
         print(f"\nSaved bootstrap summary → {save_path}")
+
+#edit2
