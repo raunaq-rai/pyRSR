@@ -3018,7 +3018,7 @@ def broad_fit(
             )
             cont_fine_full = np.interp(lam_fine_full, lam_fit_base, cont_base_unit)
             
-            # Convert component sums to individual components
+            # Convert component sums to individual components edits...
             # OLD WAY: Interpolate from coarse grid (jagged)
             # narrow_only_fine = np.interp(lam_fine_full, lam_fit_base, sum_narrow_flam)
             # b1_only_fine = np.interp(lam_fine_full, lam_fit_base, sum_b1_flam)
@@ -3077,13 +3077,8 @@ def broad_fit(
                     cont_fine_full + narrow_only_plot + narrow_std_plot,
                     color=narrow_color, alpha=0.1, linewidth=0,
                 )
-                # Main shape (dotted outline, light fill)
-                ax_full.fill_between(
-                    lam_fine_full,
-                    cont_fine_full,
-                    cont_fine_full + narrow_only_plot,
-                    color=narrow_color, alpha=0.2, linewidth=0,
-                )
+                # Main shape (dotted outline, light fill) edit
+                # REMOVED FILL as per user request
                 ax_full.plot(
                     lam_fine_full, cont_fine_full + narrow_only_plot,
                     color=narrow_color, linestyle=":", linewidth=1,
@@ -3099,12 +3094,7 @@ def broad_fit(
                     color=broad_color, alpha=0.1, linewidth=0,
                 )
                 # Main shape
-                ax_full.fill_between(
-                    lam_fine_full,
-                    cont_fine_full,
-                    cont_fine_full + b1_only_plot,
-                    color=broad_color, alpha=0.15, linewidth=0,
-                )
+                # REMOVED FILL as per user request
                 ax_full.plot(
                     lam_fine_full, cont_fine_full + b1_only_plot,
                     color=broad_color, linestyle=":", linewidth=1,
@@ -3120,12 +3110,7 @@ def broad_fit(
                     color=broad_color2, alpha=0.1, linewidth=0,
                 )
                 # Main shape
-                ax_full.fill_between(
-                    lam_fine_full,
-                    cont_fine_full,
-                    cont_fine_full + b2_only_plot,
-                    color=broad_color2, alpha=0.1, linewidth=0,
-                )
+                # REMOVED FILL as per user request
                 ax_full.plot(
                     lam_fine_full, cont_fine_full + b2_only_plot,
                     color=broad_color2, linestyle=":", linewidth=1,
@@ -3261,10 +3246,7 @@ def broad_fit(
                                 cont_fine + narrow_plot + narrow_std_p,
                                 color=narrow_color, alpha=0.1, linewidth=0
                             )
-                            ax.fill_between(
-                                lam_fine, cont_fine, cont_fine + narrow_plot,
-                                color=narrow_color, alpha=0.2, linewidth=0
-                            )
+                            # REMOVED FILL as per user request
                             ax.plot(
                                 lam_fine, cont_fine + narrow_plot,
                                 color=narrow_color, linestyle=":", linewidth=1
@@ -3276,10 +3258,7 @@ def broad_fit(
                                 cont_fine + b1_plot + b1_std_p,
                                 color=broad_color, alpha=0.1, linewidth=0
                             )
-                            ax.fill_between(
-                                lam_fine, cont_fine, cont_fine + b1_plot,
-                                color=broad_color, alpha=0.15, linewidth=0
-                            )
+                            # REMOVED FILL as per user request
                             ax.plot(
                                 lam_fine, cont_fine + b1_plot,
                                 color=broad_color, linestyle=":", linewidth=1
@@ -3291,10 +3270,7 @@ def broad_fit(
                                 cont_fine + b2_plot + b2_std_p,
                                 color=broad_color2, alpha=0.1, linewidth=0
                             )
-                            ax.fill_between(
-                                lam_fine, cont_fine, cont_fine + b2_plot,
-                                color=broad_color2, alpha=0.1, linewidth=0
-                            )
+                            # REMOVED FILL as per user request
                             ax.plot(
                                 lam_fine, cont_fine + b2_plot,
                                 color=broad_color2, linestyle=":", linewidth=1
