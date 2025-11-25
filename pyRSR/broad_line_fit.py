@@ -2793,37 +2793,59 @@ def broad_fit(
             profs = np.asarray(profs, float)
             return np.nanmean(profs, axis=0)
 
-        def _mean_profile_on_grid(line_name: str, lam_grid_um: np.ndarray) -> np.ndarray:
+        def _get_profile_stats_on_grid(line_name: str, lam_grid_um: np.ndarray):
             """
-            Compute bootstrap-mean line profile on an arbitrary wavelength grid (um).
-            This allows for smooth plotting on a fine grid, rather than interpolating
-            the coarse bin-averaged profile.
+            Return stats for the line profile on an arbitrary wavelength grid (um).
+            
+            Returns:
+                mean_param_profile: Gaussian computed from the MEAN parameters (F, mu, sigma).
+                                    This ensures the plotted component is a perfect symmetric Gaussian.
+                std_profile:        Standard deviation of the bootstrap profiles at each pixel.
+                                    This represents the flux uncertainty band.
             """
+            # 1. Compute the "Mean Parameter" profile (Symmetric)
+            if line_name not in summary:
+                mean_prof = np.zeros_like(lam_grid_um)
+            else:
+                # Get mean parameters from summary dict
+                s = summary[line_name]
+                F_mean   = s["F_line"]["value"]
+                mu_mean  = s["lam_obs_A"]["value"]
+                sig_mean = s["sigma_A"]["value"]
+                
+                if np.isfinite(F_mean) and np.isfinite(mu_mean) and np.isfinite(sig_mean) and sig_mean > 0:
+                     lam_grid_A = lam_grid_um * 1e4
+                     leftA, rightA = _pixel_edges_A(lam_grid_A)
+                     t = _gauss_binavg_area_normalized_A(leftA, rightA, mu_mean, sig_mean)
+                     mean_prof = F_mean * t
+                else:
+                    mean_prof = np.zeros_like(lam_grid_um)
+
+            # 2. Compute the STD of the bootstrap profiles (Uncertainty)
             if line_name not in samples:
-                return np.zeros_like(lam_grid_um)
+                std_prof = np.zeros_like(lam_grid_um)
+            else:
+                F   = samples[line_name]["F_line"][keep_mask]
+                muA = samples[line_name]["lam_obs_A"][keep_mask]
+                sA  = samples[line_name]["sigma_A"][keep_mask]
 
-            F   = samples[line_name]["F_line"][keep_mask]
-            muA = samples[line_name]["lam_obs_A"][keep_mask]
-            sA  = samples[line_name]["sigma_A"][keep_mask]
+                good = np.isfinite(F) & np.isfinite(muA) & np.isfinite(sA) & (sA > 0)
+                if not np.any(good):
+                    std_prof = np.zeros_like(lam_grid_um)
+                else:
+                    F, muA, sA = F[good], muA[good], sA[good]
+                    lam_grid_A = lam_grid_um * 1e4
+                    leftA, rightA = _pixel_edges_A(lam_grid_A)
 
-            good = np.isfinite(F) & np.isfinite(muA) & np.isfinite(sA) & (sA > 0)
-            if not np.any(good):
-                return np.zeros_like(lam_grid_um)
+                    profs = []
+                    for Fi, mui, si in zip(F, muA, sA):
+                        t = _gauss_binavg_area_normalized_A(leftA, rightA, mui, si)
+                        profs.append(Fi * t)
+                    
+                    profs = np.asarray(profs, float)
+                    std_prof = np.nanstd(profs, axis=0)
 
-            F, muA, sA = F[good], muA[good], sA[good]
-
-            # Prepare grid in Angstroms
-            lam_grid_A = lam_grid_um * 1e4
-            leftA, rightA = _pixel_edges_A(lam_grid_A)
-
-            profs = []
-            for Fi, mui, si in zip(F, muA, sA):
-                # Evaluate Gaussian on the new fine grid
-                t = _gauss_binavg_area_normalized_A(leftA, rightA, mui, si)
-                profs.append(Fi * t)
-
-            profs = np.asarray(profs, float)
-            return np.nanmean(profs, axis=0)
+            return mean_prof, std_prof
 
 
         # also prepare µJy versions
@@ -3002,65 +3024,112 @@ def broad_fit(
             # b1_only_fine = np.interp(lam_fine_full, lam_fit_base, sum_b1_flam)
             # b2_only_fine = np.interp(lam_fine_full, lam_fit_base, sum_b2_flam)
 
-            # NEW WAY: Compute directly on fine grid (smooth)
+            # NEW WAY: Compute directly on fine grid (smooth, symmetric, with uncertainty)
             narrow_only_fine = np.zeros_like(lam_fine_full)
+            narrow_std_fine  = np.zeros_like(lam_fine_full)
+            
             b1_only_fine     = np.zeros_like(lam_fine_full)
+            b1_std_fine      = np.zeros_like(lam_fine_full)
+            
             b2_only_fine     = np.zeros_like(lam_fine_full)
+            b2_std_fine      = np.zeros_like(lam_fine_full)
 
             for nm in which_lines:
-                prof_fine = _mean_profile_on_grid(nm, lam_fine_full)
+                prof_mean, prof_std = _get_profile_stats_on_grid(nm, lam_fine_full)
                 
                 if "BROAD" in nm:
                     if "BROAD2" in nm:
-                        b2_only_fine += prof_fine
+                        b2_only_fine += prof_mean
+                        b2_std_fine  = np.sqrt(b2_std_fine**2 + prof_std**2) # quadrature sum approx
                     else:
-                        b1_only_fine += prof_fine
+                        b1_only_fine += prof_mean
+                        b1_std_fine  = np.sqrt(b1_std_fine**2 + prof_std**2)
                 else:
-                    narrow_only_fine += prof_fine
+                    narrow_only_fine += prof_mean
+                    narrow_std_fine  = np.sqrt(narrow_std_fine**2 + prof_std**2)
             
             # Convert to plotting unit
             if unit == "flam":
                 narrow_only_plot = narrow_only_fine
-                b1_only_plot = b1_only_fine
-                b2_only_plot = b2_only_fine
+                narrow_std_plot  = narrow_std_fine
+                b1_only_plot     = b1_only_fine
+                b1_std_plot      = b1_std_fine
+                b2_only_plot     = b2_only_fine
+                b2_std_plot      = b2_std_fine
             else:
+                # Note: STD conversion is approx linear for small errors
                 narrow_only_plot = flam_to_fnu_uJy(narrow_only_fine, lam_fine_full)
-                b1_only_plot = flam_to_fnu_uJy(b1_only_fine, lam_fine_full)
-                b2_only_plot = flam_to_fnu_uJy(b2_only_fine, lam_fine_full)
+                narrow_std_plot  = flam_to_fnu_uJy(narrow_std_fine, lam_fine_full)
+                b1_only_plot     = flam_to_fnu_uJy(b1_only_fine, lam_fine_full)
+                b1_std_plot      = flam_to_fnu_uJy(b1_std_fine, lam_fine_full)
+                b2_only_plot     = flam_to_fnu_uJy(b2_only_fine, lam_fine_full)
+                b2_std_plot      = flam_to_fnu_uJy(b2_std_fine, lam_fine_full)
                 
-            # Plot each component from continuum baseline (not stacked)
-            # This makes peak heights visually comparable
+            # Plot each component from continuum baseline
+            # Using DOTTED lines for the mean-parameter profile
+            # And SHADED band for uncertainty
+            
             if np.nanmax(np.abs(narrow_only_plot)) > 0:
+                # Uncertainty band
+                ax_full.fill_between(
+                    lam_fine_full,
+                    cont_fine_full + narrow_only_plot - narrow_std_plot,
+                    cont_fine_full + narrow_only_plot + narrow_std_plot,
+                    color=narrow_color, alpha=0.1, linewidth=0,
+                )
+                # Main shape (dotted outline, light fill)
                 ax_full.fill_between(
                     lam_fine_full,
                     cont_fine_full,
                     cont_fine_full + narrow_only_plot,
-                    color=narrow_color,
-                    alpha=0.35,
-                    linewidth=0,
-                    label="Narrow components",
+                    color=narrow_color, alpha=0.2, linewidth=0,
+                )
+                ax_full.plot(
+                    lam_fine_full, cont_fine_full + narrow_only_plot,
+                    color=narrow_color, linestyle=":", linewidth=1,
+                    label="Narrow components"
                 )
 
             if has_b1 and np.nanmax(np.abs(b1_only_plot)) > 0:
+                # Uncertainty band
+                ax_full.fill_between(
+                    lam_fine_full,
+                    cont_fine_full + b1_only_plot - b1_std_plot,
+                    cont_fine_full + b1_only_plot + b1_std_plot,
+                    color=broad_color, alpha=0.1, linewidth=0,
+                )
+                # Main shape
                 ax_full.fill_between(
                     lam_fine_full,
                     cont_fine_full,
                     cont_fine_full + b1_only_plot,
-                    color=broad_color,
-                    alpha=0.25,
-                    linewidth=0,
-                    label="Broad component 1",
+                    color=broad_color, alpha=0.15, linewidth=0,
+                )
+                ax_full.plot(
+                    lam_fine_full, cont_fine_full + b1_only_plot,
+                    color=broad_color, linestyle=":", linewidth=1,
+                    label="Broad component 1"
                 )
 
             if has_b2 and np.nanmax(np.abs(b2_only_plot)) > 0:
+                # Uncertainty band
+                ax_full.fill_between(
+                    lam_fine_full,
+                    cont_fine_full + b2_only_plot - b2_std_plot,
+                    cont_fine_full + b2_only_plot + b2_std_plot,
+                    color=broad_color2, alpha=0.1, linewidth=0,
+                )
+                # Main shape
                 ax_full.fill_between(
                     lam_fine_full,
                     cont_fine_full,
                     cont_fine_full + b2_only_plot,
-                    color=broad_color2,
-                    alpha=0.20,
-                    linewidth=0,
-                    label="Broad component 2",
+                    color=broad_color2, alpha=0.1, linewidth=0,
+                )
+                ax_full.plot(
+                    lam_fine_full, cont_fine_full + b2_only_plot,
+                    color=broad_color2, linestyle=":", linewidth=1,
+                    label="Broad component 2"
                 )
 
             title_txt = f"{source_id}   (z = {z:.3f})" if source_id else f"z = {z:.3f}"
@@ -3138,11 +3207,13 @@ def broad_fit(
 
                         # NEW WAY: Compute directly on fine grid
                         narrow_fine = np.zeros_like(lam_fine)
+                        narrow_std  = np.zeros_like(lam_fine)
+                        
                         b1_fine     = np.zeros_like(lam_fine)
+                        b1_std      = np.zeros_like(lam_fine)
+                        
                         b2_fine     = np.zeros_like(lam_fine)
-
-                        b1_fine     = np.zeros_like(lam_fine)
-                        b2_fine     = np.zeros_like(lam_fine)
+                        b2_std      = np.zeros_like(lam_fine)
 
                         for nm in which_lines: 
                              # Check if line is relevant for this window to avoid unnecessary computation
@@ -3150,47 +3221,83 @@ def broad_fit(
                              # If we don't check, it's fine, just slightly slower.
                              # But we must include BROAD lines which are not in zd["names"].
                              
-                             prof_fine = _mean_profile_on_grid(nm, lam_fine)
+                             prof_mean, prof_std = _get_profile_stats_on_grid(nm, lam_fine)
                              
                              # If the profile is all zeros (line far away), skip adding
-                             if np.all(prof_fine == 0):
+                             if np.all(prof_mean == 0):
                                  continue
 
                              if "BROAD" in nm:
                                  if "BROAD2" in nm:
-                                     b2_fine += prof_fine
+                                     b2_fine += prof_mean
+                                     b2_std  = np.sqrt(b2_std**2 + prof_std**2)
                                  else:
-                                     b1_fine += prof_fine
+                                     b1_fine += prof_mean
+                                     b1_std  = np.sqrt(b1_std**2 + prof_std**2)
                              else:
-                                 narrow_fine += prof_fine
+                                 narrow_fine += prof_mean
+                                 narrow_std  = np.sqrt(narrow_std**2 + prof_std**2)
                         
                         # Convert to plotting unit
                         if unit == "flam":
                             narrow_plot = narrow_fine
+                            narrow_std_p = narrow_std
                             b1_plot = b1_fine
+                            b1_std_p = b1_std
                             b2_plot = b2_fine
+                            b2_std_p = b2_std
                         else:
                             narrow_plot = flam_to_fnu_uJy(narrow_fine, lam_fine)
+                            narrow_std_p = flam_to_fnu_uJy(narrow_std, lam_fine)
                             b1_plot = flam_to_fnu_uJy(b1_fine, lam_fine)
+                            b1_std_p = flam_to_fnu_uJy(b1_std, lam_fine)
                             b2_plot = flam_to_fnu_uJy(b2_fine, lam_fine)
+                            b2_std_p = flam_to_fnu_uJy(b2_std, lam_fine)
 
                         # Plot each component from continuum baseline
                         if np.nanmax(np.abs(narrow_plot)) > 0:
                             ax.fill_between(
+                                lam_fine, cont_fine + narrow_plot - narrow_std_p,
+                                cont_fine + narrow_plot + narrow_std_p,
+                                color=narrow_color, alpha=0.1, linewidth=0
+                            )
+                            ax.fill_between(
                                 lam_fine, cont_fine, cont_fine + narrow_plot,
-                                color=narrow_color, alpha=0.35, linewidth=0
+                                color=narrow_color, alpha=0.2, linewidth=0
+                            )
+                            ax.plot(
+                                lam_fine, cont_fine + narrow_plot,
+                                color=narrow_color, linestyle=":", linewidth=1
                             )
 
                         if has_b1 and np.nanmax(np.abs(b1_plot)) > 0:
                             ax.fill_between(
+                                lam_fine, cont_fine + b1_plot - b1_std_p,
+                                cont_fine + b1_plot + b1_std_p,
+                                color=broad_color, alpha=0.1, linewidth=0
+                            )
+                            ax.fill_between(
                                 lam_fine, cont_fine, cont_fine + b1_plot,
-                                color=broad_color, alpha=0.25, linewidth=0
+                                color=broad_color, alpha=0.15, linewidth=0
+                            )
+                            ax.plot(
+                                lam_fine, cont_fine + b1_plot,
+                                color=broad_color, linestyle=":", linewidth=1
                             )
 
                         if has_b2 and np.nanmax(np.abs(b2_plot)) > 0:
                             ax.fill_between(
+                                lam_fine, cont_fine + b2_plot - b2_std_p,
+                                cont_fine + b2_plot + b2_std_p,
+                                color=broad_color2, alpha=0.1, linewidth=0
+                            )
+                            ax.fill_between(
                                 lam_fine, cont_fine, cont_fine + b2_plot,
-                                color=broad_color2, alpha=0.20, linewidth=0
+                                color=broad_color2, alpha=0.1, linewidth=0
+                            )
+                            ax.plot(
+                                lam_fine, cont_fine + b2_plot,
+                                color=broad_color2, linestyle=":", linewidth=1
                             )
 
                     ax.set_xlim(zd["lo"], zd["hi"])
@@ -3415,4 +3522,4 @@ def print_bootstrap_line_table_broad(boot, save_path: str | None = None):
             f.write(table_text)
         print(f"\nSaved bootstrap summary → {save_path}")
 
-#edit3
+#edit-big one
