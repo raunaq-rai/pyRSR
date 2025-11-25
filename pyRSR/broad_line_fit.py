@@ -1088,7 +1088,7 @@ def _fit_emission_system(
         muA_hi = muA_seed + 12.0 * np.maximum(sigmaA_inst, 1.0)
     else:
         C_KMS    = 299792.458
-        VEL_KMS  = 120.0
+        VEL_KMS  = 100.0
         NPIX_CENT = 4.0
 
         dvA   = muA_nom * (VEL_KMS / C_KMS)
@@ -2752,7 +2752,7 @@ def broad_fit(
                             print("    This suggests flux measurement is double-counting overlapping components.")
                     
                     print("="*70 + "\n")
-
+    
     # -------- plotting + optional saving --------
     if plot:
         # mean ± std (sigma-clipped) of total F_lambda model
