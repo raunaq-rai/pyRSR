@@ -2793,6 +2793,38 @@ def broad_fit(
             profs = np.asarray(profs, float)
             return np.nanmean(profs, axis=0)
 
+        def _mean_profile_on_grid(line_name: str, lam_grid_um: np.ndarray) -> np.ndarray:
+            """
+            Compute bootstrap-mean line profile on an arbitrary wavelength grid (um).
+            This allows for smooth plotting on a fine grid, rather than interpolating
+            the coarse bin-averaged profile.
+            """
+            if line_name not in samples:
+                return np.zeros_like(lam_grid_um)
+
+            F   = samples[line_name]["F_line"][keep_mask]
+            muA = samples[line_name]["lam_obs_A"][keep_mask]
+            sA  = samples[line_name]["sigma_A"][keep_mask]
+
+            good = np.isfinite(F) & np.isfinite(muA) & np.isfinite(sA) & (sA > 0)
+            if not np.any(good):
+                return np.zeros_like(lam_grid_um)
+
+            F, muA, sA = F[good], muA[good], sA[good]
+
+            # Prepare grid in Angstroms
+            lam_grid_A = lam_grid_um * 1e4
+            leftA, rightA = _pixel_edges_A(lam_grid_A)
+
+            profs = []
+            for Fi, mui, si in zip(F, muA, sA):
+                # Evaluate Gaussian on the new fine grid
+                t = _gauss_binavg_area_normalized_A(leftA, rightA, mui, si)
+                profs.append(Fi * t)
+
+            profs = np.asarray(profs, float)
+            return np.nanmean(profs, axis=0)
+
 
         # also prepare µJy versions
         mu_uJy   = flam_to_fnu_uJy(mu_flam,  lam_um)
@@ -2965,9 +2997,26 @@ def broad_fit(
             cont_fine_full = np.interp(lam_fine_full, lam_fit_base, cont_base_unit)
             
             # Convert component sums to individual components
-            narrow_only_fine = np.interp(lam_fine_full, lam_fit_base, sum_narrow_flam)
-            b1_only_fine = np.interp(lam_fine_full, lam_fit_base, sum_b1_flam)
-            b2_only_fine = np.interp(lam_fine_full, lam_fit_base, sum_b2_flam)
+            # OLD WAY: Interpolate from coarse grid (jagged)
+            # narrow_only_fine = np.interp(lam_fine_full, lam_fit_base, sum_narrow_flam)
+            # b1_only_fine = np.interp(lam_fine_full, lam_fit_base, sum_b1_flam)
+            # b2_only_fine = np.interp(lam_fine_full, lam_fit_base, sum_b2_flam)
+
+            # NEW WAY: Compute directly on fine grid (smooth)
+            narrow_only_fine = np.zeros_like(lam_fine_full)
+            b1_only_fine     = np.zeros_like(lam_fine_full)
+            b2_only_fine     = np.zeros_like(lam_fine_full)
+
+            for nm in which_lines:
+                prof_fine = _mean_profile_on_grid(nm, lam_fine_full)
+                
+                if "BROAD" in nm:
+                    if "BROAD2" in nm:
+                        b2_only_fine += prof_fine
+                    else:
+                        b1_only_fine += prof_fine
+                else:
+                    narrow_only_fine += prof_fine
             
             # Convert to plotting unit
             if unit == "flam":
@@ -3082,9 +3131,38 @@ def broad_fit(
                         cont_fine = np.interp(lam_fine, lam_sub, cont_sub_model)
                         
                         # Interpolate individual components
-                        narrow_fine = np.interp(lam_fine, lam_sub, narrow_sub)
-                        b1_fine = np.interp(lam_fine, lam_sub, b1_sub)
-                        b2_fine = np.interp(lam_fine, lam_sub, b2_sub)
+                        # OLD WAY:
+                        # narrow_fine = np.interp(lam_fine, lam_sub, narrow_sub)
+                        # b1_fine = np.interp(lam_fine, lam_sub, b1_sub)
+                        # b2_fine = np.interp(lam_fine, lam_sub, b2_sub)
+
+                        # NEW WAY: Compute directly on fine grid
+                        narrow_fine = np.zeros_like(lam_fine)
+                        b1_fine     = np.zeros_like(lam_fine)
+                        b2_fine     = np.zeros_like(lam_fine)
+
+                        b1_fine     = np.zeros_like(lam_fine)
+                        b2_fine     = np.zeros_like(lam_fine)
+
+                        for nm in which_lines: 
+                             # Check if line is relevant for this window to avoid unnecessary computation
+                             # (simple check: is the line center within window +/- margin?)
+                             # If we don't check, it's fine, just slightly slower.
+                             # But we must include BROAD lines which are not in zd["names"].
+                             
+                             prof_fine = _mean_profile_on_grid(nm, lam_fine)
+                             
+                             # If the profile is all zeros (line far away), skip adding
+                             if np.all(prof_fine == 0):
+                                 continue
+
+                             if "BROAD" in nm:
+                                 if "BROAD2" in nm:
+                                     b2_fine += prof_fine
+                                 else:
+                                     b1_fine += prof_fine
+                             else:
+                                 narrow_fine += prof_fine
                         
                         # Convert to plotting unit
                         if unit == "flam":
@@ -3337,4 +3415,4 @@ def print_bootstrap_line_table_broad(boot, save_path: str | None = None):
             f.write(table_text)
         print(f"\nSaved bootstrap summary → {save_path}")
 
-#edit2
+#edit3
