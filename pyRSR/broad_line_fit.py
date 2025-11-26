@@ -2563,17 +2563,24 @@ def broad_fit(
     }
     model_stack_flam, keep_mask = [], []
 
-    iterator = range(n_boot)
+    # -------- Bootstrap Loop (Robust) --------
+    # We want exactly n_boot *valid* samples.
+    # We will try up to max_attempts to get them.
+    
+    n_valid = 0
+    n_attempts = 0
+    max_attempts = n_boot * 30  # generous limit to prevent infinite loops
+    
     if show_progress:
-        iterator = tqdm(
-            range(n_boot),
-            desc=f"Bootstrap ({n_boot} draws)",
-            unit="draw",
-            dynamic_ncols=True,
-            leave=True
-        )
+        pbar = tqdm(total=n_boot, desc="Bootstrap (valid draws)", unit="draw", dynamic_ncols=True)
 
-    for _ in iterator:
+    # Pre-compute pixel edges for model reconstruction
+    lam_um_A = lam_um * 1e4
+    leftA_boot, rightA_boot = _pixel_edges_A(lam_um_A)
+    
+    while n_valid < n_boot and n_attempts < max_attempts:
+        n_attempts += 1
+        
         flux_uJy_b = flux_uJy + rng.normal(0.0, err_uJy)
 
         try:
@@ -2605,14 +2612,46 @@ def broad_fit(
                    (not np.isfinite(d.get("lam_obs_A", np.nan))):
                     keep = False
                     break
-
+        
+        # If rejected, just continue to next attempt (do not record nan)
         if not keep:
-            keep_mask.append(False)
-            model_stack_flam.append(np.full_like(lam_um, np.nan))
-            for ln in which_lines:
-                for k in samples[ln]:
-                    samples[ln][k].append(np.nan)
             continue
+
+        # --- Check for crazy model fluxes ---
+        cont = fb.get("continuum_flam", np.zeros_like(lam_um))
+        
+        # RECONSTRUCT the total model using the SIGN-CONSTRAINED fluxes.
+        # This ensures the red "Mean model" line matches the blue dotted lines and table.
+        reconstructed_model_flam = np.zeros_like(lam_um)
+        
+        for ln in which_lines:
+            d = fb["lines"].get(ln, {})
+            F_val = d.get("F_line", 0.0)
+            muA   = d.get("lam_obs_A", np.nan)
+            sA    = d.get("sigma_A", np.nan)
+            
+            # Apply sign constraint (same as stored samples)
+            s0 = base_sign.get(ln, np.nan)
+            if np.isfinite(s0) and s0 != 0 and np.isfinite(F_val):
+                F_val = s0 * abs(F_val)
+                
+            if np.isfinite(F_val) and np.isfinite(muA) and np.isfinite(sA) and sA > 0:
+                t = _gauss_binavg_area_normalized_A(leftA_boot, rightA_boot, muA, sA)
+                reconstructed_model_flam += F_val * t
+
+        total_flam = cont + reconstructed_model_flam
+
+        if np.nanmax(np.abs(total_flam)) > 1e-11:
+            # Reject crazy model
+            continue
+
+        # --- Valid Sample! Store it ---
+        n_valid += 1
+        if show_progress:
+            pbar.update(1)
+
+        model_stack_flam.append(total_flam)
+        keep_mask.append(True) # All stored samples are valid now
 
         for ln in which_lines:
             d = fb["lines"][ln]
@@ -2633,30 +2672,15 @@ def broad_fit(
             samples[ln]["SNR_peak_data"].append(d["SNR_peak_data"])
             samples[ln]["SNR_peak_model"].append(d["SNR_peak_model"])
 
+    if show_progress:
+        pbar.close()
+        
+    if n_valid < n_boot:
+        print(f"Warning: Only collected {n_valid}/{n_boot} valid bootstrap samples after {max_attempts} attempts.")
 
-        cont = fb.get("continuum_flam", np.zeros_like(lam_um))
-
-        if isinstance(wfit, slice):
-            total_flam = cont + fb.get("model_window_flam", np.zeros_like(lam_um))
-        else:
-            tmp = np.zeros_like(lam_um)
-            tmp[wfit] = fb.get("model_window_flam", np.zeros_like(lam_um[wfit]))
-            total_flam = cont + tmp
-
-        # basic sanity: reject crazy models
-        if np.nanmax(np.abs(total_flam)) > 1e-11:
-            keep_mask.append(False)
-            model_stack_flam.append(np.full_like(lam_um, np.nan))
-            for ln in which_lines:
-                for k in samples[ln]:
-                    samples[ln][k].append(np.nan)
-            continue
-
-        model_stack_flam.append(total_flam)
-        keep_mask.append(True)
-
+    # Convert lists to arrays
     model_stack_flam = np.asarray(model_stack_flam, float)
-    keep_mask = np.asarray(keep_mask, bool)
+    keep_mask = np.ones(n_valid, dtype=bool) # All stored are valid
     for ln in which_lines:
         for k in samples[ln]:
             samples[ln][k] = np.asarray(samples[ln][k], float)
@@ -3490,4 +3514,4 @@ def print_bootstrap_line_table_broad(boot, save_path: str | None = None):
             f.write(table_text)
         print(f"\nSaved bootstrap summary → {save_path}")
 
-#edit-more
+#edit-more more
