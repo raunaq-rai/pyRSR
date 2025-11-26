@@ -3075,10 +3075,10 @@ def broad_fit(
                     lam_fine_full,
                     cont_fine_full + narrow_only_plot - narrow_std_plot,
                     cont_fine_full + narrow_only_plot + narrow_std_plot,
-                    color=narrow_color, alpha=0.1, linewidth=0,
+                    color=narrow_color, alpha=0.5, linewidth=0,
                 )
                 # Main shape (dotted outline, light fill) edit
-                # REMOVED FILL as per user request
+                
                 ax_full.plot(
                     lam_fine_full, cont_fine_full + narrow_only_plot,
                     color=narrow_color, linestyle=":", linewidth=1,
@@ -3091,10 +3091,10 @@ def broad_fit(
                     lam_fine_full,
                     cont_fine_full + b1_only_plot - b1_std_plot,
                     cont_fine_full + b1_only_plot + b1_std_plot,
-                    color=broad_color, alpha=0.1, linewidth=0,
+                    color=broad_color, alpha=0.5, linewidth=0,
                 )
                 # Main shape
-                # REMOVED FILL as per user request
+    
                 ax_full.plot(
                     lam_fine_full, cont_fine_full + b1_only_plot,
                     color=broad_color, linestyle=":", linewidth=1,
@@ -3107,10 +3107,10 @@ def broad_fit(
                     lam_fine_full,
                     cont_fine_full + b2_only_plot - b2_std_plot,
                     cont_fine_full + b2_only_plot + b2_std_plot,
-                    color=broad_color2, alpha=0.1, linewidth=0,
+                    color=broad_color2, alpha=0.5, linewidth=0,
                 )
                 # Main shape
-                # REMOVED FILL as per user request
+                
                 ax_full.plot(
                     lam_fine_full, cont_fine_full + b2_only_plot,
                     color=broad_color2, linestyle=":", linewidth=1,
@@ -3184,13 +3184,7 @@ def broad_fit(
                         )
                         cont_fine = np.interp(lam_fine, lam_sub, cont_sub_model)
                         
-                        # Interpolate individual components
-                        # OLD WAY:
-                        # narrow_fine = np.interp(lam_fine, lam_sub, narrow_sub)
-                        # b1_fine = np.interp(lam_fine, lam_sub, b1_sub)
-                        # b2_fine = np.interp(lam_fine, lam_sub, b2_sub)
 
-                        # NEW WAY: Compute directly on fine grid
                         narrow_fine = np.zeros_like(lam_fine)
                         narrow_std  = np.zeros_like(lam_fine)
                         
@@ -3244,7 +3238,7 @@ def broad_fit(
                             ax.fill_between(
                                 lam_fine, cont_fine + narrow_plot - narrow_std_p,
                                 cont_fine + narrow_plot + narrow_std_p,
-                                color=narrow_color, alpha=0.1, linewidth=0
+                                color=narrow_color, alpha=0.5, linewidth=0
                             )
                             # REMOVED FILL as per user request
                             ax.plot(
@@ -3256,7 +3250,7 @@ def broad_fit(
                             ax.fill_between(
                                 lam_fine, cont_fine + b1_plot - b1_std_p,
                                 cont_fine + b1_plot + b1_std_p,
-                                color=broad_color, alpha=0.1, linewidth=0
+                                color=broad_color, alpha=0.5, linewidth=0
                             )
                             # REMOVED FILL as per user request
                             ax.plot(
@@ -3268,7 +3262,7 @@ def broad_fit(
                             ax.fill_between(
                                 lam_fine, cont_fine + b2_plot - b2_std_p,
                                 cont_fine + b2_plot + b2_std_p,
-                                color=broad_color2, alpha=0.1, linewidth=0
+                                color=broad_color2, alpha=0.5, linewidth=0
                             )
                             # REMOVED FILL as per user request
                             ax.plot(
@@ -3498,4 +3492,4 @@ def print_bootstrap_line_table_broad(boot, save_path: str | None = None):
             f.write(table_text)
         print(f"\nSaved bootstrap summary → {save_path}")
 
-#edit-big one
+#edit-more
