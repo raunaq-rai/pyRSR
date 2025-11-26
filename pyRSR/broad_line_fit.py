@@ -31,9 +31,7 @@ except Exception:  # pragma: no cover
     def tqdm(x, *args, **kwargs):
         return x
 
-# --------------------------------------------------------------------
-# Imports from PyRSR.ma_line_fit (unchanged; this module wraps them)
-# --------------------------------------------------------------------
+
 from PyRSR.fitting_helpers import (
     fnu_uJy_to_flam, flam_to_fnu_uJy,
     sigma_grating_logA,             # σ_gr in log10(λ), λ in µm
