@@ -10,12 +10,50 @@ from typing import Dict, List, Optional, Tuple
 
 
 # Rest wavelengths of nebular / recombination lines [Å]
-REST_LINES_A: Dict[str, float] = {
-    "NIII_1": 989.790, "NIII_2": 991.514, "NIII_3": 991.579,
+REST_LINES_A = {
+    # --- High-z UV metal lines ---
+    "NV_1":     1238.821,
+    "NV_2":     1242.804,
+    "NIV_1":    1486.496,
+    "CIV_1":    1548.187,
+    "CIV_2":    1550.772,
+    "HEII_1640": 1640.420,
+    "OIII_1663": 1663.480,
+    "SiIII_1":  1882.71,
+    "SiIII_2":  1892.03,
+    "CIII]":    1908.734,
+
+    # --- Useful UV/near-UV lines in NIRSpec range at z~5–10 ---
+    "OII]_2471": 2470.97,
+    "OIII]_2321": 2321.7,
+    "OIII]_2331": 2331.3,
+    "FeII*_2396": 2396.36,
+
+    # --- Balmer series ---
+    "HDELTA":    4102.892,
+    "HGAMMA":    4341.684,
+    "HBETA":     4862.683,
+
+
+    # --- Optical strong lines (only valid for z ≲ 7; safely included) ---
+    "OIII_4363": 4363.21,
+    "OIII_4959": 4960.295,
+    "OIII_5007": 5008.240,
+    "NII_5756":  5756.19,
+    "HEI_5877":  5877.252,
+    "NII_6549":  6549.86,
+    "H⍺": 6564.608,
+    "NII_6585":  6585.27,
+    "SII_6718":  6718.295,
+    "SII_6732":  6732.674,
+}
+
+""" REST_LINES_A: Dict[str, float] = {
+    #"NIII_1": 989.790, "NIII_2": 991.514, "NIII_3": 991.579,
     "NV_1": 1238.821, "NV_2": 1242.804, "NIV_1": 1486.496,
     "HEII_1": 1640.420, "OIII_05": 1663.4795, "CIII": 1908.734,
     "CIV_1": 1548.187, "CIV_2": 1550.772,
-    "OII_UV_1": 3727.092, "OII_UV_2": 3729.875,
+    #"OII_UV_1": 3727.092, "OII_UV_2": 3729.875,
      "HEI_1": 3889.749, #"NEIII_UV_1": 3869.86,
      "HEPSILON": 3971.1951, #"NEIII_UV_2": 3968.59,
     "HDELTA": 4102.8922, "HGAMMA": 4341.6837, "OIII_1": 4364.436,
@@ -25,7 +63,7 @@ REST_LINES_A: Dict[str, float] = {
     "NII_1": 5756.19, "HEI_3": 5877.252,
     "NII_2": 6549.86, "H⍺": 6564.608, "NII_3": 6585.27,"HEI_4": 6679.9956,
     "SII_1": 6718.295, "SII_2": 6732.674,
-}
+} """
 
 
 

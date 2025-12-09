@@ -155,7 +155,7 @@ def _annotate_lines_zoom_no_overlap(
     model_z : array
         Model flux in this zoom panel (same units as y-axis).
     line_names : list of str
-        Line IDs to try to annotate (e.g. ["HBETA","OIII_2","OIII_3"]).
+        Line IDs to try to annotate (e.g. ["HBETA","OIII_4959","OIII_5007"]).
     z : float
         Redshift.
     per_line : dict or None
@@ -275,7 +275,7 @@ def _annotate_lines_above_model(
     model : array
         Model flux in this panel (same units as y-axis).
     line_names : list of str
-        Line IDs to try to annotate (e.g. ["HBETA","OIII_2","OIII_3"]).
+        Line IDs to try to annotate (e.g. ["HBETA","OIII_4959","OIII_5007"]).
     z : float
         Redshift.
     per_line : dict or None
@@ -476,14 +476,14 @@ def _build_width_tie_groups(which_lines):
 
     For now:
       - Tie the *narrow* Hα + [N II] λλ6549,6585 components:
-        (NII_2, HALPHA, NII_3) share a single σ.
+        (NII_6549, HALPHA, NII_6585) share a single σ.
 
     We deliberately do NOT include HALPHA_BROAD here.
     """
     name_to_idx = {nm: i for i, nm in enumerate(which_lines)}
     groups = []
 
-    ha_triplet = ["NII_2", "H⍺", "NII_3"]
+    ha_triplet = ["NII_6549", "H⍺", "NII_6585"]
     if all(nm in name_to_idx for nm in ha_triplet):
         groups.append([name_to_idx[nm] for nm in ha_triplet])
 
@@ -1097,13 +1097,13 @@ def _fit_emission_system(
         muA_hi = muA_seed + halfA
 
         HaA       = REST_LINES_A["H⍺"] * (1.0 + z)
-        mid_N2_Ha = 0.5 * (REST_LINES_A["NII_2"] + REST_LINES_A["H⍺"]) * (1.0 + z)
-        mid_Ha_N3 = 0.5 * (REST_LINES_A["H⍺"] + REST_LINES_A["NII_3"]) * (1.0 + z)
+        mid_N2_Ha = 0.5 * (REST_LINES_A["NII_6549"] + REST_LINES_A["H⍺"]) * (1.0 + z)
+        mid_Ha_N3 = 0.5 * (REST_LINES_A["H⍺"] + REST_LINES_A["NII_6585"]) * (1.0 + z)
 
         for j, nm in enumerate(which_lines):
-            if nm == "NII_2":
+            if nm == "NII_6549":
                 muA_hi[j] = min(muA_hi[j], mid_N2_Ha)
-            elif nm == "NII_3":
+            elif nm == "NII_6585":
                 muA_lo[j] = max(muA_lo[j], mid_Ha_N3)
             # we let H⍺ and H⍺_BROAD float within halfA
 
@@ -1280,7 +1280,7 @@ def single_broad_fit(
     lines_to_use=None,
     deg: int = 2,
     continuum_windows=None,
-    lyman_cut="lya",
+    lyman_cut="split",
     fit_window_um=None,
     plot: bool = True,
     verbose: bool = True,
@@ -1312,8 +1312,8 @@ def single_broad_fit(
         Polynomial degree for continuum fitting.
     continuum_windows : list of tuples or str, optional
         Wavelength windows for continuum fitting, or 'two_sided_lya' for automatic.
-    lyman_cut : str, default='lya'
-        Lyman-alpha cutoff mode.
+    lyman_cut : str, default='split'
+        Lyman-alpha cutoff mode. 'split' fits both sides (default), 'lya' masks blue.
     fit_window_um : tuple of float, optional
         (low, high) wavelength range in microns for fitting. If None, uses full coverage.
     plot : bool, default=True
@@ -1356,6 +1356,13 @@ def single_broad_fit(
 
     ok = np.isfinite(lam_um) & np.isfinite(flux_uJy) & np.isfinite(err_uJy) & (err_uJy > 0)
     lam_um, flux_uJy, err_uJy = lam_um[ok], flux_uJy[ok], err_uJy[ok]
+
+    # Handle "split" default: use two-sided LyA windows unless user overrides
+    if str(lyman_cut).lower() == "split":
+        if continuum_windows is None:
+            continuum_windows = "two_sided_lya"
+        # Disable hard cut so we can fit blue side if windows allow
+        lyman_cut = None
 
     # Continuum windows around Lyman-alpha if requested
     auto_windows = None
@@ -1422,13 +1429,13 @@ def single_broad_fit(
         if "H⍺" not in which_lines_all:
             return broad_choice, BIC_narrow, BIC_1broad, BIC_2broad, BIC_b2only, BIC_broad
 
-        ha_triplet = ["NII_2", "H⍺", "NII_3"]
+        ha_triplet = ["NII_6549", "H⍺", "NII_6585"]
         which_ha_narrow = [ln for ln in ha_triplet if ln in which_lines_all]
         if "H⍺" not in which_ha_narrow:
             return broad_choice, BIC_narrow, BIC_1broad, BIC_2broad, BIC_b2only, BIC_broad
 
-        # Local Hα window: NII_2–NII_3 ± padding
-        rest_list = [REST_LINES_A["NII_2"], REST_LINES_A["H⍺"], REST_LINES_A["NII_3"]]
+        # Local Hα window: NII_6549–NII_6585 ± padding
+        rest_list = [REST_LINES_A["NII_6549"], REST_LINES_A["H⍺"], REST_LINES_A["NII_6585"]]
         lo_ha, hi_ha = _window_from_lines_um(rest_list, z, pad_A=150.0)
         m_ha = (lam_all >= lo_ha) & (lam_all <= hi_ha)
         if np.count_nonzero(m_ha) < 5:
@@ -1616,7 +1623,7 @@ def single_broad_fit(
         if "HDELTA" not in which_lines_all:
             return broad_choice, BIC_narrow, BIC_1broad, BIC_2broad, BIC_b2only, BIC_broad
 
-        hd_doublet = ["HDELTA", "OIII_1"]
+        hd_doublet = ["HDELTA", "OIII_4363"]
         which_hd_narrow = [ln for ln in hd_doublet if ln in which_lines_all]
         if "HDELTA" not in which_hd_narrow:
             return broad_choice, BIC_narrow, BIC_1broad, BIC_2broad, BIC_b2only, BIC_broad
@@ -1624,7 +1631,7 @@ def single_broad_fit(
         # Local Hδ window: HDELTA–[O III]4363 ± padding
         rest_list = [
             REST_LINES_A["HDELTA"],
-            REST_LINES_A["OIII_1"],
+            REST_LINES_A["OIII_4363"],
         ]
         lo_hd, hi_hd = _window_from_lines_um(rest_list, z, pad_A=150.0)
         m_hd = (lam_all >= lo_hd) & (lam_all <= hi_hd)
@@ -1812,7 +1819,7 @@ def single_broad_fit(
         if "HBETA" not in which_lines_all:
             return broad_choice, BIC_narrow, BIC_1broad, BIC_2broad, BIC_b2only, BIC_broad
 
-        hb_triplet = ["HBETA", "OIII_2", "OIII_3"]
+        hb_triplet = ["HBETA", "OIII_4959", "OIII_5007"]
         which_hb_narrow = [ln for ln in hb_triplet if ln in which_lines_all]
         if "HBETA" not in which_hb_narrow:
             return broad_choice, BIC_narrow, BIC_1broad, BIC_2broad, BIC_b2only, BIC_broad
@@ -1820,8 +1827,8 @@ def single_broad_fit(
         # Local Hβ window: HBETA–[O III] ± padding
         rest_list = [
             REST_LINES_A["HBETA"],
-            REST_LINES_A["OIII_2"],
-            REST_LINES_A["OIII_3"],
+            REST_LINES_A["OIII_4959"],
+            REST_LINES_A["OIII_5007"],
         ]
         lo_hb, hi_hb = _window_from_lines_um(rest_list, z, pad_A=150.0)
         m_hb = (lam_all >= lo_hb) & (lam_all <= hi_hb)
@@ -2174,7 +2181,7 @@ def single_broad_fit(
         broad_color2 = "tab:pink"
 
         # Window around the Hα+[N II] complex
-        rest_list = [REST_LINES_A["NII_2"], REST_LINES_A["H⍺"], REST_LINES_A["NII_3"]]
+        rest_list = [REST_LINES_A["NII_6549"], REST_LINES_A["H⍺"], REST_LINES_A["NII_6585"]]
         lo_ha, hi_ha = _window_from_lines_um(rest_list, z, pad_A=150.0)
         m_ha = (lam_fit >= lo_ha) & (lam_fit <= hi_ha)
 
@@ -2184,7 +2191,7 @@ def single_broad_fit(
 
             # emission-only contribution of each component in Fλ
             em_narrow = np.zeros_like(lam_ha)
-            for nm in ("NII_2", "H⍺", "NII_3"):
+            for nm in ("NII_6549", "H⍺", "NII_6585"):
                 if nm in profiles_win:
                     em_narrow += profiles_win[nm][m_ha]
 
@@ -2259,7 +2266,7 @@ def single_broad_fit(
 
         cont_fit_flam = Fcont_fit  # continuum on lam_fit
 
-        rest_list = [REST_LINES_A["NII_2"], REST_LINES_A["H⍺"], REST_LINES_A["NII_3"]]
+        rest_list = [REST_LINES_A["NII_6549"], REST_LINES_A["H⍺"], REST_LINES_A["NII_6585"]]
         lo_ha, hi_ha = _window_from_lines_um(rest_list, z, pad_A=150.0)
         m_ha = (lam_fit >= lo_ha) & (lam_fit <= hi_ha)
 
@@ -2268,7 +2275,7 @@ def single_broad_fit(
             cont_ha_flam = cont_fit_flam[m_ha]
 
             em_narrow = np.zeros_like(lam_ha)
-            for nm in ("NII_2", "H⍺", "NII_3"):
+            for nm in ("NII_6549", "H⍺", "NII_6585"):
                 if nm in profiles_win:
                     em_narrow += profiles_win[nm][m_ha]
 
@@ -2403,7 +2410,7 @@ def broad_fit(
     source_id: str | None = None,
     deg: int = 2,
     continuum_windows=None,
-    lyman_cut="lya",
+    lyman_cut="split",
     fit_window_um=None,
     absorption_corrections=None,
     random_state=None,
@@ -2444,8 +2451,8 @@ def broad_fit(
         Polynomial degree for continuum fitting.
     continuum_windows : list of tuples or str, optional
         Wavelength windows for continuum fitting, or 'two_sided_lya' for automatic.
-    lyman_cut : str, default='lya'
-        Lyman-alpha cutoff mode.
+    lyman_cut : str, default='split'
+        Lyman-alpha cutoff mode. 'split' fits both sides (default), 'lya' masks blue.
     fit_window_um : tuple of float, optional
         (low, high) wavelength range in microns for fitting.
     absorption_corrections : dict, optional
@@ -2494,20 +2501,52 @@ def broad_fit(
     lam_um, flux_uJy, err_uJy = lam_um[ok], flux_uJy[ok], err_uJy[ok]
 
     # -------- base run (chooses model structure) --------
-    base = single_broad_fit(
-        source=dict(lam=lam_um, flux=flux_uJy, err=err_uJy),
-        z=z, grating=grating, deg=deg,
-        continuum_windows=continuum_windows,
-        lyman_cut=lyman_cut,
-        fit_window_um=fit_window_um,
-        plot=False, verbose=verbose,
-        absorption_corrections=absorption_corrections,
-        lines_to_use=lines_to_use,
-        broad_mode=broad_mode, 
-    )
-    which_lines = list(base.get("which_lines", []))
-    if not which_lines:
-        raise ValueError("No emission lines in coverage (cannot bootstrap).")
+    try:
+        base = single_broad_fit(
+            source=dict(lam=lam_um, flux=flux_uJy, err=err_uJy),
+            z=z, grating=grating, deg=deg,
+            continuum_windows=continuum_windows,
+            lyman_cut=lyman_cut,
+            fit_window_um=fit_window_um,
+            plot=False, verbose=verbose,
+            absorption_corrections=absorption_corrections,
+            lines_to_use=lines_to_use,
+            broad_mode=broad_mode, 
+        )
+        which_lines = list(base.get("which_lines", []))
+        if not which_lines:
+            raise ValueError("No emission lines in coverage (cannot bootstrap).")
+
+    except ValueError as e:
+        if verbose:
+            print(f"Fit failed: {e}")
+        
+        # Return empty result structure to prevent crash
+        return {
+            "samples": {},
+            "summary": {},
+            "which_lines": [],
+            "model_stack_flam": np.array([]),
+            "keep_mask": np.array([]),
+            "lam_um": lam_um,
+            "data_flux_uJy": flux_uJy,
+            # BIC scores
+            "BIC_HA_narrow": np.nan,
+            "BIC_HA_1broad": np.nan,
+            "BIC_HA_2broad": np.nan,
+            "BIC_HA_b2only": np.nan,
+            "broad_choice_HA": "failed",
+            "BIC_HB_narrow": np.nan,
+            "BIC_HB_1broad": np.nan,
+            "BIC_HB_2broad": np.nan,
+            "BIC_HB_b2only": np.nan,
+            "broad_choice_HB": "failed",
+            "BIC_HD_narrow": np.nan,
+            "BIC_HD_1broad": np.nan,
+            "BIC_HD_2broad": np.nan,
+            "BIC_HD_b2only": np.nan,
+            "broad_choice_HD": "failed",
+        }
 
     base_lines = base["lines"]
 
@@ -2719,8 +2758,8 @@ def broad_fit(
 
     # -------- DIAGNOSTIC: Check flux conservation in Hα region --------
     if verbose:
-        # Define Hα region (NII_2, H⍺, NII_3, and broad components)
-        ha_components = ["NII_2", "H⍺", "NII_3", "H⍺_BROAD", "H⍺_BROAD2"]
+        # Define Hα region (NII_6549, H⍺, NII_6585, and broad components)
+        ha_components = ["NII_6549", "H⍺", "NII_6585", "H⍺_BROAD", "H⍺_BROAD2"]
         ha_in_fit = [ln for ln in ha_components if ln in which_lines]
         
         if ha_in_fit:
@@ -2729,7 +2768,7 @@ def broad_fit(
             print("="*70)
             
             # Get Hα window
-            rest_list = [REST_LINES_A[nm] for nm in ["NII_2", "H⍺", "NII_3"] if nm in REST_LINES_A]
+            rest_list = [REST_LINES_A[nm] for nm in ["NII_6549", "H⍺", "NII_6585"] if nm in REST_LINES_A]
             if rest_list:
                 lo_ha, hi_ha = _window_from_lines_um(rest_list, z, pad_A=150.0)
                 mask_ha = (lam_um >= lo_ha) & (lam_um <= hi_ha)
@@ -2776,7 +2815,7 @@ def broad_fit(
                     print("="*70 + "\n")
     
     # -------- plotting + optional saving --------
-    if plot:
+    if plot or save_path:
         # mean ± std (sigma-clipped) of total F_lambda model
         mu_flam, sig_flam = _sigma_clip_mean_std(
             model_stack_flam[keep_mask], axis=0, sigma=3.0
@@ -2894,9 +2933,9 @@ def broad_fit(
         # -------------------------------
         # define line groups for zooms
         # -------------------------------
-        o3hb_names   = ["HBETA", "OIII_2", "OIII_3"]
-        aur_names    = ["HDELTA", "OIII_1"]
-        halpha_names = ["NII_2", "H⍺", "NII_3"]  # our naming in REST_LINES_A
+        o3hb_names   = ["HBETA", "OIII_4959", "OIII_5007"]
+        aur_names    = ["HDELTA", "OIII_4363"]
+        halpha_names = ["NII_6549", "H⍺", "NII_6585"]  # our naming in REST_LINES_A
 
         zoom_defs = [
             dict(title="Hδ + [O III]4363 (auroral)", names=aur_names),
@@ -2908,7 +2947,7 @@ def broad_fit(
         for zd in zoom_defs:
             restA = [REST_LINES_A[n] for n in zd["names"] if n in REST_LINES_A]
             if restA:
-                zd["lo"], zd["hi"] = _window_from_lines_um(restA, z, pad_A=10.0)
+                zd["lo"], zd["hi"] = _window_from_lines_um(restA, z, pad_A=50.0)
             else:
                 zd["lo"], zd["hi"] = np.nan, np.nan
 
@@ -3363,7 +3402,8 @@ def broad_fit(
                     )
 
             plt.tight_layout()
-            plt.show()
+            if plot:
+                plt.show()
             plt.close(fig)
 
         # --- make requested plot(s) ---
