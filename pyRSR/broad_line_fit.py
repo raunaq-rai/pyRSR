@@ -1,4 +1,5 @@
 """
+edit
 Broad-line emission fitting with BIC-based model selection. new
 
 Fits emission lines using area-normalized Gaussians with optional broad
@@ -40,6 +41,7 @@ from PyRSR.fitting_helpers import (
     rescale_uncertainties,
     apply_balmer_absorption_correction,
     REST_LINES_A,
+    get_default_line_list,
 )
 
 __all__ = [
@@ -2038,7 +2040,11 @@ def single_broad_fit(
         # Branch B: "normal" call → choose Hα & Hβ models, then global fit
         # ------------------------------------------------------------------
         # 1) all *narrow* lines in coverage in the global window
-        which_lines_all = _lines_in_range(z, lam_all, lines_to_use, margin_um=0.02)
+        use_lines = lines_to_use
+        if use_lines is None:
+            use_lines = get_default_line_list(grating)
+
+        which_lines_all = _lines_in_range(z, lam_all, use_lines, margin_um=0.02)
         which_lines_all = [ln for ln in which_lines_all if "BROAD" not in ln]
 
         which_lines_all, _ = _prune_lines_without_data(

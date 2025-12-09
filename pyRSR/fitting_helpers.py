@@ -7,16 +7,20 @@ import tqdm
 from tqdm import tqdm
 from typing import Dict, List, Optional, Tuple
 
-
+#edit
 
 # Rest wavelengths of nebular / recombination lines [Å]
 REST_LINES_A = {
     # --- High-z UV metal lines ---
     "NV_1":     1238.821,
     "NV_2":     1242.804,
+    "NV_doublet": 1240.81,
+
     "NIV_1":    1486.496,
     "CIV_1":    1548.187,
     "CIV_2":    1550.772,
+    "CIV_doublet": 1549.48,
+
     "HEII_1640": 1640.420,
     "OIII_1663": 1663.480,
     "SiIII_1":  1882.71,
@@ -28,6 +32,11 @@ REST_LINES_A = {
     "OIII]_2321": 2321.7,
     "OIII]_2331": 2331.3,
     "FeII*_2396": 2396.36,
+
+    # --- OII Doublet ---
+    "OII_3726": 3726.032,
+    "OII_3729": 3728.815,
+    "OII_doublet": 3727.42,
 
     # --- Balmer series ---
     "HDELTA":    4102.892,
@@ -277,3 +286,38 @@ def apply_balmer_absorption_correction(line_fluxes, correction_fractions=None):
         d2["sigma_line"] *= corr
         out[name] = d2
     return out
+
+
+def get_default_line_list(grating: str) -> List[str]:
+    """
+    Return the default line list based on the grating resolution.
+    
+    For medium resolution (R~1000) or PRISM, returns merged doublets for
+    NV, CIV, and OII to improve fit stability.
+    For high resolution, returns individual components.
+    """
+    g = grating.lower()
+    is_medium = ("prism" in g) or ("medium" in g) or ("med" in g) or g.endswith("m") or ("g140m" in g)
+    
+    # Base lines present in all resolutions
+    lines = [
+        "NIV_1", "HEII_1640", "OIII_1663", "SiIII_1", "SiIII_2", "CIII]",
+        "OII]_2471", "OIII]_2321", "OIII]_2331", "FeII*_2396",
+        "HDELTA", "HGAMMA", "HBETA",
+        "OIII_4363", "OIII_4959", "OIII_5007",
+        "NII_5756", "HEI_5877",
+        "NII_6549", "H⍺", "NII_6585",
+        "SII_6718", "SII_6732"
+    ]
+    
+    if is_medium:
+        # Use merged doublets for medium res / prism
+        lines.extend(["NV_doublet", "CIV_doublet", "OII_doublet"])
+    else:
+        # Use individual components for high res
+        lines.extend(["NV_1", "NV_2", "CIV_1", "CIV_2", "OII_3726", "OII_3729"])
+        
+    # Sort by wavelength for consistency
+    lines.sort(key=lambda x: REST_LINES_A.get(x, 0))
+    
+    return [l for l in lines if l in REST_LINES_A]
