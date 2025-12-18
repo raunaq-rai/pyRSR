@@ -2841,13 +2841,17 @@ def broad_fit(
                     
                     print("="*70 + "\n")
     
+    
+    # --- Extract continuum from base fit (available for return even if not plotting) ---
+    cont_flam = np.asarray(base.get("continuum_flam", np.zeros_like(lam_um)))
+    cont_uJy  = flam_to_fnu_uJy(cont_flam, lam_um)
+
     # -------- plotting + optional saving --------
     if plot or save_path:
-        # mean ± std (sigma-clipped) of total F_lambda model
         mu_flam, sig_flam = _sigma_clip_mean_std(
             model_stack_flam[keep_mask], axis=0, sigma=3.0
         )
-        cont_flam = np.asarray(base.get("continuum_flam", np.zeros_like(lam_um)))
+        # cont_flam is now defined above
 
         # grid on which the base + all bootstrap fits are defined
         lam_fit_base = np.asarray(base.get("lam_fit", lam_um), float)
@@ -3490,6 +3494,7 @@ def broad_fit(
         "continuum_fnu": cont_uJy,
         "z": z,
     }
+    
 def print_bootstrap_line_table_broad(boot, save_path: str | None = None):
     """
     Print a formatted bootstrap summary to console, including peak SNRs and BIC scores.
