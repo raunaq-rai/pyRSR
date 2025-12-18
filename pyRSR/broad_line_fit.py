@@ -1,5 +1,5 @@
 """
-edit
+edit more more
 Broad-line emission fitting with BIC-based model selection. new
 
 Fits emission lines using area-normalized Gaussians with optional broad
@@ -874,7 +874,7 @@ def _fit_emission_system(
         peak_half_um = np.maximum(5.0 * sigma_um_inst, 2.0 * pix_um_local)
     else:
         # MED/HIGH: search only within ±2 pixels of expected centre
-        peak_half_um = 2.0 * pix_um_local
+        peak_half_um = 3.0 * pix_um_local
 
     mu_seed_um = _find_local_peaks(
         lam_fit, resid_fit, expected_um,
@@ -939,6 +939,26 @@ def _fit_emission_system(
     sigmaA_lo   = np.array(sigmaA_lo,  float)
     sigmaA_hi   = np.array(sigmaA_hi,  float)
     sigmaA_seed = np.clip(seed_factor * sigmaA_inst, sigmaA_lo, sigmaA_hi)
+
+    # ------------------------------------------------------------------
+    # NEW LOGIC: Handle Blended Doublets
+    # ------------------------------------------------------------------
+    # These keys represent two physical lines fitted as one Gaussian.
+    # We must relax the upper width bound and increase the seed width
+    # so the fitter can encompass both peaks.
+    BLENDED_KEYS = {"NV_doublet", "CIV_doublet", "OII_doublet", "CIII]"}
+
+    for j, nm in enumerate(which_lines):
+        if nm in BLENDED_KEYS:
+            # Widen the seed: start at 1.5x the instrumental width
+            sigmaA_seed[j] = max(sigmaA_seed[j], 1.5 * sigmaA_inst[j])
+            
+            # Widen the upper bound: allow up to 3.5x instrumental width
+            # (Standard lines are usually capped around 1.15x - 1.5x)
+            sigmaA_hi[j]   = max(sigmaA_hi[j],   3.5 * sigmaA_inst[j])
+            
+            if verbose:
+                 print(f"  [Auto-Correction] Widening bounds for blended entry: {nm}")
 
     # Map each broad line to its narrow parent
     parent_narrow = {
@@ -1270,7 +1290,7 @@ def _fit_emission_system(
     )
 
 
-
+#edit
 # --------------------------------------------------------------------
 # Main public fit: single_broad_fit
 # --------------------------------------------------------------------
@@ -2429,8 +2449,9 @@ def broad_fit(
     save_transparent: bool = False,
     lines_to_use=None,
     broad_mode: str = "auto",
-    plot_unit: str = "fnu",       
-):
+    plot_unit: str = "fnu",
+    plot_continuum_subtracted: bool = False,
+) -> Dict:
 
 
     """
@@ -2865,52 +2886,49 @@ def broad_fit(
             Return stats for the line profile on an arbitrary wavelength grid (um).
             
             Returns:
-                mean_param_profile: Gaussian computed from the MEAN parameters (F, mu, sigma).
-                                    This ensures the plotted component is a perfect symmetric Gaussian.
-                std_profile:        Standard deviation of the bootstrap profiles at each pixel.
-                                    This represents the flux uncertainty band.
+                mean_prof: Mean of the bootstrap profiles at each pixel.
+                           (Fixed: previously used profile of mean params, which was too sharp)
+                std_prof:  Standard deviation of the bootstrap profiles at each pixel.
             """
-            # 1. Compute the "Mean Parameter" profile (Symmetric)
-            if line_name not in summary:
-                mean_prof = np.zeros_like(lam_grid_um)
-            else:
-                # Get mean parameters from summary dict
-                s = summary[line_name]
-                F_mean   = s["F_line"]["value"]
-                mu_mean  = s["lam_obs_A"]["value"]
-                sig_mean = s["sigma_A"]["value"]
-                
-                if np.isfinite(F_mean) and np.isfinite(mu_mean) and np.isfinite(sig_mean) and sig_mean > 0:
-                     lam_grid_A = lam_grid_um * 1e4
-                     leftA, rightA = _pixel_edges_A(lam_grid_A)
-                     t = _gauss_binavg_area_normalized_A(leftA, rightA, mu_mean, sig_mean)
-                     mean_prof = F_mean * t
-                else:
-                    mean_prof = np.zeros_like(lam_grid_um)
-
-            # 2. Compute the STD of the bootstrap profiles (Uncertainty)
+            # Initialize
+            mean_prof = np.zeros_like(lam_grid_um)
+            std_prof  = np.zeros_like(lam_grid_um)
+            
             if line_name not in samples:
-                std_prof = np.zeros_like(lam_grid_um)
-            else:
-                F   = samples[line_name]["F_line"][keep_mask]
-                muA = samples[line_name]["lam_obs_A"][keep_mask]
-                sA  = samples[line_name]["sigma_A"][keep_mask]
+                return mean_prof, std_prof
 
-                good = np.isfinite(F) & np.isfinite(muA) & np.isfinite(sA) & (sA > 0)
-                if not np.any(good):
-                    std_prof = np.zeros_like(lam_grid_um)
-                else:
-                    F, muA, sA = F[good], muA[good], sA[good]
-                    lam_grid_A = lam_grid_um * 1e4
-                    leftA, rightA = _pixel_edges_A(lam_grid_A)
+            # Get VALID samples
+            F   = samples[line_name]["F_line"][keep_mask]
+            muA = samples[line_name]["lam_obs_A"][keep_mask]
+            sA  = samples[line_name]["sigma_A"][keep_mask]
 
-                    profs = []
-                    for Fi, mui, si in zip(F, muA, sA):
-                        t = _gauss_binavg_area_normalized_A(leftA, rightA, mui, si)
-                        profs.append(Fi * t)
-                    
-                    profs = np.asarray(profs, float)
-                    std_prof = np.nanstd(profs, axis=0)
+            # Filter out any lingering NaNs
+            good = np.isfinite(F) & np.isfinite(muA) & np.isfinite(sA) & (sA > 0)
+            
+            if not np.any(good):
+                return mean_prof, std_prof
+
+            F, muA, sA = F[good], muA[good], sA[good]
+
+            # Prepare fine grid edges in Angstroms
+            lam_grid_A = lam_grid_um * 1e4
+            leftA, rightA = _pixel_edges_A(lam_grid_A)
+
+            # Accumulate profiles
+            profs = []
+            for Fi, mui, si in zip(F, muA, sA):
+                # Unit-area * Flux
+                t = _gauss_binavg_area_normalized_A(leftA, rightA, mui, si)
+                profs.append(Fi * t)
+            
+            profs = np.asarray(profs, float)
+            
+            # --- COMPUTE STATS ---
+            # 1. Mean Profile: mean of the profiles (consistent with red total model line)
+            mean_prof = np.nanmean(profs, axis=0)
+            
+            # 2. Std Profile: std of the profiles (uncertainty band)
+            std_prof  = np.nanstd(profs, axis=0)
 
             return mean_prof, std_prof
 
@@ -2973,7 +2991,7 @@ def broad_fit(
         # ----------------------------------------------------
         # helper: single plotting routine for a given unit
         # ----------------------------------------------------
-        def _plot_unit(unit: str = "fnu"):
+        def _plot_unit(unit: str = "fnu", plot_continuum_subtracted: bool = False):
             unit = unit.lower()
             if unit == "flam":
                 flux = fnu_uJy_to_flam(flux_uJy, lam_um)
@@ -3014,6 +3032,21 @@ def broad_fit(
             broad_color  = "tab:orange"
             broad_color2 = "tab:pink"
 
+            # --- Apply continuum subtraction if requested ---
+            if plot_continuum_subtracted: 
+                flux = flux - cont
+                # mu includes continuum so we subtract it
+                mu = mu - cont
+                # set continuum to zero for display
+                cont = np.zeros_like(cont)
+                ylabel += " (cont. sub.)"
+                
+                # Also subtract from base fit continuum for components
+                # (components are added TO the continuum, so we just set base continuum to 0)
+                cont_fit_base_for_plot = np.zeros_like(cont_fit_base)
+            else:
+                cont_fit_base_for_plot = cont_fit_base
+
             # --- build mean line profiles in Fλ on lam_fit_base ---
             # IMPORTANT: We must ensure that sum of component means = mean of total model.
             # To do this, we compute component profiles from the SAME bootstrap stack
@@ -3039,18 +3072,25 @@ def broad_fit(
                     sum_narrow_flam += prof_flam_mean
 
             # --- convert continuum + grouped components to the chosen plotting unit ---
+            # We use cont_fit_base_for_plot (which is 0 if subtracted) as the baseline for components
+             
             if unit == "flam":
-                cont_base_unit       = cont_fit_base
-                narrow_tot_unit      = cont_fit_base + sum_narrow_flam
+                cont_base_unit       = cont_fit_base_for_plot
+                narrow_tot_unit      = cont_fit_base_for_plot + sum_narrow_flam
                 narrow_plus_b1_unit  = narrow_tot_unit + sum_b1_flam
                 full_unit            = narrow_plus_b1_unit + sum_b2_flam
             else:
-                cont_base_unit       = flam_to_fnu_uJy(cont_fit_base, lam_fit_base)
-                narrow_tot_unit      = flam_to_fnu_uJy(cont_fit_base + sum_narrow_flam,
+                # If plotting Fnu but subtracting continuum, we must be careful.
+                # The components (sum_narrow_flam etc) are in Flam.
+                # If plot_continuum_subtracted is True, cont_fit_base_for_plot is 0 (in Flam).
+                # To get Fnu of components, we just convert (0 + component_flam).
+                
+                cont_base_unit       = flam_to_fnu_uJy(cont_fit_base_for_plot, lam_fit_base)
+                narrow_tot_unit      = flam_to_fnu_uJy(cont_fit_base_for_plot + sum_narrow_flam,
                                                       lam_fit_base)
-                narrow_plus_b1_unit  = flam_to_fnu_uJy(cont_fit_base + sum_narrow_flam + sum_b1_flam,
+                narrow_plus_b1_unit  = flam_to_fnu_uJy(cont_fit_base_for_plot + sum_narrow_flam + sum_b1_flam,
                                                       lam_fit_base)
-                full_unit            = flam_to_fnu_uJy(cont_fit_base + sum_narrow_flam +
+                full_unit            = flam_to_fnu_uJy(cont_fit_base_for_plot + sum_narrow_flam +
                                                        sum_b1_flam + sum_b2_flam,
                                                       lam_fit_base)
 
@@ -3414,9 +3454,9 @@ def broad_fit(
 
         # --- make requested plot(s) ---
         if plot_unit.lower() in ("flam", "both"):
-            _plot_unit("flam")
+            _plot_unit("flam", plot_continuum_subtracted=plot_continuum_subtracted)
         if plot_unit.lower() in ("fnu", "both"):
-            _plot_unit("fnu")
+            _plot_unit("fnu", plot_continuum_subtracted=plot_continuum_subtracted)
 
 
 
@@ -3444,6 +3484,11 @@ def broad_fit(
         "BIC_HD_2broad": base.get("BIC_HD_2broad", np.nan),
         "BIC_HD_b2only": base.get("BIC_HD_b2only", np.nan),
         "broad_choice_HD": base.get("broad_choice_HD", "unknown"),
+        
+        # New return values: continuum and redshift
+        "continuum_flam": cont_flam,
+        "continuum_fnu": cont_uJy,
+        "z": z,
     }
 def print_bootstrap_line_table_broad(boot, save_path: str | None = None):
     """
