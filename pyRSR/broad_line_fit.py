@@ -1,5 +1,5 @@
 """
-edit more more
+edit more more more
 Broad-line emission fitting with BIC-based model selection. new
 
 Fits emission lines using area-normalized Gaussians with optional broad
@@ -2074,7 +2074,25 @@ def single_broad_fit(
             verbose=bool(verbose),
         )
         if not which_lines_all:
-            raise ValueError("No emission lines with data in the global fit window.")
+            # Raise no error, just return continuum-only result
+            if verbose:
+                print("No emission lines with data in the global fit window (or empty list provided). Returning continuum only.")
+            
+            return {
+                "success": True,
+                "message": "Continuum only",
+                "lam_fit": lam_all,
+                "model_window_flam": np.zeros_like(lam_all),
+                "model_flam": np.zeros_like(lam_all),  # for consistent return
+                "continuum_flam": Fcont_all,
+                "lines": {},
+                "which_lines": [],
+                "BIC": np.nan,
+                # BICs
+                "BIC_HA_narrow": np.nan, "BIC_HA_1broad": np.nan, "BIC_HA_2broad": np.nan, "BIC_HA_b2only": np.nan, "broad_choice_HA": "none",
+                "BIC_HB_narrow": np.nan, "BIC_HB_1broad": np.nan, "BIC_HB_2broad": np.nan, "BIC_HB_b2only": np.nan, "broad_choice_HB": "none",
+                "BIC_HD_narrow": np.nan, "BIC_HD_1broad": np.nan, "BIC_HD_2broad": np.nan, "BIC_HD_b2only": np.nan, "broad_choice_HD": "none",
+            }
 
         # 2) decide Hα, Hβ, and Hδ models (none/one/two broad) using local windows
         broad_choice_ha, BIC_HA_narrow, BIC_HA_1broad, BIC_HA_2broad, BIC_HA_b2only, BIC_HA_broad = _select_ha_model(which_lines_all)
@@ -2542,7 +2560,12 @@ def broad_fit(
         )
         which_lines = list(base.get("which_lines", []))
         if not which_lines:
-            raise ValueError("No emission lines in coverage (cannot bootstrap).")
+            # No lines to bootstrap, but valid continuum fit
+            if verbose:
+                print("No lines to bootstrap. Returning base fit (continuum only).")
+            # We will proceed to return, skipping the bootstrap loop 
+            # by ensuring which_lines is empty (check loop conditions)
+            pass 
 
     except ValueError as e:
         if verbose:
