@@ -1,5 +1,5 @@
 """
-edit more more more
+edit more more more more
 Broad-line emission fitting with BIC-based model selection. new
 
 Fits emission lines using area-normalized Gaussians with optional broad
@@ -1311,6 +1311,7 @@ def single_broad_fit(
     bic_delta_prefer: float = 0.0,
     snr_broad_threshold: float = 5.0,
     broad_mode: str = "auto",
+    continuum_lya_mask_A: float = 200.0,
 ):
     """
     Fit emission lines with optional broad Balmer components using BIC selection.
@@ -1390,10 +1391,10 @@ def single_broad_fit(
     auto_windows = None
     if isinstance(continuum_windows, str) and continuum_windows.lower() == "two_sided_lya":
         auto_windows = continuum_windows_two_sides_of_lya(
-            lam_um, z, buffer_rest_A=200.0, min_pts=12, verbose=verbose
+            lam_um, z, buffer_rest_A=continuum_lya_mask_A, min_pts=12, verbose=verbose
         )
     elif isinstance(continuum_windows, dict) and continuum_windows.get("mode", "").lower() == "two_sided_lya":
-        brA = float(continuum_windows.get("buffer_rest_A", 200.0))
+        brA = float(continuum_windows.get("buffer_rest_A", continuum_lya_mask_A))
         mpts = int(continuum_windows.get("min_pts", 12))
         auto_windows = continuum_windows_two_sides_of_lya(
             lam_um, z, buffer_rest_A=brA, min_pts=mpts, verbose=verbose
@@ -2469,6 +2470,7 @@ def broad_fit(
     broad_mode: str = "auto",
     plot_unit: str = "fnu",
     plot_continuum_subtracted: bool = False,
+    continuum_lya_mask_A: float = 200.0,
 ) -> Dict:
 
 
@@ -2557,6 +2559,7 @@ def broad_fit(
             absorption_corrections=absorption_corrections,
             lines_to_use=lines_to_use,
             broad_mode=broad_mode, 
+            continuum_lya_mask_A=continuum_lya_mask_A,
         )
         which_lines = list(base.get("which_lines", []))
         if not which_lines:
@@ -2683,7 +2686,8 @@ def broad_fit(
                 absorption_corrections=absorption_corrections,
                 lines_to_use=lines_to_use,
                 force_lines=which_lines,      # freeze line list
-                broad_mode=broad_mode, 
+                broad_mode=broad_mode,
+                continuum_lya_mask_A=continuum_lya_mask_A,
             )
             ok_fit = True
         except Exception:
