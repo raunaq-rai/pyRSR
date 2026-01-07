@@ -23,7 +23,7 @@ You can easily set up the environment and install the package using Conda:
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/raunaq-rai/cosmicdawn.git
+git clone https://github.com/raunaq-rai/pyRSR.git
 cd PyRSR
 
 # 2. Create the environment
@@ -41,7 +41,7 @@ pip install -e .
 If you prefer to use your own environment:
 
 ```bash
-git clone https://github.com/raunaq-rai/cosmicdawn.git
+git clone https://github.com/raunaq-rai/pyRSR.git
 cd PyRSR
 pip install -e .
 ```
