@@ -1,5 +1,5 @@
 """
-edit more more more more
+tying together NII peaks
 Broad-line emission fitting with BIC-based model selection. new
 
 Fits emission lines using area-normalized Gaussians with optional broad
@@ -1130,10 +1130,82 @@ def _fit_emission_system(
             # we let H⍺ and H⍺_BROAD float within halfA
 
     # --- pack params (full A, σ, μ as in original fitter) ---
-    p0 = np.r_[A0,          sigmaA_seed, muA_seed]
-    lb = np.r_[A_lo,        sigmaA_lo,   muA_lo]
-    ub = np.r_[A_hi,        sigmaA_hi,   muA_hi]
-    p0, lb, ub = _finalize_seeds_and_bounds(p0, lb, ub)
+    p0_full = np.r_[A0,          sigmaA_seed, muA_seed]
+    lb_full = np.r_[A_lo,        sigmaA_lo,   muA_lo]
+    ub_full = np.r_[A_hi,        sigmaA_hi,   muA_hi]
+    p0_full, lb_full, ub_full = _finalize_seeds_and_bounds(p0_full, lb_full, ub_full)
+    
+    # ------------------------------------------------------------------
+    # CONSTRAINT LOGIC: Tie NII Doublet & Weighting
+    # ------------------------------------------------------------------
+    idx_6549 = name_to_idx.get("NII_6549")
+    idx_6585 = name_to_idx.get("NII_6585")
+    do_tie_nii = (idx_6549 is not None) and (idx_6585 is not None)
+    
+    sig_fit_weighted = sig_fit.copy()
+    
+    # Increase weight on NII_6549
+    if idx_6549 is not None:
+         # Find pixels near NII_6549 seed center
+         mu_6549_um = p0_full[2*nL + idx_6549] / 1e4
+         sig_6549_um = p0_full[nL + idx_6549] / 1e4 * 1.0  # approximate width
+         
+         # Define window to boost weight (e.g. +/- 2 sigma)
+         mask_weight = (lam_fit >= mu_6549_um - 2*sig_6549_um) & (lam_fit <= mu_6549_um + 2*sig_6549_um)
+         if np.any(mask_weight):
+             if verbose:
+                 print(f"  [Weighting] Increasing weight for NII_6549 on {np.count_nonzero(mask_weight)} pixels.")
+             # Divide sigma by 3 -> weight * 9
+             sig_fit_weighted[mask_weight] /= 3.0
+
+    # Mask of parameters to OPTIMIZE
+    # default: all True
+    param_mask = np.ones(p0_full.size, dtype=bool)
+    
+    if do_tie_nii:
+        if verbose:
+            print("  [Constraints] Tying NII_6549 to NII_6585 (Flux ratio 2.96, tied kinematics).")
+        # Remove 6549 parameters from optimization
+        # Amplitude
+        param_mask[idx_6549] = False
+        # Sigma
+        param_mask[nL + idx_6549] = False
+        # Mu
+        param_mask[2*nL + idx_6549] = False
+        
+    p0_opt = p0_full[param_mask]
+    lb_opt = lb_full[param_mask]
+    ub_opt = ub_full[param_mask]
+    
+    def _reconstruct_params(p_opt):
+        # Start with full seeds (holds fixed values if any, though here we overwrite everything important)
+        p_curr = p0_full.copy()
+        
+        # Fill in optimized values
+        p_curr[param_mask] = p_opt
+        
+        if do_tie_nii:
+            # 1. Amplitude: A_6549 = A_6585 / 2.96
+            # Note: p_curr[idx_6585] is now updated from p_opt
+            p_curr[idx_6549] = p_curr[idx_6585] / 2.96
+            
+            # 2. Kinematics
+            # Need ratio of rest wavelengths
+            lam_49 = REST_LINES_A["NII_6549"]
+            lam_85 = REST_LINES_A["NII_6585"]
+            ratio = lam_49 / lam_85
+            
+            # Tie Mu: z_49 = z_85
+            # mu_85 = lam_85 * (1+z)
+            # mu_49 = lam_49 * (1+z) = lam_49 * (mu_85 / lam_85) = mu_85 * ratio
+            p_curr[2*nL + idx_6549] = p_curr[2*nL + idx_6585] * ratio
+            
+            # Tie Sigma (velocity): sigma_v_49 = sigma_v_85
+            # sigma_lam_49 / lam_49 = sigma_lam_85 / lam_85
+            # sigma_lam_49 = sigma_lam_85 * ratio
+            p_curr[nL + idx_6549] = p_curr[nL + idx_6585] * ratio
+            
+        return p_curr
 
     # --- χ² residuals with gentle pixel-width weighting (same as before) ---
     dlA = np.gradient(lamA_fit)
@@ -1143,23 +1215,26 @@ def _fit_emission_system(
     w_pix = np.clip(w_pix, 0.8, 1.25)
 
     def fun(p):
+        p_full = _reconstruct_params(p)
         model, _, _ = build_model_flam_linear(
-            p, lam_fit, z, grating, which_lines, mu_seed_um
+            p_full, lam_fit, z, grating, which_lines, mu_seed_um
         )
-        return w_pix * (resid_fit - model) / np.clip(sig_fit, 1e-30, None)
+        # Use weighted expected error
+        return w_pix * (resid_fit - model) / np.clip(sig_fit_weighted, 1e-30, None)
 
     res = least_squares(
-        fun, p0, bounds=(lb, ub),
+        fun, p0_opt, bounds=(lb_opt, ub_opt),
         max_nfev=80000, xtol=1e-8, ftol=1e-8
     )
 
     # --- best-fit model ---
+    p_best_full = _reconstruct_params(res.x)
     model_flam_win, profiles_win, centers = build_model_flam_linear(
-        res.x, lam_fit, z, grating, which_lines, mu_seed_um
+        p_best_full, lam_fit, z, grating, which_lines, mu_seed_um
     )
 
     # First nL params are fitted amplitudes
-    A_fit = np.asarray(res.x[:nL], float)
+    A_fit = np.asarray(p_best_full[:nL], float)
 
     # --- fluxes & EWs using the standard helpers (same as excels_fit_poly) ---
     # NOTE: For overlapping components (e.g., broad Hα spilling into NII),
