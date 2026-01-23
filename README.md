@@ -14,6 +14,30 @@
 - **Continuum Subtraction**: Polynomial continuum fitting with options for automatic masking around Lyman-α.
 - **Support for NIRSpec Gratings**: Tuned constraints and presets for PRISM, MEDIUM, and HIGH resolution gratings.
 - **Photometry & Stacking**: Tools for photometry handling and spectral stacking (in `photometry.py` and `stacking.py`).
+- **High-Performance Version (PyRSRX)**: A Cythonized version (`PyRSRX`) is available for computationally intensive bootstrapping, offering ~1.5x speedup.
+
+## PyRSR vs PyRSRX
+
+This repository contains two versions of the package:
+
+| Package | Description | Best For | Installation |
+|---|---|---|---|
+| **PyRSR** | Pure Python implementation. | General usage, detailed debugging, environments without C compilers. | `pip install .` |
+| **PyRSRX** | Cython-optimized implementation. | Heavy bootstrapping (`broad_fit`), production pipelines. | `pip install -e .` (requires C compiler) |
+
+**Walkthrough: Switching to PyRSRX**
+
+Both packages share the exact same API. To use the faster version, simply change your import:
+
+```python
+# Standard version
+from PyRSR.broad_line_fit import broad_fit
+
+# Fast Cython version
+from PyRSRX.broad_line_fit import broad_fit
+```
+
+The `PyRSRX` module uses compiled C extensions for the Gaussian model generation and integration steps, which are the bottleneck in iterative fitting. This results in a significant speedup (approx 1.5x faster per fit) which adds up when running 1000+ bootstrap iterations.
 
 ## Installation
 
