@@ -1429,8 +1429,8 @@ def single_broad_fit(
         Wavelength windows for continuum fitting, or 'two_sided_lya' for automatic.
     lyman_cut : str, default='split'
         Lyman-alpha cutoff mode. 'split' fits both sides (default), 'lya' masks blue.
-    fit_window_um : tuple of float, optional
-        (low, high) wavelength range in microns for fitting. If None, uses full coverage.
+    fit_window_um : tuple of float or list of tuples, optional
+        (low, high) or [(lo1, hi1), ...] wavelength range(s) in microns for fitting.
     plot : bool, default=True
         Whether to generate diagnostic plots.
     verbose : bool, default=True
@@ -1509,8 +1509,14 @@ def single_broad_fit(
 
     # Global fit window for all lines
     if fit_window_um is not None:
-        lo_all, hi_all = fit_window_um
-        w_all = (lam_um >= lo_all) & (lam_um <= hi_all)
+        if isinstance(fit_window_um, list):
+             w_all = np.zeros(lam_um.shape, dtype=bool)
+             for (lo, hi) in fit_window_um:
+                 w_all |= (lam_um >= lo) & (lam_um <= hi)
+        else:
+             lo_all, hi_all = fit_window_um
+             w_all = (lam_um >= lo_all) & (lam_um <= hi_all)
+
         lam_all   = lam_um[w_all]
         resid_all = resid_full[w_all]
         sig_all   = sig_flam_fit[w_all]
@@ -2720,8 +2726,13 @@ def broad_fit(
                  for ln in which_lines}
 
     if fit_window_um:
-        lo, hi = fit_window_um
-        wfit = (lam_um >= lo) & (lam_um <= hi)
+        if isinstance(fit_window_um, list):
+             wfit = np.zeros_like(lam_um, dtype=bool)
+             for (lo, hi) in fit_window_um:
+                 wfit |= (lam_um >= lo) & (lam_um <= hi)
+        else:
+             lo, hi = fit_window_um
+             wfit = (lam_um >= lo) & (lam_um <= hi)
     else:
         # Derive window from the base fit's lam_fit
         lam_fit_base = np.asarray(base.get("lam_fit", lam_um), float)
@@ -3073,9 +3084,9 @@ def broad_fit(
                 cw_mask |= (lam_um >= lo_cw) & (lam_um <= hi_cw)
             disp_mask &= cw_mask
 
-        if fit_window_um:
-            lo_fw, hi_fw = fit_window_um
-            disp_mask &= (lam_um >= lo_fw) & (lam_um <= hi_fw)
+        # if fit_window_um:
+        #    # User requested to see data outside fit window, so we do NOT mask the display.
+        #    pass
 
         # -------------------------------
         # define line groups for zooms
