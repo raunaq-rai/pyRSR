@@ -1,5 +1,5 @@
 """
-tying together NII peaks
+centrod bounds and peak width
 Broad-line emission fitting with BIC-based model selection. new
 
 Fits emission lines using area-normalized Gaussians with optional broad
@@ -946,7 +946,7 @@ def _fit_emission_system(
     # These keys represent two physical lines fitted as one Gaussian.
     # We must relax the upper width bound and increase the seed width
     # so the fitter can encompass both peaks.
-    BLENDED_KEYS = {"NV_doublet", "CIV_doublet", "OII_doublet", "CIII]"}
+    BLENDED_KEYS = {"NV_doublet", "CIV_doublet", "OII_doublet"}
 
     for j, nm in enumerate(which_lines):
         if nm in BLENDED_KEYS:
@@ -1107,13 +1107,12 @@ def _fit_emission_system(
         muA_lo = muA_seed - 12.0 * np.maximum(sigmaA_inst, 1.0)
         muA_hi = muA_seed + 12.0 * np.maximum(sigmaA_inst, 1.0)
     else:
-        C_KMS    = 299792.458
-        VEL_KMS  = 100.0
+        # Relaxed centroid bounds: allow ~25 A movement observed frame
         NPIX_CENT = 4.0
+        CENTROID_HALF_WIDTH_A = 25.0
 
-        dvA   = muA_nom * (VEL_KMS / C_KMS)
         pixA  = pixA_local
-        halfA = np.maximum(NPIX_CENT * pixA, dvA)
+        halfA = np.maximum(NPIX_CENT * pixA, CENTROID_HALF_WIDTH_A)
 
         muA_lo = muA_seed - halfA
         muA_hi = muA_seed + halfA
