@@ -145,6 +145,47 @@ def gaussian_pixel_integrated(lam_edges, mu, sigma):
     area = np.diff(cdf)
     return area
 
+def gaussian_profile(lam, A, mu, sigma):
+    """
+    Compute a Gaussian profile for plotting.
+    
+    Args:
+        lam: Wavelength array (Angstroms or microns, must match mu/sigma units)
+        A: Integrated flux (area under curve)
+        mu: Centroid (same units as lam)
+        sigma: Standard deviation (same units as lam)
+        
+    Returns:
+        F_lambda: Flux density at each wavelength (F_lambda = A * G(lam) / integral)
+    """
+    if sigma <= 0:
+        return np.zeros_like(lam)
+    
+    SQRT2PI = np.sqrt(2 * np.pi)
+    # Area-normalized Gaussian: integral = 1
+    gauss = np.exp(-0.5 * ((lam - mu) / sigma)**2) / (sigma * SQRT2PI)
+    return A * gauss
+
+def reconstruct_line_profile(lam_um, line_params):
+    """
+    Reconstruct a line's Gaussian profile from fitted parameters.
+    
+    Args:
+        lam_um: Wavelength array in microns
+        line_params: dict with 'A_gauss', 'lam_obs_A', 'sigma_A'
+        
+    Returns:
+        profile: F_lambda array
+    """
+    A = line_params["A_gauss"]
+    mu_A = line_params["lam_obs_A"]
+    sigma_A = line_params["sigma_A"]
+    
+    # Convert lam to Angstroms
+    lam_A = lam_um * 1e4
+    
+    return gaussian_profile(lam_A, A, mu_A, sigma_A)
+
 def build_model(params, lam, which_lines, fixed_z, fixed_sigma_inst):
     """
     Construct the model flux density (F_lambda).
@@ -195,17 +236,29 @@ class LineModel:
         self.lb = np.zeros(self.n_dim)
         self.ub = np.zeros(self.n_dim)
         
-        # Flux Bounds: 0 to 1000x seed
+        # Flux Bounds: 0 to 10000x seed (very generous for real data)
         self.lb[0:self.n_lines] = 0.0 # Strict positive
-        self.ub[0:self.n_lines] = np.maximum(self.flux_seeds * 1000.0, 1e-10)
+        self.ub[0:self.n_lines] = np.maximum(self.flux_seeds * 10000.0, 1e-5)
         
-        # Sigma Bounds: Inst/2 to 500A (broad)
-        # We need to distinguish narrow/broad logic here, but let's keep it generic first
-        self.lb[self.n_lines : 2*self.n_lines] = self.sigma_inst_A * 0.5
-        self.ub[self.n_lines : 2*self.n_lines] = np.maximum(self.sigma_inst_A * 10.0, 500.0)
+        # Sigma Bounds: Handle narrow vs broad components
+        # Base bounds: 0.2*inst to 15*inst for flexibility
+        sig_lo = self.sigma_inst_A * 0.2
+        sig_hi = np.maximum(self.sigma_inst_A * 15.0, 1000.0)
         
-        # Redshift Bounds: +/- 1000 km/s approx
-        dz = 0.02
+        # Widen bounds for BROAD components
+        for j, nm in enumerate(self.line_names):
+            if "BROAD2" in nm.upper():
+                sig_lo[j] = self.sigma_inst_A[j] * 4.0
+                sig_hi[j] = max(self.sigma_inst_A[j] * 25.0, 2000.0)
+            elif "BROAD" in nm.upper():
+                sig_lo[j] = self.sigma_inst_A[j] * 1.5
+                sig_hi[j] = max(self.sigma_inst_A[j] * 12.0, 1500.0)
+        
+        self.lb[self.n_lines : 2*self.n_lines] = sig_lo
+        self.ub[self.n_lines : 2*self.n_lines] = sig_hi
+        
+        # Redshift Bounds: +/- 0.01 (~3000 km/s)
+        dz = 0.01
         self.lb[-1] = -dz
         self.ub[-1] = +dz
 
@@ -404,7 +457,335 @@ class MCMCFitter:
         sampler.run_mcmc(p0, n_steps, progress=verbose, skip_initial_state_check=True)
         
         flat_chain = sampler.get_chain(discard=burn_in, flat=True, thin=1)
-        return flat_chain
+        return flat_chain, sampler
+
+    def compute_bic(self, params):
+        """
+        Compute BIC = k*ln(n) - 2*ln(L)
+        where k = ndim, n = number of data points, L = likelihood
+        """
+        ll = self.log_likelihood(params)
+        n = len(self.lam)
+        k = self.ndim
+        bic = k * np.log(n) - 2.0 * ll
+        return bic
+
+def compute_bic_for_model(spec_data, z_init, line_names, grating, verbose=False):
+    """
+    Fast least-squares fit to compute BIC for a given line configuration.
+    Uses scipy.optimize.least_squares, matching PyRSR's approach.
+    """
+    from scipy.optimize import least_squares
+    
+    lam = spec_data["lam"]
+    flux = spec_data["flux"]
+    err = spec_data["err"]
+    
+    # Filter valid lines
+    valid_lines = [l for l in line_names if l in REST_LINES_A]
+    if not valid_lines:
+        return np.inf, None
+    
+    nL = len(valid_lines)
+    
+    # Compute observed wavelengths and instrument widths
+    lam_obs_A = np.array([REST_LINES_A[l] * (1 + z_init) for l in valid_lines])
+    lam_obs_um = lam_obs_A / 1e4
+    
+    sigma_log = sigma_grating_logA(grating, lam_obs_um)
+    sigma_inst_A = lam_obs_A * LN10 * sigma_log
+    
+    # Convert wavelength to Angstroms for fitting
+    lam_A = lam * 1e4
+    
+    # Pixel edges for area-normalized Gaussians
+    dlam = np.median(np.diff(lam_A))
+    edges_A = np.concatenate(([lam_A[0] - dlam/2], 0.5*(lam_A[1:]+lam_A[:-1]), [lam_A[-1] + dlam/2]))
+    
+    # Initial seeds for parameters: [A_0, A_1, ..., sigma_0, sigma_1, ..., mu_0, mu_1, ...]
+    # A = flux amplitude (integrated flux)
+    # sigma = line width in Angstroms
+    # mu = centroid in Angstroms
+    
+    A0 = []
+    for i, l_um in enumerate(lam_obs_um):
+        win = (lam > l_um - 0.02) & (lam < l_um + 0.02)
+        if np.any(win):
+            peak = np.nanmax(flux[win])
+            peak = max(peak, 1e-20)
+        else:
+            peak = np.nanpercentile(flux, 95) if len(flux) > 0 else 1e-19
+            peak = max(peak, 1e-20)
+        # Rough integrated flux estimate
+        A0.append(peak * sigma_inst_A[i] * np.sqrt(2*np.pi))
+    
+    sigma0 = sigma_inst_A.copy()
+    mu0 = lam_obs_A.copy()
+    
+    # Bounds - be generous to handle real data
+    A_lo = np.zeros(nL)
+    A_hi = np.array([1000 * max(a, 1e-10) for a in A0])  # More generous upper bound
+    
+    # Sigma bounds - widen for all gratings to handle broader lines
+    g = str(grating).lower()
+    if "prism" in g:
+        sigma_lo = 0.4 * sigma_inst_A
+        sigma_hi = 5.0 * sigma_inst_A  # Widened
+    else:
+        # G395M, G395H etc - be more generous
+        sigma_lo = 0.2 * sigma_inst_A
+        sigma_hi = 8.0 * sigma_inst_A  # Much wider to catch broad lines
+    
+    # Widen bounds for BROAD components
+    for j, nm in enumerate(valid_lines):
+        if "BROAD2" in nm:
+            sigma_lo[j] = 4.0 * sigma_inst_A[j]
+            sigma_hi[j] = 20.0 * sigma_inst_A[j]
+            sigma0[j] = 7.0 * sigma_inst_A[j]
+        elif "BROAD" in nm:
+            sigma_lo[j] = 1.5 * sigma_inst_A[j]
+            sigma_hi[j] = 10.0 * sigma_inst_A[j]
+            sigma0[j] = 3.0 * sigma_inst_A[j]
+    
+    # Centroid bounds: +/- 100 Angstroms (wider for real data)
+    mu_lo = lam_obs_A - 100.0
+    mu_hi = lam_obs_A + 100.0
+    
+    # Pack parameters
+    p0 = np.concatenate([A0, sigma0, mu0])
+    lb = np.concatenate([A_lo, sigma_lo, mu_lo])
+    ub = np.concatenate([A_hi, sigma_hi, mu_hi])
+    
+    # Ensure seeds are within bounds
+    p0 = np.clip(p0, lb + 1e-10, ub - 1e-10)
+    
+    # Validate data before fitting
+    valid_data = np.isfinite(flux) & np.isfinite(err) & (err > 0)
+    if not np.any(valid_data):
+        if verbose:
+            print(f"  BIC fit failed: No valid data points")
+        return np.inf, None
+    
+    # Filter data
+    lam_valid = lam[valid_data]
+    flux_valid = flux[valid_data]
+    err_valid = err[valid_data]
+    lam_A_valid = lam_valid * 1e4
+    
+    # Recompute edges for valid data
+    dlam_v = np.median(np.diff(lam_A_valid))
+    edges_valid = np.concatenate(([lam_A_valid[0] - dlam_v/2], 
+                                   0.5*(lam_A_valid[1:]+lam_A_valid[:-1]), 
+                                   [lam_A_valid[-1] + dlam_v/2]))
+    
+    def model_fn(params):
+        A = params[:nL]
+        sigma = params[nL:2*nL]
+        mu = params[2*nL:3*nL]
+        
+        total = np.zeros_like(lam_A_valid)
+        for j in range(nL):
+            if sigma[j] <= 0:
+                continue
+            prof = gaussian_pixel_integrated(edges_valid, mu[j], sigma[j])
+            total += A[j] * prof
+        return total
+    
+    def residual_fn(params):
+        model = model_fn(params)
+        return (flux_valid - model) / np.clip(err_valid, 1e-30, None)
+    
+    try:
+        res = least_squares(
+            residual_fn, p0, 
+            bounds=(lb, ub),
+            max_nfev=20000,  # More iterations
+            xtol=1e-7, ftol=1e-7
+        )
+        
+        # Compute BIC = chi2 + k * ln(N)
+        resid_vec = residual_fn(res.x)
+        mfin = np.isfinite(resid_vec)
+        N_data = int(np.count_nonzero(mfin))
+        
+        if N_data == 0:
+            if verbose:
+                print(f"  BIC fit failed: Zero valid residuals")
+            return np.inf, None
+            
+        chi2 = float(np.sum(resid_vec[mfin]**2))
+        k_params = res.x.size
+        BIC = chi2 + k_params * np.log(N_data)
+        
+        if verbose:
+            print(f"  Fit {valid_lines}: χ²={chi2:.1f}, k={k_params}, N={N_data}, BIC={BIC:.1f}")
+        
+        return BIC, {"params": res.x, "chi2": chi2, "lines": valid_lines}
+        
+    except Exception as e:
+        if verbose:
+            print(f"  BIC fit failed for {valid_lines}: {e}")
+            import traceback
+            traceback.print_exc()
+        return np.inf, None
+
+def select_broad_model(
+    spec_data,
+    z_init,
+    base_lines,
+    balmer_line="H⍺",
+    grating="PRISM",
+    broad_mode="auto",
+    bic_delta=6.0,
+    verbose=True
+):
+    """
+    Select the best broad component configuration for a Balmer line using BIC.
+    
+    Args:
+        spec_data: dict with lam, flux, err
+        z_init: redshift
+        base_lines: list of narrow lines to include
+        balmer_line: which Balmer line to add broad components for (e.g. "H⍺", "HBETA")
+        grating: instrument grating
+        broad_mode: "auto", "off", "broad1", "broad2", "both"
+        bic_delta: minimum BIC improvement to prefer broad model
+        verbose: print diagnostics
+        
+    Returns:
+        dict with:
+            - chosen_lines: final line list
+            - broad_choice: "none", "one", "broad2_only", "two"
+            - BIC_narrow, BIC_1broad, BIC_2broad, BIC_b2only
+    """
+    broad1_name = f"{balmer_line}_BROAD"
+    broad2_name = f"{balmer_line}_BROAD2"
+    
+    # Ensure broad names exist in REST_LINES_A
+    if broad1_name not in REST_LINES_A and balmer_line in REST_LINES_A:
+        REST_LINES_A[broad1_name] = REST_LINES_A[balmer_line]
+    if broad2_name not in REST_LINES_A and balmer_line in REST_LINES_A:
+        REST_LINES_A[broad2_name] = REST_LINES_A[balmer_line]
+    
+    results = {
+        "broad_choice": "none",
+        "BIC_narrow": np.nan,
+        "BIC_1broad": np.nan,
+        "BIC_2broad": np.nan,
+        "BIC_b2only": np.nan,
+        "chosen_lines": list(base_lines)
+    }
+    
+    if balmer_line not in base_lines:
+        if verbose:
+            print(f"{balmer_line} not in base_lines, skipping broad selection.")
+        return results
+    
+    if broad_mode == "off":
+        if verbose:
+            print(f"broad_mode='off' → using narrow-only {balmer_line} model.")
+        return results
+        
+    # 1. Narrow-only fit
+    if verbose:
+        print(f"\n=== BIC Model Selection for {balmer_line} ===")
+        print("Fitting narrow-only model...")
+    
+    bic_narrow, _ = compute_bic_for_model(spec_data, z_init, base_lines, grating, verbose=False)
+    results["BIC_narrow"] = bic_narrow
+    
+    if verbose:
+        print(f"  Narrow-only: BIC = {bic_narrow:.2f}")
+    
+    # 2. +BROAD fit
+    lines_1broad = list(base_lines) + [broad1_name]
+    if verbose:
+        print("Fitting narrow + BROAD model...")
+    bic_1broad, fit1 = compute_bic_for_model(spec_data, z_init, lines_1broad, grating, verbose=False)
+    results["BIC_1broad"] = bic_1broad
+    
+    if verbose:
+        print(f"  +BROAD: BIC = {bic_1broad:.2f}" if np.isfinite(bic_1broad) else "  +BROAD: (fit failed)")
+    
+    # 3. +BROAD2 only fit
+    lines_b2only = list(base_lines) + [broad2_name]
+    if verbose:
+        print("Fitting narrow + BROAD2 model...")
+    bic_b2only, fit_b2 = compute_bic_for_model(spec_data, z_init, lines_b2only, grating, verbose=False)
+    results["BIC_b2only"] = bic_b2only
+    
+    if verbose:
+        print(f"  +BROAD2 only: BIC = {bic_b2only:.2f}" if np.isfinite(bic_b2only) else "  +BROAD2 only: (fit failed)")
+    
+    # 4. +BROAD +BROAD2 fit
+    lines_2broad = list(base_lines) + [broad1_name, broad2_name]
+    if verbose:
+        print("Fitting narrow + BROAD + BROAD2 model...")
+    bic_2broad, fit2 = compute_bic_for_model(spec_data, z_init, lines_2broad, grating, verbose=False)
+    results["BIC_2broad"] = bic_2broad
+    
+    if verbose:
+        print(f"  +both BROAD: BIC = {bic_2broad:.2f}" if np.isfinite(bic_2broad) else "  +both BROAD: (fit failed)")
+    
+    # 5. Select best model
+    candidates = [(bic_narrow, "none", base_lines)]
+    if np.isfinite(bic_1broad):
+        candidates.append((bic_1broad, "one", lines_1broad))
+    if np.isfinite(bic_b2only):
+        candidates.append((bic_b2only, "broad2_only", lines_b2only))
+    if np.isfinite(bic_2broad):
+        candidates.append((bic_2broad, "two", lines_2broad))
+    
+    if broad_mode == "broad1":
+        if np.isfinite(bic_1broad):
+            results["broad_choice"] = "one"
+            results["chosen_lines"] = lines_1broad
+        else:
+            if verbose:
+                print("broad_mode='broad1' but fit failed → reverting to narrow-only.")
+    elif broad_mode == "broad2":
+        if np.isfinite(bic_b2only):
+            results["broad_choice"] = "broad2_only"
+            results["chosen_lines"] = lines_b2only
+        else:
+            if verbose:
+                print("broad_mode='broad2' but fit failed → reverting to narrow-only.")
+    elif broad_mode == "both":
+        if np.isfinite(bic_2broad):
+            results["broad_choice"] = "two"
+            results["chosen_lines"] = lines_2broad
+        else:
+            if verbose:
+                print("broad_mode='both' but fit failed → reverting to narrow-only.")
+    else:
+        # auto mode: pick lowest BIC with threshold
+        if len(candidates) > 1:
+            bics = [c[0] for c in candidates]
+            i_best = int(np.argmin(bics))
+            best_bic, best_choice, best_lines = candidates[i_best]
+            
+            # Only accept if improvement exceeds threshold
+            if best_choice != "none":
+                if np.isfinite(bic_narrow) and (best_bic + bic_delta >= bic_narrow):
+                    if verbose:
+                        print(f"Broad models do not improve BIC by >{bic_delta:.1f} → reverting to narrow-only.")
+                    best_choice = "none"
+                    best_lines = base_lines
+            
+            results["broad_choice"] = best_choice
+            results["chosen_lines"] = best_lines
+    
+    if verbose:
+        model_desc = {
+            "none": "narrow-only",
+            "one": "narrow + BROAD",
+            "broad2_only": "narrow + BROAD2",
+            "two": "narrow + BROAD + BROAD2"
+        }.get(results["broad_choice"], results["broad_choice"])
+        print(f"→ Selected model: {model_desc}")
+        print("=" * 50)
+    
+    return results
 
 # -----------------------------------------------------------------------------
 # 4. Usage Wrapper
@@ -412,62 +793,100 @@ class MCMCFitter:
 
 def plot_mcmc_detailed(lam, flux, err, model_total, profiles, z, title, unit="fnu"):
     """
-    Generate the 4-panel plot (Main + 3 Zooms) matching PyRSR style.
+    Generate the 4-panel plot (Main + 3 Zooms) matching PyRSR style exactly.
     """
     import matplotlib.gridspec as gridspec
     
+    # Colors
+    narrow_color = "tab:blue"
+    broad_color  = "tab:orange"
+    broad_color2 = "tab:pink"
+    
     # 1. Setup Layout
-    fig = plt.figure(figsize=(12, 8))
-    gs = gridspec.GridSpec(2, 3, height_ratios=[1.5, 1.0], hspace=0.35, wspace=0.25)
+    fig = plt.figure(figsize=(12.0, 8.2))
+    gs = gridspec.GridSpec(2, 3, height_ratios=[1.6, 1.0], hspace=0.35, wspace=0.25)
     
     ax_main = fig.add_subplot(gs[0, :])
     ax_z1 = fig.add_subplot(gs[1, 0])
     ax_z2 = fig.add_subplot(gs[1, 1])
     ax_z3 = fig.add_subplot(gs[1, 2])
     
-    # Label
     ylabel = r"$F_{\nu}$ [$\mu$Jy]" if unit == "fnu" else r"$F_{\lambda}$"
     
     # 2. Main Panel
-    # Data check
     if np.all(np.isnan(flux)):
          print("Warning: All flux is NaN, skipping plot.")
          return
 
-    # Use steps for data
-    # Create bin edges for steps
     dlam = np.median(np.diff(lam))
     edges = np.concatenate(([lam[0] - dlam/2], 0.5*(lam[1:]+lam[:-1]), [lam[-1] + dlam/2]))
     
-    ax_main.stairs(flux, edges, color='k', lw=1, alpha=0.5, label='Data')
+    # Measurement error band
     if err is not None:
-         ax_main.fill_between(lam, flux-err, flux+err, step="mid", color='gray', alpha=0.2, lw=0)
+         ax_main.fill_between(lam, flux-err, flux+err, step="mid", color='grey', alpha=0.25, lw=0)
     
-    ax_main.plot(lam, model_total, color='r', lw=1.5, alpha=0.9, label='Total Model')
+    ax_main.stairs(flux, edges, color='k', lw=0.5, alpha=0.7, label='Data')
+    ax_main.plot(lam, model_total, color='#ff0000a6', lw=0.5, label='Mean model')
+    
+    # Decompose model components for visualization
+    # Note: `profiles` contains arrays of each line's contribution
+    narrow_sum = np.zeros_like(lam)
+    broad_sum = np.zeros_like(lam)
+    broad2_sum = np.zeros_like(lam)
+    
+    has_b1, has_b2 = False, False
+    
+    for name, prof in profiles.items():
+        if "BROAD" in name.upper():
+            if "BROAD2" in name.upper():
+                broad2_sum += prof
+                has_b2 = True
+            else:
+                broad_sum += prof
+                has_b1 = True
+        else:
+            narrow_sum += prof
+            
+    # Add Component Fills (Main Panel)
+    # Stacked order: Continuum (0 here) -> Narrow -> B1 -> B2
+    # But broad_fit uses fill_between logic:
+    # narrow: 0 -> narrow
+    # b1: narrow -> narrow+b1
+    # b2: narrow+b1 -> narrow+b1+b2
+    
+    base = np.zeros_like(lam)
+    top_narrow = base + narrow_sum
+    top_b1 = top_narrow + broad_sum
+    top_b2 = top_b1 + broad2_sum
+    
+    if np.any(narrow_sum > 0):
+        ax_main.fill_between(lam, base, top_narrow, color=narrow_color, alpha=0.35, lw=0, label="Narrow")
+        # Dotted outline
+        ax_main.plot(lam, top_narrow, color=narrow_color, ls=":", lw=1)
+        
+    if has_b1 and np.any(broad_sum > 0):
+        ax_main.fill_between(lam, top_narrow, top_b1, color=broad_color, alpha=0.25, lw=0, label="Broad 1")
+        ax_main.plot(lam, top_b1, color=broad_color, ls=":", lw=1)
+        
+    if has_b2 and np.any(broad2_sum > 0):
+        ax_main.fill_between(lam, top_b1, top_b2, color=broad_color2, alpha=0.20, lw=0, label="Broad 2")
+        ax_main.plot(lam, top_b2, color=broad_color2, ls=":", lw=1)
     
     ax_main.set_xlim(lam.min(), lam.max())
     ax_main.set_xlabel(r"Observed Wavelength [$\mu$m]")
     ax_main.set_ylabel(ylabel)
-    ax_main.set_title(title)
-    ax_main.legend(loc='upper right', frameon=False)
+    ax_main.set_title(title, fontsize=12, pad=8)
+    ax_main.legend(ncol=3, fontsize=9, frameon=False)
+    ax_main.grid(alpha=0.25, linestyle=":", linewidth=0.5)
+    ax_main.tick_params(direction="in", top=True, right=True)
     
-    # 3. Decompose Profiles into Narrow / Broad for coloring
-    # Simple heuristic: "BROAD" in name -> Broad
-    narrow_sum = np.zeros_like(lam)
-    broad_sum = np.zeros_like(lam)
+    # Annotate Lines
+    _annotate_lines_above_model(
+        ax_main, lam, model_total,
+        profiles.keys(), z, fontsize=8
+    )
     
-    for name, prof in profiles.items():
-        if "BROAD" in name.upper():
-            broad_sum += prof
-        else:
-            narrow_sum += prof
-            
-    # 4. Zoom Panels Logic
-    # We define 3 zones:
-    # Z1: H-delta (4102) + OIII_4363
-    # Z2: H-beta (4862) + OIII_4959/5007
-    # Z3: H-alpha (6564) + NII
-    
+    # 4. Zoom Panels
     def get_zoom_window(center_rest_A, z_val, width_rest_A=300):
         cen_um = center_rest_A * (1+z_val) / 1e4
         width_um = width_rest_A * (1+z_val) / 1e4
@@ -485,42 +904,63 @@ def plot_mcmc_detailed(lam, flux, err, model_total, profiles, z, title, unit="fn
         # Check coverage
         mask = (lam >= lo) & (lam <= hi)
         if np.sum(mask) < 2:
-            ax.text(0.5, 0.5, "No Coverage", ha='center', va='center', transform=ax.transAxes)
-            ax.set_title(label)
+            ax.text(0.5, 0.5, "No Coverage", ha='center', va='center', transform=ax.transAxes, color='0.5')
+            ax.set_title(label, fontsize=10)
             ax.set_xticks([])
             ax.set_yticks([])
+            ax.axhline(0, color="k", ls="--", lw=0.5, alpha=0.3)
             continue
             
-        # Plot Data
         lam_z = lam[mask]
         flux_z = flux[mask]
+        # model components in zoom
+        n_z = narrow_sum[mask]
+        b1_z = broad_sum[mask]
+        b2_z = broad2_sum[mask]
+        
+        base_z = np.zeros_like(lam_z)
+        tn_z = base_z + n_z
+        tb1_z = tn_z + b1_z
+        tb2_z = tb1_z + b2_z
+        
+        err_z = err[mask] if err is not None else np.zeros_like(lam_z)
         edges_z = np.concatenate(([lam_z[0] - dlam/2], 0.5*(lam_z[1:]+lam_z[:-1]), [lam_z[-1] + dlam/2]))
 
-        ax.stairs(flux_z, edges_z, color='k', lw=0.8, alpha=0.4)
+        # Data
+        ax.fill_between(lam_z, flux_z - err_z, flux_z + err_z, step="mid", color="grey", alpha=0.25, lw=0)
+        ax.stairs(flux_z, edges_z, color="black", lw=0.5, alpha=0.7, label="Data")
         
-        # Plot Components (Smooth?)
-        # For now just plot the binned components to match resolution
-        # Narrow = Blue, Broad = Orange
-        
-        n_z = narrow_sum[mask]
-        b_z = broad_sum[mask]
-        
-        # Stacked Areas
-        # Base is 0 (assuming continuum subtracted or user just wants line model)
-        # Wait, MCMCFitter model includes continuum? No, my build_model is line-only.
-        # So background is 0.
-        
-        ax.fill_between(lam_z, 0, n_z, color='tab:blue', alpha=0.4, label='Narrow')
-        
-        if np.max(b_z) > 1e-9:
-             ax.fill_between(lam_z, n_z, n_z + b_z, color='tab:orange', alpha=0.4, label='Broad')
-             ax.plot(lam_z, n_z + b_z, color='r', lw=1)
-        else:
-             ax.plot(lam_z, n_z, color='r', lw=1)
+        # Model Components (Filled + Dotted)
+        if np.any(n_z > 0):
+             ax.fill_between(lam_z, base_z, tn_z, color=narrow_color, alpha=0.35, lw=0)
+             ax.plot(lam_z, tn_z, color=narrow_color, ls=":", lw=1)
              
+        if has_b1 and np.any(b1_z > 0):
+             ax.fill_between(lam_z, tn_z, tb1_z, color=broad_color, alpha=0.25, lw=0)
+             ax.plot(lam_z, tb1_z, color=broad_color, ls=":", lw=1)
+        
+        if has_b2 and np.any(b2_z > 0):
+             ax.fill_between(lam_z, tb1_z, tb2_z, color=broad_color2, alpha=0.20, lw=0)
+             ax.plot(lam_z, tb2_z, color=broad_color2, ls=":", lw=1)
+        
+        # Total Model
+        total_z = tb2_z
+        ax.stairs(total_z, edges_z, color="#ff0000a6", lw=0.5, label="Mean model")
+
         ax.set_xlim(lo, hi)
         ax.set_title(label, fontsize=10)
+        ax.set_xlabel("Observed wavelength [µm]")
+        ax.set_ylabel(ylabel)
+        ax.axhline(0, color="k", ls="--", lw=0.5, alpha=0.5)
+        ax.grid(alpha=0.25, linestyle=":", linewidth=0.5)
+        ax.tick_params(direction="in", top=True, right=True)
         ax.tick_params(labelsize=8)
+        
+        # Annotate
+        _annotate_lines_above_model(
+            ax, lam_z, total_z,
+            profiles.keys(), z, fontsize=8
+        )
         
     plt.tight_layout()
     plt.show()
@@ -539,77 +979,36 @@ def print_mcmc_summary(res, input_unit="fnu"):
     # Constants
     C_AA = 2.99792458e18
     
-    # Header matching user request
-    # Line | F_line [erg/s/cm²] | EW₀ [Å] | σ_A [Å] | μ_obs [Å] | SNR_int | SNR_peak(data) | SNR_peak(model)
-    
-    print("\n=== BOOTSTRAP SUMMARY (value ± error) ===")
+    print("\n=== MCMC FIT SUMMARY ===")
     header = (
-        f"{'Line':<15} {'F_line [erg/s/cm²]':<25} {'EW₀ [Å]':<15} {'σ_A [Å]':<15} "
-        f"{'μ_obs [Å]':<15} {'SNR_int':<12} {'SNR_peak(data)':<15} {'SNR_peak(model)':<16}"
+        f"{'Line':<15} {'A_gauss':<20} {'σ_A [Å]':<20} "
+        f"{'μ_obs [Å]':<15} {'SNR':<10} {'FWHM [Å]':<12}"
     )
     print(header)
-    print("-" * 135)
+    print("-" * 100)
     
     for name, info in lines.items():
-        # 1. Retrieve Params
-        flux = info["flux"]
-        flux_err = info["flux_err"]
-        sigma = info["sigma_A"]
-        sigma_err = info["sigma_A_err"]
-        
-        # 2. Get Rest Wavelength for Calc
-        lam0 = REST_LINES_A.get(name, 0.0)
-        lam_obs = lam0 * (1 + z_fit)
-        
-        # 3. Flux Conversion to erg/s/cm2
-        # Param `flux` is integral in (InputUnit * Angstrom)
-        f_cgs = np.nan
-        f_cgs_err = np.nan
-        
-        if input_unit.lower() == "fnu":
-            # Input: uJy. Param: uJy*A.
-            # Conv: uJy*A -> erg/s/cm2
-            # F_line = F_nu_int * (c / lam^2) * 1e-29
-            conv = (C_AA / (lam_obs**2)) * 1e-29 if lam_obs > 0 else 0
-            f_cgs = flux * conv
-            f_cgs_err = flux_err * conv
-        elif input_unit.lower() == "flam":
-            # Input: erg/s/cm2/A. Param: erg/s/cm2.
-            # No conversion needed (already integrated flam)
-            f_cgs = flux
-            f_cgs_err = flux_err
-            
-        # 4. SNR Integrated
-        snr_int = flux / flux_err if flux_err > 0 else 0.0
-        
-        # 5. SNR Peak
-        # We need the pixel data to calculate this properly, but 'res' dict only has params.
-        # Ideally we'd calculate this during the fit and store it in 'lines'.
-        # For now, I'll put placeholders or rudimentary estimates if available.
-        # Current MCMCFitter doesn't store peak SNRs in res['lines'].
-        # I will output "—" for now until I update the fitter.
-        snr_peak_data = "—"
-        snr_peak_model = "—"
-        
-        # 6. EW
-        # Requires continuum. Using placeholder.
-        ew = "—"
+        # Extract Gaussian parameters
+        A_gauss = info.get("A_gauss", np.nan)
+        A_err = info.get("A_gauss_err", np.nan)
+        sigma = info.get("sigma_A", np.nan)
+        sigma_err = info.get("sigma_A_err", np.nan)
+        lam_obs = info.get("lam_obs_A", np.nan)
+        snr = info.get("SNR", np.nan)
+        fwhm = info.get("FWHM_A", np.nan)
         
         # Format Strings
-        s_flux = f"{f_cgs:.3e} ± {f_cgs_err:.3e}"
-        s_ew   = f"{ew}"
-        s_sig  = f"{sigma:.2f} ± {sigma_err:.2f}"
-        s_mu   = f"{lam_obs:.1f}" # No error on z propagated yet?
-        s_snri = f"{snr_int:.2f}"
+        s_A = f"{A_gauss:.3e} ± {A_err:.3e}"
+        s_sig = f"{sigma:.2f} ± {sigma_err:.2f}"
+        s_mu = f"{lam_obs:.1f}"
+        s_snr = f"{snr:.1f}"
+        s_fwhm = f"{fwhm:.1f}"
         
-        row = (
-            f"{name:<15} {s_flux:<25} {s_ew:<15} {s_sig:<15} "
-            f"{s_mu:<15} {s_snri:<12} {snr_peak_data:<15} {snr_peak_model:<16}"
-        )
+        row = f"{name:<15} {s_A:<20} {s_sig:<20} {s_mu:<15} {s_snr:<10} {s_fwhm:<12}"
         print(row)
         
-    print("-" * 135)
-    print(f"all in erg/s/cm2\n")
+    print("-" * 100)
+    print(f"z_fit = {z_fit:.5f}\n")
 
 def run_mcmc_fit(
     spec_data: Dict[str, np.ndarray],
@@ -621,30 +1020,62 @@ def run_mcmc_fit(
     verbose=True,
     input_unit: str = "fnu", # "fnu" (uJy) or "flam" (erg/s/cm2/A)
     plot: bool = False,
-    plot_unit: str = "fnu" # "fnu" or "flam"
+    plot_unit: str = "fnu", # "fnu" or "flam"
+    broad_mode: str = "auto", # "auto", "off", "broad1", "broad2", "both"
+    bic_delta: float = 6.0, # BIC improvement threshold
 ):
     """
-    Main entry point for MCMC fitting.
+    Main entry point for MCMC fitting with automatic BIC-based broad component selection.
     
     Args:
         spec_data: dict with 'lam' (um), 'flux', 'err'
         z_init: initial redshift guess
-        line_names: list of line names to fit
+        line_names: list of line names to fit (narrow components)
         grating: e.g. "PRISM", "G395M"
         input_unit: Unit of input flux. Default 'fnu' (uJy).
         plot: Whether to generate a plot.
         plot_unit: Unit for the plot ('fnu' or 'flam').
+        broad_mode: Broad component selection mode:
+            - "auto": Use BIC to decide (default)
+            - "off": No broad components
+            - "broad1": Force narrow + BROAD
+            - "broad2": Force narrow + BROAD2 (very broad)
+            - "both": Force narrow + BROAD + BROAD2
+        bic_delta: Minimum BIC improvement to prefer broad model (default 6.0)
         
     Returns:
-        dict with keys 'chains', 'best_fit', 'success'
+        dict with keys 'chains', 'best_fit', 'success', 'BIC_*' scores
     """
     lam = spec_data["lam"]
     flux = spec_data["flux"]
     err = spec_data["err"]
     
+    # BIC Model Selection for Balmer lines
+    # Check which Balmer lines are in the user's list and run selection for each
+    final_lines = list(line_names)
+    bic_results = {}
+    
+    balmer_lines = ["H⍺", "HBETA", "HDELTA"]
+    for bl in balmer_lines:
+        if bl in final_lines:
+            sel = select_broad_model(
+                spec_data, z_init, final_lines,
+                balmer_line=bl,
+                grating=grating,
+                broad_mode=broad_mode,
+                bic_delta=bic_delta,
+                verbose=verbose
+            )
+            # Update line list with selected model
+            final_lines = list(sel["chosen_lines"])
+            bic_results[bl] = sel
+    
+    if verbose:
+        print(f"\nFinal line list: {final_lines}")
+    
     # Estimate Inputs
     # 1. Sigma Inst
-    lam_obs = np.array([REST_LINES_A.get(l, 0)*(1+z_init)/1e4 for l in line_names])
+    lam_obs = np.array([REST_LINES_A.get(l, 0)*(1+z_init)/1e4 for l in final_lines])
     if len(lam_obs) == 0:
          return {"success": False, "error": "No valid lines in REST_LINES_A"}
          
@@ -671,24 +1102,56 @@ def run_mcmc_fit(
         flux_est = peak * sig_A * 2.5 
         flux_seeds.append(flux_est)
         
-    model_mgr = LineModel(line_names, z_init, sigma_inst_A, flux_seeds)
+    model_mgr = LineModel(final_lines, z_init, sigma_inst_A, flux_seeds)
     fitter = MCMCFitter(lam, flux, err, model_mgr)
     
     try:
-        chain = fitter.run_emcee(n_walkers=n_walkers, n_steps=n_steps, verbose=verbose)
+        chain, sampler = fitter.run_emcee(n_walkers=n_walkers, n_steps=n_steps, verbose=verbose)
         
         # Best fit (median)
         p_med = np.median(chain, axis=0)
         p_std = np.std(chain, axis=0)
         
-        # Reconstruct result dict
+        # Extract fitted parameters
+        nL = len(final_lines)
+        dz = p_med[-1]
+        z_fit = z_init + dz
+        
+        # Reconstruct result dict with proper Gaussian parameters
         res_lines = {}
-        for i, name in enumerate(line_names):
+        for i, name in enumerate(final_lines):
+            # Fitted values
+            A_gauss = p_med[i]  # Integrated flux (area under Gaussian)
+            A_gauss_err = p_std[i]
+            sigma_A = p_med[nL + i]  # Width in Angstroms
+            sigma_A_err = p_std[nL + i]
+            
+            # Compute centroid from rest wavelength + fitted z
+            lam0_A = REST_LINES_A.get(name, 0.0)
+            lam_obs_A = lam0_A * (1 + z_fit)
+            
+            # Compute derived quantities
+            SQRT2PI = np.sqrt(2 * np.pi)
+            peak_amplitude = A_gauss / (SQRT2PI * sigma_A) if sigma_A > 0 else 0
+            FWHM_A = 2.355 * sigma_A  # FWHM = 2*sqrt(2*ln(2))*sigma
+            
+            # SNR estimate (integrated)
+            SNR = A_gauss / A_gauss_err if A_gauss_err > 0 else 0
+            
             res_lines[name] = {
-                "flux": p_med[i],
-                "flux_err": p_std[i],
-                "sigma_A": p_med[len(line_names) + i],
-                "sigma_A_err": p_std[len(line_names) + i]
+                # Gaussian Parameters (for plotting)
+                "A_gauss": A_gauss,           # Integrated flux (erg/s/cm² or uJy*A)
+                "A_gauss_err": A_gauss_err,
+                "sigma_A": sigma_A,           # Line width in Angstroms
+                "sigma_A_err": sigma_A_err,
+                "lam_obs_A": lam_obs_A,       # Observed centroid in Angstroms
+                
+                # Derived quantities
+                "peak_amplitude": peak_amplitude,  # Peak F_lambda
+                "FWHM_A": FWHM_A,
+                "F_line": A_gauss,            # Same as A_gauss (integrated flux)
+                "sigma_line": A_gauss_err,    # Error on flux
+                "SNR": SNR,
             }
             
         # Plotting
@@ -742,8 +1205,10 @@ def run_mcmc_fit(
             "chains": chain,
             "best_params": p_med,
             "lines": res_lines,
+            "which_lines": final_lines,
             "z_fit": z_init + p_med[-1],
-            "fit_stats": {"ndim": fitter.ndim, "n_steps": n_steps}
+            "fit_stats": {"ndim": fitter.ndim, "n_steps": n_steps},
+            "bic_selection": bic_results,
         }
         
         if verbose:
