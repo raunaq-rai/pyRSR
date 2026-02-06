@@ -1144,19 +1144,21 @@ def _fit_emission_system(
     
     sig_fit_weighted = sig_fit.copy()
     
-    # Increase weight on NII_6549
-    if idx_6549 is not None:
-         # Find pixels near NII_6549 seed center
-         mu_6549_um = p0_full[2*nL + idx_6549] / 1e4
-         sig_6549_um = p0_full[nL + idx_6549] / 1e4 * 1.0  # approximate width
-         
-         # Define window to boost weight (e.g. +/- 2 sigma)
-         mask_weight = (lam_fit >= mu_6549_um - 2*sig_6549_um) & (lam_fit <= mu_6549_um + 2*sig_6549_um)
-         if np.any(mask_weight):
-             if verbose:
-                 print(f"  [Weighting] Increasing weight for NII_6549 on {np.count_nonzero(mask_weight)} pixels.")
-             # Divide sigma by 3 -> weight * 9
-             sig_fit_weighted[mask_weight] /= 3.0
+    # Increase weight on NII lines (6549 and 6585)
+    # This forces the fitter to respect the narrow NII features and not let BROAD2 swallow them.
+    for nm_nii in ["NII_6549", "NII_6585"]:
+        idx_nii = name_to_idx.get(nm_nii)
+        if idx_nii is not None:
+             mu_um = p0_full[2*nL + idx_nii] / 1e4
+             sig_um = p0_full[nL + idx_nii] / 1e4 * 1.0
+             
+             # Use +/- 3 sigma window
+             mask_weight = (lam_fit >= mu_um - 3*sig_um) & (lam_fit <= mu_um + 3*sig_um)
+             if np.any(mask_weight):
+                 if verbose:
+                     print(f"  [Weighting] Increasing weight for {nm_nii} (factor 9) on {np.count_nonzero(mask_weight)} pixels.")
+                 # Divide sigma by 3.0 -> weight * 9
+                 sig_fit_weighted[mask_weight] /= 3.0
 
     # Mask of parameters to OPTIMIZE
     # default: all True
