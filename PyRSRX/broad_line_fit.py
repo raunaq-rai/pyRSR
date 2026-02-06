@@ -1189,6 +1189,25 @@ def _fit_emission_system(
         param_mask[nL + idx_6549] = False
         # Mu
         param_mask[2*nL + idx_6549] = False
+    
+    # ------------------------------------------------------------------
+    # CONSTRAINT LOGIC: Tie Narrow Balmer lines to OIII_5007
+    # ------------------------------------------------------------------
+    idx_o3 = name_to_idx.get("OIII_5007")
+    balmer_tie_list = ["HBETA", "H⍺", "HDELTA", "HGAMMA"]
+    tied_indices = []
+    
+    if idx_o3 is not None:
+        for nm in balmer_tie_list:
+             if nm in name_to_idx:
+                 tied_indices.append(name_to_idx[nm])
+                 
+    if idx_o3 is not None and len(tied_indices) > 0:
+        if verbose:
+             print(f"  [Constraints] Tying narrow Balmer width(s) to OIII_5007.")
+        for idx in tied_indices:
+             # Remove sigma from optimization (index + nL)
+             param_mask[nL + idx] = False
         
     p0_opt = p0_full[param_mask]
     lb_opt = lb_full[param_mask]
@@ -1221,6 +1240,17 @@ def _fit_emission_system(
             # sigma_lam_49 / lam_49 = sigma_lam_85 / lam_85
             # sigma_lam_49 = sigma_lam_85 * ratio
             p_curr[nL + idx_6549] = p_curr[nL + idx_6585] * ratio
+
+        if idx_o3 is not None and len(tied_indices) > 0:
+            lam_o3 = REST_LINES_A["OIII_5007"]
+            # OIII sigma is at nL + idx_o3
+            sigma_o3 = p_curr[nL + idx_o3] 
+            
+            for idx in tied_indices:
+                nm = which_lines[idx]
+                lam_target = REST_LINES_A[nm]
+                ratio = lam_target / lam_o3
+                p_curr[nL + idx] = sigma_o3 * ratio
             
         return p_curr
 
