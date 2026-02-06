@@ -1151,6 +1151,7 @@ def _fit_emission_system(
     lb_full = np.r_[A_lo,        sigmaA_lo,   muA_lo]
     ub_full = np.r_[A_hi,        sigmaA_hi,   muA_hi]
     p0_full, lb_full, ub_full = _finalize_seeds_and_bounds(p0_full, lb_full, ub_full)
+
     
     # ------------------------------------------------------------------
     # CONSTRAINT LOGIC: Tie NII Doublet & Weighting
@@ -1194,7 +1195,7 @@ def _fit_emission_system(
     # CONSTRAINT LOGIC: Tie Narrow Balmer lines to OIII_5007
     # ------------------------------------------------------------------
     idx_o3 = name_to_idx.get("OIII_5007")
-    balmer_tie_list = ["HBETA", "H⍺", "HDELTA", "HGAMMA"]
+    balmer_tie_list = ["HBETA", "H⍺", "HDELTA", "HGAMMA", "NII_6549", "NII_6585"]
     tied_indices = []
     
     if idx_o3 is not None:
