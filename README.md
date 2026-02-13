@@ -172,7 +172,8 @@ res = broad_fit(
     n_boot=1000,
     broad_mode="auto",
     plot=True,
-    save_path="./output_plots"
+    save_path="./output_plots",
+    plot_ylim=(-0.5, 5.0)  # Optional: set y-axis limits
 )
 
 # Access summary statistics

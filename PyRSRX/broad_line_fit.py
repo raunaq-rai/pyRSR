@@ -2833,6 +2833,7 @@ def broad_fit(
     continuum_movavg_window_um: float = 0.05,
     continuum_exclude_regions: Optional[List[Tuple[float, float]]] = None,
     continuum_lyman_window_um: Optional[float] = None,
+    plot_ylim: Optional[Tuple[float, float]] = None,
 ) -> Dict:
 
 
@@ -2932,9 +2933,7 @@ def broad_fit(
             # No lines to bootstrap, but valid continuum fit
             if verbose:
                 print("No lines to bootstrap. Returning base fit (continuum only).")
-            # We will proceed to return, skipping the bootstrap loop 
-            # by ensuring which_lines is empty (check loop conditions)
-            pass 
+            pass
 
     except ValueError as e:
         if verbose:
@@ -3635,6 +3634,8 @@ def broad_fit(
             ax_full.axhline(0, color="k", ls="--", lw=0.5, alpha=0.5)
             ax_full.set_xlabel("Observed wavelength [µm]")
             ax_full.set_ylabel(ylabel)
+            if plot_ylim is not None:
+                ax_full.set_ylim(plot_ylim)
             ax_full.legend(ncol=3, fontsize=9, frameon=False)
             ax_full.grid(alpha=0.25, linestyle=":", linewidth=0.5)
             ax_full.tick_params(direction="in", top=True, right=True)
