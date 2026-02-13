@@ -11,7 +11,7 @@
 - **Emission Line Fitting**: Fit single or multiple emission lines with Gaussian profiles (`excels_fit_poly`).
 - **Broad Component Analysis**: Detect and fit broad Balmer lines (Hα, Hβ, Hδ) using BIC-based model selection (`single_broad_fit`).
 - **Bootstrap Uncertainty**: Robust uncertainty estimation via bootstrap resampling (`broad_fit`, `bootstrap_excels_fit`).
-- **Continuum Subtraction**: Polynomial continuum fitting with options for automatic masking around Lyman-α.
+- **Continuum Subtraction**: Polynomial or Moving Average continuum fitting with options for automatic masking around Lyman-α.
 - **Support for NIRSpec Gratings**: Tuned constraints and presets for PRISM, MEDIUM, and HIGH resolution gratings.
 - **Photometry & Stacking**: Tools for photometry handling and spectral stacking (in `photometry.py` and `stacking.py`).
 - **High-Performance Version (PyRSRX)**: A Cythonized version (`PyRSRX`) is available for computationally intensive bootstrapping, offering ~1.5x speedup.
@@ -99,9 +99,43 @@ results = excels_fit_poly(
 )
 
 print(results["per_line"]["H⍺"])
+print(results["per_line"]["H⍺"])
 ```
 
-### 2. Broad Line Search
+### 2. Advanced Continuum Fitting
+
+PyRSR supports two methods for continuum fitting: **Polynomial** (default) and **Moving Average** (robust).
+
+#### Polynomial Fit (Default)
+Standard finding of the best-fit polynomial of degree `deg`.
+
+```python
+results = broad_fit(..., continuum_fit="polyfit", deg=2)
+```
+
+#### Moving Average Fit
+A robust, sigma-clipped moving average that can handle complex continuum shapes and the Lyman break better than high-degree polynomials.
+
+**Key Arguments:**
+*   `continuum_fit="moving_average"`: Enable this mode.
+*   `continuum_movavg_window_um`: Window width in microns (default `0.05`).
+*   `continuum_exclude_regions`: List of `(min, max)` tuples in microns to **manually mask** artifacts or broad emission lines that standard masking misses.
+*   `continuum_lyman_window_um`: A smaller window size (e.g., `0.01`) to use specifically near the Lyman-alpha break to preserve the sharp step function.
+*   `continuum_lya_mask_A`: Buffer in rest-frame Angstroms around LyA where the smaller window is applied (default `200.0`).
+
+**Example:**
+```python
+results = broad_fit(
+    source=source,
+    z=6.0,
+    continuum_fit="moving_average",
+    continuum_movavg_window_um=0.05,       # Global window: 500A (obs) at z=0, 0.05um
+    continuum_exclude_regions=[(1.48, 1.52)], # Manually mask a glitch at 1.5um
+    continuum_lyman_window_um=0.01,        # Use 100A window near Lyman break for sharpness
+)
+```
+
+### 3. Broad Line Search
 
 Fit a spectrum and automatically determine if a broad component (e.g., for AGN) is supported by the data.
 
@@ -144,6 +178,16 @@ res = broad_fit(
 # Access summary statistics
 print(res["summary"]["H⍺"]["F_line"])
 ```
+
+### 5. Using PyRSRX
+
+To use the high-performance Cython version, simply change the import:
+
+```python
+from PyRSRX.broad_line_fit import broad_fit
+```
+
+Both `PyRSR` and `PyRSRX` share the exact same API and support all features including robust continuum fitting.
 
 ## Contributing
 
