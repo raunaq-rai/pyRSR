@@ -1640,6 +1640,8 @@ def single_broad_fit(
     continuum_movavg_window_um: float = 0.05,
     continuum_exclude_regions: Optional[List[Tuple[float, float]]] = None,
     continuum_lyman_window_um: Optional[float] = None,
+    save_npz: bool = False,
+    npz_name: Optional[str] = None,
 ):
     """
     Fit emission lines with optional broad Balmer components using BIC selection.
@@ -2834,6 +2836,8 @@ def broad_fit(
     continuum_exclude_regions: Optional[List[Tuple[float, float]]] = None,
     continuum_lyman_window_um: Optional[float] = None,
     plot_ylim: Optional[Tuple[float, float]] = None,
+    save_npz: bool = False,
+    npz_name: Optional[str] = None,
 ) -> Dict:
 
 
@@ -3216,7 +3220,10 @@ def broad_fit(
                     model_ha = model_in_window[mask_ha]
                     dlam_A = np.gradient(lam_ha_window * 1e4)
                     
-                    total_model_flux = np.trapz(model_ha, lam_ha_window * 1e4)
+                    try:
+                        total_model_flux = np.trapezoid(model_ha, lam_ha_window * 1e4)
+                    except AttributeError:
+                        total_model_flux = np.trapz(model_ha, lam_ha_window * 1e4)
                     
                     # Sum of individual component fluxes from base fit
                     sum_component_flux = 0.0
@@ -3247,11 +3254,58 @@ def broad_fit(
     cont_flam = np.asarray(base.get("continuum_flam", np.zeros_like(lam_um)))
     cont_uJy  = flam_to_fnu_uJy(cont_flam, lam_um)
 
+    # -------- save results to .npz if requested --------
+    # --- Calculate mean model stats (needed for saving OR plotting) ---
+    mu_flam, sig_flam = _sigma_clip_mean_std(
+        model_stack_flam[keep_mask], axis=0, sigma=3.0
+    )
+
+    # -------- save results to .npz if requested --------
+    if save_npz:
+        import os
+        
+        # Determine filename
+        if npz_name:
+             out_name = npz_name
+             if not out_name.endswith(".npz"):
+                 out_name += ".npz"
+        elif save_path:
+             base_name = os.path.splitext(os.path.basename(save_path))[0]
+             out_name = base_name + ".npz"
+             # If save_path has a directory, preserve it? 
+             # save_path usually is just a prefix or full path. 
+             # If save_path is "plots/target_fit", we want "plots/target_fit.npz"
+             # But save_path usage in plotting often appends .pdf
+             # Let's use the directory of save_path if it exists
+             dirname = os.path.dirname(save_path)
+             if dirname:
+                 out_name = os.path.join(dirname, out_name)
+        else:
+             sid = source.get("id", "source") if isinstance(source, dict) else "source"
+             out_name = f"broad_fit_{sid}.npz"
+             
+        if verbose:
+             print(f"Saving fit results to {out_name}...")
+             
+        np.savez_compressed(
+            out_name,
+            lam_um=lam_um,
+            flux_uJy=flux_uJy,
+            err_uJy=err_uJy,
+            z=z,
+            grating=grating,
+            which_lines=which_lines,
+            cont_flam=cont_flam,
+            # Use object array for dictionaries to allow pickling
+            summary=np.array([summary], dtype=object),
+            # Save mean model and std instead of full stack/samples
+            mean_model_flam=mu_flam,
+            std_model_flam=sig_flam,
+        )
+
     # -------- plotting + optional saving --------
     if plot or save_path:
-        mu_flam, sig_flam = _sigma_clip_mean_std(
-            model_stack_flam[keep_mask], axis=0, sigma=3.0
-        )
+        # mu_flam, sig_flam are already computed above
         # cont_flam is now defined above
 
         # grid on which the base + all bootstrap fits are defined
