@@ -1538,20 +1538,15 @@ def fit_continuum_moving_average(
         # Determine window size
         current_window_um = window_um
         if use_adaptive:
-            # check distance to LyA in rest-frame Angstroms approx
-            # w_rest_A = w_center * 1e4 / (1 + z)
-            # lya_rest_A = 1215.67
-            # dist_A = abs(w_rest_A - lya_rest_A)
-            
-            # Or simpler: Is w_center within the "buffer" of LyA?
-            # continuum_lya_mask_A is the buffer width in A.
-            # dist_um = dist_A * (1+z) / 1e4
-            
+            # check distance to LyA
             dist_um = abs(w_center - lam_lya_obs)
             dist_rest_A = dist_um * 1e4 / (1 + z)
             
             if dist_rest_A < continuum_lya_mask_A:
                 current_window_um = lyman_window_um
+
+
+
 
         half_win = current_window_um / 2.0
         
