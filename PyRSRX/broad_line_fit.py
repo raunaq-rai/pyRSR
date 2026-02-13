@@ -1428,7 +1428,10 @@ def fit_continuum_moving_average(
     grating="PRISM",
     clip_sigma=3.0,
     percentile_bounds=(16, 84),
-    min_points=5
+    min_points=5,
+    exclude_regions=None,
+    lyman_window_um=None,
+    continuum_lya_mask_A=200.0,
 ):
     """
     Fit continuum using a moving average of flux between percentiles (default 16-84),
@@ -1485,6 +1488,13 @@ def fit_continuum_moving_average(
             in_windows |= (lam_um >= lo) & (lam_um <= hi)
         mask &= in_windows
 
+    # Manual exclude regions
+    if exclude_regions:
+        for (lo, hi) in exclude_regions:
+            # Mask out region
+            mask &= ~((lam_um >= lo) & (lam_um <= hi))
+
+
     # 2. Line Masking (Mask known emission lines)
     # Similar logic to fit_continuum_polynomial
     lam_A = lam_um * 1e4
@@ -1513,6 +1523,11 @@ def fit_continuum_moving_average(
     lam_valid = lam_um[valid_indices]
     flam_valid = flam[valid_indices]
 
+    # Pre-calculate Lyman-alpha parameters if adaptive window is used
+    lam_lya_obs = 0.121567 * (1 + z)
+    use_adaptive = (lyman_window_um is not None) and (lyman_window_um > 0)
+
+
     # Iterate over all points (or just valid ones? We want continuum everywhere ideally,
     # or at least interpolated everywhere).
     # Let's compute it at every wavelength point to be safe, using the valid data.
@@ -1530,6 +1545,17 @@ def fit_continuum_moving_average(
     for i in range(n):
         # Center of window
         w_center = lam_um[i]
+
+        # Determine window size
+        current_window_um = window_um
+        if use_adaptive:
+            dist_um = abs(w_center - lam_lya_obs)
+            dist_rest_A = dist_um * 1e4 / (1 + z)
+            
+            if dist_rest_A < continuum_lya_mask_A:
+                current_window_um = lyman_window_um
+
+        half_win = current_window_um / 2.0
         
         # Identify valid neighbors in window
         # We can use searchsorted or just boolean mask if array is small.
@@ -1612,6 +1638,8 @@ def single_broad_fit(
     continuum_lya_mask_A: float = 200.0,
     continuum_fit: str = "polyfit",
     continuum_movavg_window_um: float = 0.05,
+    continuum_exclude_regions: Optional[List[Tuple[float, float]]] = None,
+    continuum_lyman_window_um: Optional[float] = None,
 ):
     """
     Fit emission lines with optional broad Balmer components using BIC selection.
@@ -1658,6 +1686,10 @@ def single_broad_fit(
         Continuum fitting method: 'polyfit' (polynomial) or 'moving_average'.
     continuum_movavg_window_um : float, default=0.05
         Window size in microns for moving average continuum fit.
+    continuum_exclude_regions : list of tuples, optional
+        List of (min_um, max_um) regions to exclude from continuum fit.
+    continuum_lyman_window_um : float, optional
+         Smaller window size [um] for moving average near Lyman-alpha to preserve the break.
 
     Returns
     -------
@@ -1721,6 +1753,9 @@ def single_broad_fit(
             grating=grating,
             clip_sigma=3.0,
             percentile_bounds=(16, 84),
+            exclude_regions=continuum_exclude_regions,
+            lyman_window_um=continuum_lyman_window_um,
+            continuum_lya_mask_A=continuum_lya_mask_A,
         )
     elif continuum_fit == "polyfit":
         Fcont, _ = fit_continuum_polynomial(
@@ -2796,6 +2831,8 @@ def broad_fit(
     continuum_lya_mask_A: float = 200.0,
     continuum_fit: str = "polyfit",
     continuum_movavg_window_um: float = 0.05,
+    continuum_exclude_regions: Optional[List[Tuple[float, float]]] = None,
+    continuum_lyman_window_um: Optional[float] = None,
 ) -> Dict:
 
 
@@ -2887,6 +2924,8 @@ def broad_fit(
             continuum_lya_mask_A=continuum_lya_mask_A,
             continuum_fit=continuum_fit,
             continuum_movavg_window_um=continuum_movavg_window_um,
+            continuum_exclude_regions=continuum_exclude_regions,
+            continuum_lyman_window_um=continuum_lyman_window_um,
         )
         which_lines = list(base.get("which_lines", []))
         if not which_lines:
@@ -3022,6 +3061,8 @@ def broad_fit(
                 continuum_lya_mask_A=continuum_lya_mask_A,
                 continuum_fit=continuum_fit,
                 continuum_movavg_window_um=continuum_movavg_window_um,
+                continuum_exclude_regions=continuum_exclude_regions,
+                continuum_lyman_window_um=continuum_lyman_window_um,
             )
             ok_fit = True
         except Exception:
