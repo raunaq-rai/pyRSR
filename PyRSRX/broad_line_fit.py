@@ -1420,6 +1420,179 @@ def _fit_emission_system(
 # Main public fit: single_broad_fit
 # --------------------------------------------------------------------
 
+def fit_continuum_moving_average(
+    lam_um, flam, z,
+    windows=None,
+    lyman_cut="lya",
+    window_um=0.05,
+    grating="PRISM",
+    clip_sigma=3.0,
+    percentile_bounds=(16, 84),
+    min_points=5
+):
+    """
+    Fit continuum using a moving average of flux between percentiles (default 16-84),
+    with sigma clipping and line masking.
+
+    Parameters
+    ----------
+    lam_um : array
+        Wavelength in microns.
+    flam : array
+        Flux in F_lambda units.
+    z : float
+        Redshift.
+    windows : list of tuples, optional
+        (min, max) windows in microns to consider for the continuum.
+        If None, uses the full range.
+    lyman_cut : str or None
+        If "lya", masks everything blue of Lyman-alpha.
+    window_um : float
+        Width of the moving window in microns.
+    grating : str
+        Used to determine line masking width based on resolution.
+    clip_sigma : float
+        Sigma threshold for clipping outliers within the moving window and overall.
+    percentile_bounds : tuple
+        (low, high) percentiles to compute the mean of (Truncated Mean).
+    min_points : int
+        Minimum number of valid points in a window to compute a value.
+
+    Returns
+    -------
+    Fcont : array
+        The estimated continuum flux array.
+    coeffs : None
+        Dummy return to match polynomial fitter signature.
+    """
+    lam_um = np.asarray(lam_um, float)
+    flam = np.asarray(flam, float)
+    n = len(lam_um)
+    Fcont = np.full(n, np.nan)
+
+    # 1. Global Masking (Lyman cut + Continuum Windows)
+    mask = np.ones(n, dtype=bool)
+
+    # Lyman cut
+    if lyman_cut:
+        ly_um = _lyman_cut_um(z, lyman_cut)
+        mask &= (lam_um >= ly_um)
+
+    # Continuum windows (if provided)
+    if windows:
+        in_windows = np.zeros(n, dtype=bool)
+        for (lo, hi) in windows:
+            in_windows |= (lam_um >= lo) & (lam_um <= hi)
+        mask &= in_windows
+
+    # 2. Line Masking (Mask known emission lines)
+    # Similar logic to fit_continuum_polynomial
+    lam_A = lam_um * 1e4
+    for lam_rest in REST_LINES_A.values():
+        muA = lam_rest * (1 + z)
+        mu_um = muA / 1e4
+        sig_gr_log = float(sigma_grating_logA(grating, mu_um))
+        # Mask ±6 sigma around lines
+        sigma_A = muA * LN10 * sig_gr_log * 1.5
+        # slightly generous mask for moving average to avoid line wings
+        core = (lam_A > muA - 6 * sigma_A) & (lam_A < muA + 6 * sigma_A)
+        mask[core] = False
+
+    # 3. Moving Average Calculation
+    # We only compute Fcont where mask is True, but we use neighboring data
+    # that is also valid (mask is True) and finite.
+
+    valid_data_mask = mask & np.isfinite(flam)
+    valid_indices = np.where(valid_data_mask)[0]
+
+    if len(valid_indices) < min_points:
+        # Not enough data for continuum
+        return np.nan_to_num(Fcont, nan=np.nanmedian(flam) if len(flam) > 0 else 0.0), None
+
+    # Pre-compute valid arrays to speed up
+    lam_valid = lam_um[valid_indices]
+    flam_valid = flam[valid_indices]
+
+    # Iterate over all points (or just valid ones? We want continuum everywhere ideally,
+    # or at least interpolated everywhere).
+    # Let's compute it at every wavelength point to be safe, using the valid data.
+
+    half_win = window_um / 2.0
+
+    # Optimization: iterate only finite points, then interpolate?
+    # Or just iterate all points. For standard spectra (few k pixels), iterating is fast enough.
+    
+    # Let's calculate Fcont for each pixel i based on valid neighbors
+    
+    computed_vals = []
+    computed_indices = []
+
+    for i in range(n):
+        # Center of window
+        w_center = lam_um[i]
+        
+        # Identify valid neighbors in window
+        # We can use searchsorted or just boolean mask if array is small.
+        # Assuming sorted lam_um.
+        
+        # Fast slice
+        idx_start = np.searchsorted(lam_valid, w_center - half_win, side='left')
+        idx_end = np.searchsorted(lam_valid, w_center + half_win, side='right')
+        
+        chunk = flam_valid[idx_start:idx_end]
+        
+        if len(chunk) < min_points:
+            continue
+            
+        # Sigma Clipping in the window
+        # Simple iterative clipping
+        chunk_clipped = chunk.copy()
+        
+        # 1-pass or 2-pass clipping usually enough
+        med = np.median(chunk_clipped)
+        mad = np.median(np.abs(chunk_clipped - med))
+        if mad == 0:
+            std = np.std(chunk_clipped)
+        else:
+            std = 1.4826 * mad
+            
+        if std > 0:
+            keep = np.abs(chunk_clipped - med) < clip_sigma * std
+            chunk_clipped = chunk_clipped[keep]
+        
+        if len(chunk_clipped) < min_points:
+            continue
+
+        # Percentile Calculation (16th to 84th)
+        p_lo, p_hi = np.percentile(chunk_clipped, list(percentile_bounds))
+        
+        # Mean of values within this range
+        core_mask = (chunk_clipped >= p_lo) & (chunk_clipped <= p_hi)
+        if np.sum(core_mask) > 0:
+            val = np.mean(chunk_clipped[core_mask])
+            computed_vals.append(val)
+            computed_indices.append(i)
+
+    # 4. Interpolate to fill gaps
+    if len(computed_indices) > 1:
+        Fcont[computed_indices] = computed_vals
+        # Interpolate missing values (including those masked out)
+        # We use the computed points as knots
+        Fcont = np.interp(lam_um, lam_um[computed_indices], computed_vals, left=np.nan, right=np.nan)
+        
+        # Helper: Extrapolate ends if needed with nearest valid
+        valid_cont = np.isfinite(Fcont)
+        if np.any(valid_cont):
+            Fcont[:np.argmax(valid_cont)] = Fcont[valid_cont][0] # fill left
+            Fcont[len(Fcont) - np.argmax(valid_cont[::-1]):] = Fcont[valid_cont][-1] # fill right
+            
+    else:
+        # Fallback if moving average failed completely
+        Fcont[:] = np.nanmedian(flam_valid) if len(flam_valid) > 0 else 0.0
+
+    return Fcont, None
+
+
 def single_broad_fit(
     source,
     z,
@@ -1437,6 +1610,8 @@ def single_broad_fit(
     snr_broad_threshold: float = 5.0,
     broad_mode: str = "auto",
     continuum_lya_mask_A: float = 200.0,
+    continuum_fit: str = "polyfit",
+    continuum_movavg_window_um: float = 0.05,
 ):
     """
     Fit emission lines with optional broad Balmer components using BIC selection.
@@ -1457,7 +1632,7 @@ def single_broad_fit(
     lines_to_use : list of str, optional
         Subset of emission lines to fit. If None, uses all available lines.
     deg : int, default=2
-        Polynomial degree for continuum fitting.
+        Polynomial degree for continuum fitting (used if continuum_fit='polyfit').
     continuum_windows : list of tuples or str, optional
         Wavelength windows for continuum fitting, or 'two_sided_lya' for automatic.
     lyman_cut : str, default='split'
@@ -1479,6 +1654,10 @@ def single_broad_fit(
     broad_mode : str, default='auto'
         Broad component selection mode: 'auto' (BIC-based), 'off' (narrow only),
         'broad1' (force BROAD), 'broad2' (force BROAD2), 'both' (force both).
+    continuum_fit : str, default='polyfit'
+        Continuum fitting method: 'polyfit' (polynomial) or 'moving_average'.
+    continuum_movavg_window_um : float, default=0.05
+        Window size in microns for moving average continuum fit.
 
     Returns
     -------
@@ -1533,10 +1712,23 @@ def single_broad_fit(
     flam     = fnu_uJy_to_flam(flux_uJy, lam_um)
     sig_flam = fnu_uJy_to_flam(err_uJy,  lam_um)
 
-    Fcont, _ = fit_continuum_polynomial(
-        lam_um, flam, z, deg=deg, windows=continuum_windows,
-        lyman_cut=lyman_cut, sigma_flam=sig_flam, grating=grating
-    )
+    if continuum_fit == "moving_average":
+        Fcont, _ = fit_continuum_moving_average(
+            lam_um, flam, z,
+            windows=continuum_windows,
+            lyman_cut=lyman_cut,
+            window_um=continuum_movavg_window_um,
+            grating=grating,
+            clip_sigma=3.0,
+            percentile_bounds=(16, 84),
+        )
+    elif continuum_fit == "polyfit":
+        Fcont, _ = fit_continuum_polynomial(
+            lam_um, flam, z, deg=deg, windows=continuum_windows,
+            lyman_cut=lyman_cut, sigma_flam=sig_flam, grating=grating
+        )
+    else:
+        raise ValueError(f"Unknown continuum_fit mode: {continuum_fit}")
     resid_full   = flam - Fcont
     sig_flam_fit = rescale_uncertainties(resid_full, sig_flam)
 
@@ -2602,6 +2794,8 @@ def broad_fit(
     plot_unit: str = "fnu",
     plot_continuum_subtracted: bool = False,
     continuum_lya_mask_A: float = 200.0,
+    continuum_fit: str = "polyfit",
+    continuum_movavg_window_um: float = 0.05,
 ) -> Dict:
 
 
@@ -2691,6 +2885,8 @@ def broad_fit(
             lines_to_use=lines_to_use,
             broad_mode=broad_mode, 
             continuum_lya_mask_A=continuum_lya_mask_A,
+            continuum_fit=continuum_fit,
+            continuum_movavg_window_um=continuum_movavg_window_um,
         )
         which_lines = list(base.get("which_lines", []))
         if not which_lines:
@@ -2824,6 +3020,8 @@ def broad_fit(
                 force_lines=which_lines,      # freeze line list
                 broad_mode=broad_mode,
                 continuum_lya_mask_A=continuum_lya_mask_A,
+                continuum_fit=continuum_fit,
+                continuum_movavg_window_um=continuum_movavg_window_um,
             )
             ok_fit = True
         except Exception:
