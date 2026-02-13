@@ -154,30 +154,60 @@ results = single_broad_fit(
 print(f"Selected Model: {results.get('broad_choice_HA', 'narrow')}")
 ```
 
-### 3. Bootstrap Analysis
+### 4. Broad Line Fitting (`broad_fit`)
 
-Run a bootstrap analysis to get robust error estimates for line fluxes and widths.
+The core function of PyRSR is `broad_fit`, which performs a robust analysis of emission lines, particularly for AGN candidates with broad Balmer lines.
+
+**What `broad_fit` does:**
+
+1.  **Continuum Fitting**: Fits the continuum using either a polynomial or a robust moving average (see above).
+2.  **Model Selection (BIC)**: Automatically determines the best model for H$\alpha$, H$\beta$, and H$\delta$ by comparing the Bayesian Information Criterion (BIC) of:
+    *   **Narrow-only**: Single Gaussian per line.
+    *   **One Broad**: Adds a broad component.
+    *   **Two Broad**: Adds a second broad component (e.g., outflow vs BLR).
+3.  **Bootstrap Resampling**: Once the model structure is fixed, it runs `n_boot` iterations where residuals are reshuffled and added back to the best-fit model. This provides:
+    *   Robust uncertainties on fluxes and EWs.
+    *   Realistic error bars on line widths and shifts.
+    *   Non-Gaussian posterior distributions for parameters.
+4.  **Plotting & Saving**: Generates detailed diagnostic plots and optionally saves results for later use.
+
+**Example Usage:**
 
 ```python
 from PyRSR.broad_line_fit import broad_fit
 
-# formatting options for output table can be handled by
-# print_bootstrap_line_table_broad(res)
-
-res = broad_fit(
+results = broad_fit(
     source=source,
     z=2.5,
     grating="PRISM",
     lines_to_use=["H⍺", "HBETA", "OIII_5007"],
-    n_boot=1000,
-    broad_mode="auto",
+    n_boot=1000,           # Number of bootstrap iterations
+    broad_mode="auto",     # "auto" (BIC), "off", "broad1", or "both"
     plot=True,
-    save_path="./output_plots",
-    plot_ylim=(-0.5, 5.0)  # Optional: set y-axis limits
+    save_path="./output",  # Save plots to this folder
+    save_npz=True,         # Save fit results to .npz file
+    npz_name="my_galaxy_fit"
 )
 
-# Access summary statistics
-print(res["summary"]["H⍺"]["F_line"])
+# Access summary statistics (dict with keys: F_line, EW, SNR, sigma_line, etc.)
+ha_flux = results["summary"]["H⍺"]["F_line"]
+ha_err  = results["summary"]["H⍺"]["sigma_line"]
+print(f"H-alpha Flux: {ha_flux:.2e} +/- {ha_err:.2e}")
+```
+
+#### Saving & Loading Results
+
+You can save the computationally expensive fit results (especially the bootstrap statistics) to a lightweight `.npz` file using `save_npz=True`.
+
+The saved file contains the **mean model** derived from the bootstrap, the continuum, and all summary statistics. You can reload this file to recreate plots without re-running the fit.
+
+**Plotting saved results:**
+
+```python
+# A simple helper to plot the saved .npz file
+from plot_fit_results import plot_npz_results
+
+plot_npz_results("my_galaxy_fit.npz")
 ```
 
 ### 5. Using PyRSRX
